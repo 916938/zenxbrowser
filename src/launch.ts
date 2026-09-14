@@ -129,7 +129,7 @@ async function ensureOnlineLocked(store: Store, account: Account, run: Runner, r
     const browser = browsers.find((item) => item.instance_id === account.instanceId);
     if (browser) {
       if (!isEdge(browser)) throw new ZenxError("NOT_EDGE", "目标实例不是 Microsoft Edge；不会改选其他浏览器。");
-      if (!protocolSupported(browser)) throw new ZenxError("UNSUPPORTED_PROTOCOL", "目标扩展协议不兼容；当前仅支持 1.0 / 1.1。");
+      if (!protocolSupported(browser)) throw new ZenxError("UNSUPPORTED_PROTOCOL", "目标扩展协议不兼容；当前仅支持 1.0 / 1.1 / 1.3。");
       return launched;
     }
     if (!launched) {

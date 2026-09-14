@@ -108,7 +108,7 @@ export function isEdge(browser: Browser): boolean {
   return /^(?:microsoft )?edge$/i.test(browser.browser_name);
 }
 export function protocolSupported(browser: Browser): boolean {
-  return browser.extension_protocol_version === "1.0" || browser.extension_protocol_version === "1.1";
+  return browser.extension_protocol_version === "1.0" || browser.extension_protocol_version === "1.1" || browser.extension_protocol_version === "1.3";
 }
 
 export async function doctor(run: Runner) {
@@ -205,7 +205,7 @@ export async function bindAccount(home: string, run: Runner, account: Omit<Accou
     const browser = (await listBrowsers(run)).find((item) => item.instance_id === account.instanceId);
     if (!browser) throw new ZenxError("INSTANCE_OFFLINE", "绑定实例未在线；不按标签匹配，也不改选其他浏览器。");
     if (!isEdge(browser)) throw new ZenxError("NOT_EDGE", "首期仅允许绑定 Microsoft Edge 实例。");
-    if (!protocolSupported(browser)) throw new ZenxError("UNSUPPORTED_PROTOCOL", "扩展协议未验证兼容；当前仅支持 1.0 / 1.1。");
+    if (!protocolSupported(browser)) throw new ZenxError("UNSUPPORTED_PROTOCOL", "扩展协议未验证兼容；当前仅支持 1.0 / 1.1 / 1.3。");
     if (store.accounts.some((item) => item.alias === account.alias || item.instanceId === account.instanceId)) {
       throw new ZenxError("BINDING_EXISTS", "账号别名或实例 ID 已绑定；不会覆盖或自动重新绑定。");
     }

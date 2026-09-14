@@ -66,12 +66,28 @@ test("标签恰好等于目标 ID 时不回退到该浏览器", async (t) => {
   await assert.rejects(bindAccount(home, mock([other]), binding, true), { code: "INSTANCE_OFFLINE" });
 });
 
+for (const extension_protocol_version of ["1.0", "1.1", "1.3"]) {
+  test(`协议 ${extension_protocol_version} 可绑定且 check 在线`, async (t) => {
+    const home = await temporary(t);
+    const run = mock([{ ...edge, extension_protocol_version }]);
+    await bindAccount(home, run, binding, true);
+    assert.equal((await readStore(home)).accounts[0].instanceId, edge.instance_id);
+    const result = await checkAccounts(home, run);
+    assert.equal(result.ok, true);
+    assert.equal(result.accounts[0].connection, "online");
+    assert.equal(result.accounts[0].identity, "not_verified");
+  });
+}
+
+const unsupportedProtocols = ["", "1.2", "1.4", "1.9", "2.0", "1.30", "1.3.0", " 1.3", "1.3 ", "v1.3", "1.3-beta"];
+
 test("绑定仅允许 Edge 和已支持协议", async (t) => {
   const home = await temporary(t);
   await assert.rejects(bindAccount(home, mock([{ ...edge, browser_name: "Chrome" }]), binding, true), { code: "NOT_EDGE" });
-  for (const extension_protocol_version of ["", "2.0", "1.9"]) {
-    await assert.rejects(bindAccount(home, mock([{ ...edge, extension_protocol_version }]), binding, true), { code: "UNSUPPORTED_PROTOCOL" });
+  for (const extension_protocol_version of unsupportedProtocols) {
+    await assert.rejects(bindAccount(home, mock([{ ...edge, extension_protocol_version }]), binding, true), { code: "UNSUPPORTED_PROTOCOL", message: /当前仅支持 1\.0 \/ 1\.1 \/ 1\.3。/ });
   }
+  assert.deepEqual((await readStore(home)).accounts, []);
 });
 
 test("重复别名或重复实例绑定不覆盖原数据", async (t) => {
@@ -115,7 +131,11 @@ test("连接使用错误浏览器或未知协议时失败", async (t) => {
   const home = await temporary(t);
   await bindAccount(home, mock(), binding, true);
   assert.equal((await checkAccounts(home, mock([{ ...edge, browser_name: "Chrome" }]))).accounts[0].connection, "wrong_browser");
-  assert.equal((await checkAccounts(home, mock([{ ...edge, extension_protocol_version: "2.0" }]))).accounts[0].connection, "unsupported_protocol");
+  for (const extension_protocol_version of unsupportedProtocols) {
+    const result = await checkAccounts(home, mock([{ ...edge, extension_protocol_version }]));
+    assert.equal(result.ok, false);
+    assert.equal(result.accounts[0].connection, "unsupported_protocol");
+  }
 });
 
 test("损坏、未来版本和重复配置均不覆盖", async (t) => {

@@ -48,6 +48,18 @@ test("旧版绑定无需启动配置，在线直接返回且不启动", async (t
   assert.equal(await readFile(join(home, "accounts.json"), "utf8"), before);
 });
 
+test("ensure-online 接受协议 1.3，不启动、不修改绑定", async (t) => {
+  const { home } = await fixture(t);
+  const before = await readFile(join(home, "accounts.json"), "utf8");
+  const run: Runner = async (args) => {
+    assert.deepEqual(args, ["browsers", "--json"]);
+    return { stdout: JSON.stringify([{ ...edge, extension_protocol_version: "1.3" }]), exitCode: 0 };
+  };
+  const result = await ensureOnline(home, run, "work", 1000, { now: () => 0, launch: async () => { assert.fail("不应启动"); } });
+  assert.deepEqual(result, { ok: true, alias: "work", instanceId: edge.instance_id, connection: "online", launched: false, identity: "not_verified" });
+  assert.equal(await readFile(join(home, "accounts.json"), "utf8"), before);
+});
+
 test("保存配置保留绑定、其他账号和未知字段，修改仍需确认", windows, async (t) => {
   const { home, config } = await fixture(t);
   const saved = await configureLaunch(home, "work", config, true);
@@ -142,6 +154,12 @@ test("在线错误浏览器或协议不能成功，不调用启动", async (t) =
   const { home } = await fixture(t);
   for (const [browser, code] of [[{ ...edge, browser_name: "Chrome" }, "NOT_EDGE"], [{ ...edge, extension_protocol_version: "2.0" }, "UNSUPPORTED_PROTOCOL"]] as const) {
     await assert.rejects(ensureOnline(home, async () => ({ stdout: JSON.stringify([browser]), exitCode: 0 }), "work", 1000, { launch: async () => { assert.fail("不应启动"); } }), { code });
+  }
+  for (const extension_protocol_version of ["1.2", "1.4", "1.3.0", " 1.3", "1.3 "]) {
+    await assert.rejects(ensureOnline(home, async (args) => {
+      assert.deepEqual(args, ["browsers", "--json"]);
+      return { stdout: JSON.stringify([{ ...edge, extension_protocol_version }]), exitCode: 0 };
+    }, "work", 1000, { now: () => 0, launch: async () => { assert.fail("不应启动"); } }), { code: "UNSUPPORTED_PROTOCOL", message: /当前仅支持 1\.0 \/ 1\.1 \/ 1\.3。/ });
   }
   await assert.rejects(ensureOnline(home, offline, "work"), { code: "LAUNCH_NOT_CONFIGURED" });
 });

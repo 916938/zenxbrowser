@@ -337,6 +337,11 @@ test("inspect 离线或协议不符直接报告，不启动、不查询标签、
     [[{ ...edge, instance_id: "other" }], "offline"],
     [[{ ...edge, browser_name: "Chrome" }], "wrong_browser"],
     [[{ ...edge, extension_protocol_version: "2.0" }], "unsupported_protocol"],
+    [[{ ...edge, extension_protocol_version: "1.2" }], "unsupported_protocol"],
+    [[{ ...edge, extension_protocol_version: "1.4" }], "unsupported_protocol"],
+    [[{ ...edge, extension_protocol_version: "1.3.0" }], "unsupported_protocol"],
+    [[{ ...edge, extension_protocol_version: " 1.3" }], "unsupported_protocol"],
+    [[{ ...edge, extension_protocol_version: "1.3 " }], "unsupported_protocol"],
   ] as [Browser[], string][]) {
     const { run, calls } = inspectRunner([], undefined, browsers);
     const result = await inspectSite(home, run, "work", undefined, 1000, noLaunch);
@@ -356,13 +361,13 @@ test("inspect 无候选标签不发起观察，也不新建", async (t) => {
   assert.equal(await readFile(join(home, "accounts.json"), "utf8"), before);
 });
 
-test("inspect 唯一候选观察身份命中并识别签到信号", async (t) => {
+test("inspect 协议 1.3 唯一候选观察身份命中并识别签到信号", async (t) => {
   const { home } = await fixture(t);
   const text = "AgentRouter 控制台\nprivate-identity\n今日已签到\n积分 120\nhttps://agentrouter.org/leaderboard";
   const { run, calls } = inspectRunner([tab(11, "https://agentrouter.org/dashboard")], async (args) => {
     assert.deepEqual(args, ["tab", "observe", "--browser-id", edge.instance_id, "--tab-id", "11", "--expected-origin", "https://agentrouter.org", "--json"]);
     return reply(observed(text));
-  });
+  }, [{ ...edge, extension_protocol_version: "1.3" }]);
   const result = await inspectSite(home, run, "work", undefined, 1000, noLaunch);
   assert.equal(result.ok, true);
   assert.equal(result.identity, "matched");
