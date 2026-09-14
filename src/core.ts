@@ -7,8 +7,8 @@ import type { LaunchConfig } from "./launch-config.ts";
 
 export class ZenxError extends Error {
   code: string;
-  details?: { candidateTabIds: number[] };
-  constructor(code: string, message: string, details?: { candidateTabIds: number[] }) {
+  details?: Record<string, unknown>;
+  constructor(code: string, message: string, details?: Record<string, unknown>) {
     super(message);
     this.code = code;
     this.details = details;

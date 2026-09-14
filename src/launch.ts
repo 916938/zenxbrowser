@@ -17,7 +17,7 @@ export type LaunchDependencies = {
   sleep?: (ms: number) => Promise<void>;
 };
 
-function findAccount(store: Store, alias: string): Account {
+export function findAccount(store: Store, alias: string): Account {
   const account = store.accounts.find((item) => item.alias === alias);
   if (!account) throw new ZenxError("ACCOUNT_NOT_FOUND", "账号别名尚未绑定；请先核对并绑定精确实例 ID。");
   return account;

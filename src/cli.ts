@@ -5,8 +5,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { bindAccount, checkAccounts, createRunner, doctor, isEdge, listBrowsers, ZenxError } from "./core.ts";
 import type { Runner } from "./core.ts";
 import { configureLaunch, ensureOnline, inspectSite, openSite } from "./launch.ts";
+import { checkinAccount } from "./checkin.ts";
 import { isTabId } from "./site.ts";
 import type { LaunchDependencies } from "./launch.ts";
+import type { CheckinDependencies } from "./checkin.ts";
 
 export const DEFAULT_HOME = fileURLToPath(new URL("../.zenx/", import.meta.url));
 
@@ -25,6 +27,7 @@ const help = `ZenX Browser — Windows Edge 多账号连接台
   zenx accounts ensure-online <别名> [--timeout 45s]
   zenx accounts open-site <别名> [--tab-id <N>] [--timeout 45s]
   zenx accounts inspect-site <别名> [--tab-id <N>] [--timeout 45s]
+  zenx accounts checkin <别名> [--timeout 3m]
 
 全局选项：
   --json          输出 JSON
@@ -48,9 +51,11 @@ inspect-site 只读采集既有 AgentRouter 标签当前视口可见正文，核
 启动可能将窗口带到前台；扩展连接被禁用时必须人工开启。
 路径请从目标 Profile 的 edge://version 核对，不能把 edge-3 推断为 Profile 3。
 绑定需要人工核对；连接在线不等于目标站点登录身份已验证。
-不保存密码、Cookie 或令牌；不执行签到。`;
+不保存密码、Cookie 或令牌。
+checkin 执行完整退出重登签到流程（隔离 session、不抢焦点、退出前核对登录身份）；
+  遇 GitHub 授权/验证页或签到未确认时停止并报错，由人工处理后重试；其余命令保持只读。`;
 
-type Dependencies = { run?: Runner; home?: string; output?: (line: string) => void; launchDependencies?: LaunchDependencies };
+type Dependencies = { run?: Runner; home?: string; output?: (line: string) => void; launchDependencies?: LaunchDependencies; checkinDependencies?: CheckinDependencies };
 
 function parseTimeout(value = "45s"): number {
   const match = /^(\d+)(ms|s|m)$/.exec(value);
@@ -103,10 +108,11 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     const ensuring = group === "accounts" && action === "ensure-online";
     const opening = group === "accounts" && action === "open-site";
     const inspecting = group === "accounts" && action === "inspect-site";
+    const checkingIn = group === "accounts" && action === "checkin";
     const allowed = new Set(["json", "home", "help"]);
     if (binding) for (const key of ["instance-id", "expected-identity", "confirm"]) allowed.add(key);
     if (configuring) for (const key of ["edge-path", "user-data-dir", "profile-directory", "confirm"]) allowed.add(key);
-    if (ensuring || opening || inspecting) allowed.add("timeout");
+    if (ensuring || opening || inspecting || checkingIn) allowed.add("timeout");
     if (opening || inspecting) allowed.add("tab-id");
     for (const key of Object.keys(values)) {
       if (!allowed.has(key)) throw new ZenxError("INVALID_ARGUMENT", `此命令不接受 --${key}。`);
@@ -142,10 +148,12 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
       report = await openSite(home, run, alias, parseTabId(values["tab-id"]), parseTimeout(values.timeout), dependencies.launchDependencies);
     } else if (inspecting && alias && positionals.length === 3) {
       report = await inspectSite(home, run, alias, parseTabId(values["tab-id"]), parseTimeout(values.timeout), dependencies.launchDependencies);
+    } else if (checkingIn && alias && positionals.length === 3) {
+      report = await checkinAccount(home, run, alias, parseTimeout(values.timeout ?? "3m"), dependencies.checkinDependencies);
     } else {
       throw new ZenxError("INVALID_ARGUMENT", "命令或参数不正确；运行 zenx --help 查看用法。");
     }
-    if (!asJson) output("连接在线或打开站点不等于登录身份验证；未执行签到。");
+    if (!asJson && !checkingIn) output("连接在线或打开站点不等于登录身份验证；未执行签到。");
     output(JSON.stringify(report, null, 2));
     return report.ok === false ? 1 : 0;
   } catch (error) {
