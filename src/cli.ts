@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { bindAccount, checkAccounts, createRunner, doctor, isEdge, listBrowsers, ZenxError } from "./core.ts";
 import type { Runner } from "./core.ts";
-import { configureLaunch, ensureOnline, inspectSite, openSite } from "./launch.ts";
+import { closeBrowser, configureLaunch, ensureOnline, inspectSite, openSite } from "./launch.ts";
 import { checkinAccount } from "./checkin.ts";
 import { isTabId } from "./site.ts";
 import type { LaunchDependencies } from "./launch.ts";
@@ -25,6 +25,7 @@ const help = `ZenX Browser — Windows Edge 多账号连接台
   zenx accounts check
   zenx accounts configure-launch <别名> --edge-path <msedge.exe绝对路径> --user-data-dir <用户数据根目录> --profile-directory <Profile子目录> --confirm
   zenx accounts ensure-online <别名> [--timeout 45s]
+  zenx accounts close <别名> --confirm [--timeout 45s]
   zenx accounts open-site <别名> [--tab-id <N>] [--timeout 45s]
   zenx accounts inspect-site <别名> [--tab-id <N>] [--timeout 45s]
   zenx accounts checkin <别名> [--timeout 3m]
@@ -38,6 +39,10 @@ ZENX_BSK_PATH 指定 bsk 可执行文件（不是带参数的 shell 命令）。
 profiles list 只识别已经连接的扩展实例，不枚举所有 Edge Profile。
 bsk 查询可能自动启动本地 daemon；check 保持只读，不启动 Edge。
 ensure-online / open-site 在线不启动，离线只启动一次已配置的 Windows Edge Profile。
+close 与 ensure-online 成对：关闭账号绑定的那个 Edge 实例（停止其全部会话后关闭所有窗口，
+  浏览器进程随之退出）；只用已绑定的精确实例 ID，离线、非 Edge 或协议不兼容都直接报错，
+  不按标签匹配也不改选；必须 --confirm；失败不重试（可能已关闭），用 zenx accounts check 核对。
+  会关闭该实例的所有窗口，包括与本项目无关的窗口，未保存内容会丢失。
 不显式打开空白窗口；Edge 自身启动设置仍可能恢复窗口或新标签，无法保证消除。
 open-site 本期仅支持 https://agentrouter.org/；先查找并切换用户已有标签，无匹配才新建。
 多个候选仅在唯一 active 匹配时自动选择，否则用 --tab-id 明确选择；错误候选不新建。
@@ -108,12 +113,14 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     const ensuring = group === "accounts" && action === "ensure-online";
     const opening = group === "accounts" && action === "open-site";
     const inspecting = group === "accounts" && action === "inspect-site";
+    const closing = group === "accounts" && action === "close";
     const checkingIn = group === "accounts" && action === "checkin";
     const allowed = new Set(["json", "home", "help"]);
     if (binding) for (const key of ["instance-id", "expected-identity", "confirm"]) allowed.add(key);
     if (configuring) for (const key of ["edge-path", "user-data-dir", "profile-directory", "confirm"]) allowed.add(key);
-    if (ensuring || opening || inspecting || checkingIn) allowed.add("timeout");
+    if (ensuring || opening || inspecting || checkingIn || closing) allowed.add("timeout");
     if (opening || inspecting) allowed.add("tab-id");
+    if (closing) allowed.add("confirm");
     for (const key of Object.keys(values)) {
       if (!allowed.has(key)) throw new ZenxError("INVALID_ARGUMENT", `此命令不接受 --${key}。`);
     }
@@ -148,12 +155,15 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
       report = await openSite(home, run, alias, parseTabId(values["tab-id"]), parseTimeout(values.timeout), dependencies.launchDependencies);
     } else if (inspecting && alias && positionals.length === 3) {
       report = await inspectSite(home, run, alias, parseTabId(values["tab-id"]), parseTimeout(values.timeout), dependencies.launchDependencies);
+    } else if (closing && alias && positionals.length === 3) {
+      if (values.confirm !== true) throw new ZenxError("CONFIRM_REQUIRED", "关闭会退出该实例的全部 Edge 窗口（含无关窗口，未保存内容会丢失），需要 --confirm。");
+      report = await closeBrowser(home, run, alias, parseTimeout(values.timeout), dependencies.launchDependencies);
     } else if (checkingIn && alias && positionals.length === 3) {
       report = await checkinAccount(home, run, alias, parseTimeout(values.timeout ?? "3m"), dependencies.checkinDependencies);
     } else {
       throw new ZenxError("INVALID_ARGUMENT", "命令或参数不正确；运行 zenx --help 查看用法。");
     }
-    if (!asJson && !checkingIn) output("连接在线或打开站点不等于登录身份验证；未执行签到。");
+    if (!asJson && !checkingIn && !closing) output("连接在线或打开站点不等于登录身份验证；未执行签到。");
     output(JSON.stringify(report, null, 2));
     return report.ok === false ? 1 : 0;
   } catch (error) {

@@ -164,6 +164,84 @@ export async function ensureOnline(
   });
 }
 
+function parseCloseReply(raw: string, instanceId: string): {
+  browser_id: string;
+  closed: boolean;
+  windows_closed: number;
+  sessions_stopped: number;
+  disconnected: boolean;
+} {
+  let value: unknown;
+  try { value = JSON.parse(raw); }
+  // 关闭可能已经生效：解析失败只报告"无法确认"，绝不重试、绝不改选实例。
+  catch { throw new ZenxError("INVALID_BSK_OUTPUT", "bsk 未返回有效 JSON；关闭可能已生效，不会重试，请用 zenx accounts check 确认。"); }
+  if (typeof value !== "object" || value === null) throw new ZenxError("INVALID_BSK_OUTPUT", "bsk 关闭结果不是对象；关闭可能已生效，不会重试。");
+  const result = value as { browser_id?: unknown; closed?: unknown; windows_closed?: unknown; sessions_stopped?: unknown; disconnected?: unknown };
+  if (result.browser_id !== instanceId || typeof result.closed !== "boolean" || typeof result.disconnected !== "boolean" ||
+    !Number.isSafeInteger(result.windows_closed) || !Number.isSafeInteger(result.sessions_stopped)) {
+    throw new ZenxError("INVALID_BSK_OUTPUT", "bsk 关闭结果字段异常或未回显目标实例；关闭可能已生效，不会重试，请用 zenx accounts check 确认。");
+  }
+  return {
+    browser_id: instanceId,
+    closed: result.closed,
+    windows_closed: result.windows_closed as number,
+    sessions_stopped: result.sessions_stopped as number,
+    disconnected: result.disconnected,
+  };
+}
+
+/**
+ * 与 ensure-online 成对：关闭账号绑定的那个 Edge 实例（停止其全部会话后关闭
+ * 所有窗口，浏览器进程随之退出）。
+ *
+ * 安全措施：
+ * - 只用账号里已绑定的精确 instanceId；不按标签/前缀匹配，离线直接报错，不会改选。
+ * - 调用前先确认该实例在线且是协议兼容的 Edge，避免关到别的浏览器。
+ * - bsk 侧要求 --confirm，本命令同样要求调用方已确认（CLI 层强制 --confirm）。
+ * - 失败一律不重试、不杀进程：关闭可能已生效，报告"无法确认"交给人工核对。
+ */
+export async function closeBrowser(
+  home: string,
+  run: Runner,
+  alias: string,
+  timeoutMs: number = 45_000,
+  dependencies: LaunchDependencies = {},
+): Promise<{
+  ok: true;
+  alias: string;
+  instanceId: string;
+  browser_id: string;
+  closed: boolean;
+  windows_closed: number;
+  sessions_stopped: number;
+  disconnected: boolean;
+  identity: "not_verified";
+}> {
+  const remaining = deadlineBudget(timeoutMs, dependencies);
+  const store = await readStore(home);
+  const account = findAccount(store, alias);
+  const browsers = await listBrowsers(run, {
+    timeoutMs: Math.min(60_000, remaining()),
+    env: { BSK_BROWSER_WAIT_MS: "0" },
+  });
+  remaining();
+  const browser = browsers.find((item) => item.instance_id === account.instanceId);
+  if (!browser) throw new ZenxError("INSTANCE_OFFLINE", "目标实例未在线：没有可关闭的 Edge；未调用关闭，也不会改选其他实例。");
+  if (!isEdge(browser)) throw new ZenxError("NOT_EDGE", "目标实例不是 Microsoft Edge；不会关闭。");
+  if (!protocolSupported(browser)) throw new ZenxError("UNSUPPORTED_PROTOCOL", "目标扩展协议不兼容；当前仅支持 1.0 / 1.1 / 1.3，不会关闭。");
+  remaining();
+  const reply = await run(
+    ["browsers", "close", "--browser-id", account.instanceId, "--confirm", "--json"],
+    { timeoutMs: Math.min(60_000, remaining()) },
+  );
+  if (reply.exitCode !== 0) {
+    const detail = reply.stdout.trim().slice(0, 200);
+    throw new ZenxError("BSK_FAILED", "bsk 未能确认浏览器已关闭；关闭可能已生效，不会自动重试，请用 zenx accounts check 核对。", detail ? { detail } : undefined);
+  }
+  const result = parseCloseReply(reply.stdout, account.instanceId);
+  return { ok: true, alias: account.alias, instanceId: account.instanceId, ...result, identity: "not_verified" };
+}
+
 export async function openSite(
   home: string,
   run: Runner,
