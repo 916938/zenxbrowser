@@ -265,6 +265,10 @@ const invalidLaunchCommands: { name: string; args: string[]; code: string }[] = 
   { name: "check 无关 timeout", args: ["accounts", "check", "--timeout", "1s"], code: "INVALID_ARGUMENT" },
   { name: "configure-launch 重复 edge-path", args: ["accounts", "configure-launch", "work", ...launchOptions, "--edge-path=C:\\Other\\msedge.exe", "--confirm"], code: "INVALID_ARGUMENT" },
   { name: "ensure-online 重复 timeout", args: ["accounts", "ensure-online", "work", "--timeout", "1s", "--timeout=2s"], code: "INVALID_ARGUMENT" },
+  { name: "close 无 confirm", args: ["accounts", "close", "work"], code: "CONFIRM_REQUIRED" },
+  { name: "close 缺 alias", args: ["accounts", "close", "--confirm"], code: "INVALID_ARGUMENT" },
+  { name: "close 未知 alias", args: ["accounts", "close", "unknown", "--confirm"], code: "ACCOUNT_NOT_FOUND" },
+  { name: "close 无关 tab-id", args: ["accounts", "close", "work", "--confirm", "--tab-id", "1"], code: "INVALID_ARGUMENT" },
 ];
 for (const option of ["--edge-path", "--user-data-dir", "--profile-directory"]) {
   invalidLaunchCommands.push({
@@ -321,6 +325,41 @@ test("CLI ensure-online 在线无需配置，不启动且默认查询预算为 4
   assert.equal(lines.length, 1);
   assert.deepEqual(JSON.parse(lines[0]), { ok: true, alias: "work", instanceId: edge.instance_id, connection: "online", launched: false, identity: "not_verified" });
   assert.equal((await readStore(home)).accounts[0].launch, undefined);
+  assert.equal(await readFile(join(home, "accounts.json"), "utf8"), before);
+});
+
+const closeReply = JSON.stringify({ browser_id: edge.instance_id, closed: true, windows_closed: 2, sessions_stopped: 1, disconnected: false });
+
+test("CLI accounts close 按精确实例 ID 关闭，不启动也不改绑定", async (t) => {
+  const { home } = await launchFixture(t);
+  const before = await readFile(join(home, "accounts.json"), "utf8");
+  const lines: string[] = [];
+  const calls: string[][] = [];
+  let launches = 0;
+  const code = await main(["accounts", "close", "work", "--confirm", "--json"], {
+    home, output: (line) => lines.push(line),
+    run: async (args, options) => {
+      calls.push(args);
+      if (args[1] === "close") {
+        assert.deepEqual(options, { timeoutMs: 45_000 });
+        return { stdout: closeReply, exitCode: 0 };
+      }
+      assert.deepEqual(options, { timeoutMs: 45_000, env: { BSK_BROWSER_WAIT_MS: "0" } });
+      return { stdout: JSON.stringify([edge]), exitCode: 0 };
+    },
+    launchDependencies: { now: () => 1000, launch: async () => { launches++; } },
+  });
+  assert.equal(code, 0);
+  assert.deepEqual(calls, [
+    ["browsers", "--json"],
+    ["browsers", "close", "--browser-id", edge.instance_id, "--confirm", "--json"],
+  ]);
+  assert.equal(launches, 0);
+  assert.equal(lines.length, 1);
+  assert.deepEqual(JSON.parse(lines[0]), {
+    ok: true, alias: "work", instanceId: edge.instance_id, browser_id: edge.instance_id,
+    closed: true, windows_closed: 2, sessions_stopped: 1, disconnected: false, identity: "not_verified",
+  });
   assert.equal(await readFile(join(home, "accounts.json"), "utf8"), before);
 });
 

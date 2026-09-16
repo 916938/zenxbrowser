@@ -8,7 +8,7 @@ import { EventEmitter } from "node:events";
 import { syncBuiltinESMExports } from "node:module";
 import { checkAccounts, createRunner, readStore, withStoreLock, ZenxError } from "../src/core.ts";
 import type { Account, Browser, Runner } from "../src/core.ts";
-import { configureLaunch, ensureOnline } from "../src/launch.ts";
+import { closeBrowser, configureLaunch, ensureOnline } from "../src/launch.ts";
 import type { LaunchConfig } from "../src/launch.ts";
 
 const edge: Browser = {
@@ -306,5 +306,71 @@ test("等待预算拒绝零、负数、无穷、非整数和超过五分钟", as
   const { home } = await fixture(t);
   for (const timeout of [0, -1, NaN, Infinity, 1.5, 300001]) {
     await assert.rejects(ensureOnline(home, async () => { assert.fail("不应查询"); }, "work", timeout), { code: "INVALID_TIMEOUT" });
+  }
+});
+
+const closeReply = JSON.stringify({ browser_id: edge.instance_id, closed: true, windows_closed: 2, sessions_stopped: 1, disconnected: false });
+
+test("关闭在线实例：精确实例 ID、零等待、回显结果且不改绑定", async (t) => {
+  const { home } = await fixture(t);
+  const before = await readFile(join(home, "accounts.json"), "utf8");
+  const time = clock();
+  const calls: string[][] = [];
+  const budgets: number[] = [];
+  const run: Runner = async (args, options) => {
+    calls.push(args);
+    if (args[0] === "browsers" && args[1] === "--json") {
+      assert.equal(options?.env?.BSK_BROWSER_WAIT_MS, "0");
+      budgets.push(options!.timeoutMs!);
+      time.advance(100);
+      return { stdout: JSON.stringify([edge]), exitCode: 0 };
+    }
+    budgets.push(options!.timeoutMs!);
+    return { stdout: closeReply, exitCode: 0 };
+  };
+  const result = await closeBrowser(home, run, "work", 5000, time);
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, [["browsers", "--json"], ["browsers", "close", "--browser-id", edge.instance_id, "--confirm", "--json"]]);
+  assert.deepEqual(budgets, [5000, 4900]);
+  assert.deepEqual(result, {
+    ok: true, alias: "work", instanceId: edge.instance_id, browser_id: edge.instance_id,
+    closed: true, windows_closed: 2, sessions_stopped: 1, disconnected: false, identity: "not_verified",
+  });
+  assert.equal(await readFile(join(home, "accounts.json"), "utf8"), before);
+});
+
+test("离线、非 Edge 或协议不兼容都不调用关闭", async (t) => {
+  const { home } = await fixture(t);
+  const offlineOrWrong: [Browser | null, string][] = [
+    [null, "INSTANCE_OFFLINE"],
+    [{ ...edge, browser_name: "Chrome" }, "NOT_EDGE"],
+    [{ ...edge, extension_protocol_version: "2.0" }, "UNSUPPORTED_PROTOCOL"],
+  ];
+  for (const [browser, code] of offlineOrWrong) {
+    let closed = 0;
+    await assert.rejects(closeBrowser(home, async (args) => {
+      if (args.includes("close")) { closed++; assert.fail("不应关闭"); }
+      return { stdout: JSON.stringify(browser ? [browser] : []), exitCode: 0 };
+    }, "work", 1000), { code });
+    assert.equal(closed, 0);
+  }
+  // 标签恰好等于目标 ID 也不能作为关闭对象。
+  await assert.rejects(closeBrowser(home, async () => ({ stdout: JSON.stringify([{ ...edge, instance_id: "eeee1111", label: edge.instance_id }]), exitCode: 0 }), "work", 1000), { code: "INSTANCE_OFFLINE" });
+});
+
+test("关闭失败或不回显目标实例都不重试，报错交给人工核对", async (t) => {
+  const { home } = await fixture(t);
+  for (const [reply, code] of [
+    [{ stdout: "", exitCode: 1 }, "BSK_FAILED"],
+    [{ stdout: "not-json", exitCode: 0 }, "INVALID_BSK_OUTPUT"],
+    [{ stdout: JSON.stringify({ browser_id: "eeee1111", closed: true, windows_closed: 1, sessions_stopped: 0, disconnected: false }), exitCode: 0 }, "INVALID_BSK_OUTPUT"],
+    [{ stdout: JSON.stringify({ browser_id: edge.instance_id, closed: "yes", windows_closed: 1, sessions_stopped: 0, disconnected: false }), exitCode: 0 }, "INVALID_BSK_OUTPUT"],
+  ] as const) {
+    let attempts = 0;
+    await assert.rejects(closeBrowser(home, async (args) => {
+      if (args.includes("close")) { attempts++; return reply; }
+      return { stdout: JSON.stringify([edge]), exitCode: 0 };
+    }, "work", 1000), { code });
+    assert.equal(attempts, 1);
   }
 });
