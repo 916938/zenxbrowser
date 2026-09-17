@@ -1,12 +1,18 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
+import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { bindAccount, checkAccounts, createRunner, doctor, isEdge, listBrowsers, ZenxError } from "./core.ts";
 import type { Runner } from "./core.ts";
-import { configureLaunch, ensureOnline, inspectSite, openSite } from "./launch.ts";
+import { closeBrowser, configureLaunch, ensureOnline, inspectSite, openSite, relinkProfile } from "./launch.ts";
+import { checkinAccount } from "./checkin.ts";
+import { recheckAccount } from "./recheck.ts";
+import { snapshotAccount, snapshotAll } from "./snapshot.ts";
+import { startReportServer } from "./report.ts";
 import { isTabId } from "./site.ts";
 import type { LaunchDependencies } from "./launch.ts";
+import type { CheckinDependencies } from "./checkin.ts";
 
 export const DEFAULT_HOME = fileURLToPath(new URL("../.zenx/", import.meta.url));
 
@@ -23,24 +29,46 @@ const help = `ZenX Browser — Windows Edge 多账号连接台
   zenx accounts check
   zenx accounts configure-launch <别名> --edge-path <msedge.exe绝对路径> --user-data-dir <用户数据根目录> --profile-directory <Profile子目录> --confirm
   zenx accounts ensure-online <别名> [--timeout 45s]
+  zenx accounts relink-profile <别名> --confirm [--timeout 2m]
+  zenx accounts close <别名> --confirm [--timeout 45s]
   zenx accounts open-site <别名> [--tab-id <N>] [--timeout 45s]
   zenx accounts inspect-site <别名> [--tab-id <N>] [--timeout 45s]
+  zenx accounts checkin <别名> [--timeout 3m] [--force]
+  zenx accounts recheck <别名> [--timeout 45s]
+  zenx accounts snapshot <别名> [--timeout 45s]
+  zenx accounts snapshot --all [--timeout 45s]
+  zenx report [--port 8787] [--open]
 
 全局选项：
   --json          输出 JSON
   --home <目录>   账号数据目录（优先于 ZENX_HOME；默认 CLI 所在项目的 .zenx，不随工作目录变化）
+  --port <端口>   report 监听端口（默认 8787）
+  --open          report 启动后自动打开浏览器
   --help          显示帮助
 
 ZENX_BSK_PATH 指定 bsk 可执行文件（不是带参数的 shell 命令）。
 profiles list 只识别已经连接的扩展实例，不枚举所有 Edge Profile。
 bsk 查询可能自动启动本地 daemon；check 保持只读，不启动 Edge。
 ensure-online / open-site 在线不启动，离线只启动一次已配置的 Windows Edge Profile。
+relink-profile 在 Edge 重启导致实例 ID 变化后，按已配置的 Profile 重新定位并改绑；
+  不启动也不关闭 Edge，只开临时探测窗口（必定回收）；目标 Profile 不唯一时拒绝改绑。
+close 与 ensure-online 成对：关闭账号绑定的那个 Edge 实例（停止其全部会话后关闭所有窗口，
+  浏览器进程随之退出）；只用已绑定的精确实例 ID，离线、非 Edge 或协议不兼容都直接报错，
+  不按标签匹配也不改选；必须 --confirm；失败不重试（可能已关闭），用 zenx accounts check 核对。
+  会关闭该实例的所有窗口，包括与本项目无关的窗口，未保存内容会丢失。
 不显式打开空白窗口；Edge 自身启动设置仍可能恢复窗口或新标签，无法保证消除。
 open-site 本期仅支持 https://agentrouter.org/；先查找并切换用户已有标签，无匹配才新建。
 多个候选仅在唯一 active 匹配时自动选择，否则用 --tab-id 明确选择；错误候选不新建。
 inspect-site 只读采集既有 AgentRouter 标签当前视口可见正文，核对登录身份与签到信号；
   不启动 Edge、不切换/新建/刷新标签、不执行签到；离线直接报告，不等待。
   页面在扩展更新前已加载时没有只读接收器，需人工刷新该标签后重试。
+snapshot 采集一次"当前余额 + 站点累计消耗"写入账本（只读：不退出、不重登录、不消耗登录配额）；
+  与 checkin 只记录签到那一刻不同，它提供连续观测点，供周/月对比到账与消耗；
+  --all 依次采集全部已绑定账号，单个失败不中断；失败也留一条（ok=false + 错误码）。
+recheck 只读复查某账号"今日签到额度是否已到账"：开隔离窗口读一次控制台，结合账本给出结论；
+  不退出、不重新登录、不消耗站点登录配额，可在签到失败或未确认后反复使用。
+  退出码 0=已确认到账，1=未到账或异常；离线/非 Edge/协议不兼容只报告，不启动 Edge（先 ensure-online）；
+  遇 GitHub 授权/验证页或登录身份不符时停止判断，不给出额度结论。
 --tab-id 仅供 open-site / inspect-site 使用，限 1–2147483647 的十进制整数。
 需要支持严格用户标签命令的新版 bsk CLI、daemon 和扩展；不回退到 session 或标签名称。
 --timeout 接受正整数加 ms/s/m，最大 5m，连接和站点操作共用总预算；超时不关闭 Edge。
@@ -48,9 +76,28 @@ inspect-site 只读采集既有 AgentRouter 标签当前视口可见正文，核
 启动可能将窗口带到前台；扩展连接被禁用时必须人工开启。
 路径请从目标 Profile 的 edge://version 核对，不能把 edge-3 推断为 Profile 3。
 绑定需要人工核对；连接在线不等于目标站点登录身份已验证。
-不保存密码、Cookie 或令牌；不执行签到。`;
+不保存密码、Cookie 或令牌。
+checkin 执行完整退出重登签到流程（隔离 session、退出前核对登录身份）；
+  支持无人值守：窗口被遮挡或锁屏时仍可执行，交互前通过 evaluate 收敛页面动画；
+  硬性前提是隔离窗口至少绘制过一帧——最小化的窗口会丢弃全部输入，此时报 WINDOW_NOT_INTERACTIVE
+  （计划任务脚本需先恢复最小化的 Edge 窗口）；遇 GitHub 授权/验证页或签到未确认时
+  停止并报错，由人工处理后重试；其余命令保持只读。
+checkin 在当天账本已有"确认到账"记录、或站点显示"今日已签到"时直接跳过（不退出重登），
+  避免白扣站点登录配额；确需重跑加 --force。`;
 
-type Dependencies = { run?: Runner; home?: string; output?: (line: string) => void; launchDependencies?: LaunchDependencies };
+type Dependencies = {
+  run?: Runner;
+  home?: string;
+  output?: (line: string) => void;
+  launchDependencies?: LaunchDependencies;
+  checkinDependencies?: CheckinDependencies;
+  /** report 使用的数据库文件（测试注入用）。 */
+  reportDbFile?: string;
+  /** recheck 使用的签到账本（测试注入用）。 */
+  recheckDbFile?: string;
+  /** snapshot 使用的账本（测试注入用）。 */
+  snapshotDbFile?: string;
+};
 
 function parseTimeout(value = "45s"): number {
   const match = /^(\d+)(ms|s|m)$/.exec(value);
@@ -64,6 +111,56 @@ function parseTabId(value?: string): number | undefined {
   if (value === undefined) return undefined;
   if (!/^[1-9]\d*$/.test(value) || !isTabId(Number(value))) throw new ZenxError("INVALID_TAB_ID", "--tab-id 必须是 1–2147483647 的十进制整数。");
   return Number(value);
+}
+
+function parsePort(value?: string): number {
+  if (value === undefined) return 8787;
+  if (!/^\d+$/.test(value)) throw new ZenxError("INVALID_PORT", "--port 必须是 1–65535 的十进制整数。");
+  const port = Number(value);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw new ZenxError("INVALID_PORT", "--port 必须是 1–65535 的十进制整数。");
+  return port;
+}
+
+/** 启动报表服务器并保持运行，直到用户中断。 */
+async function runReport(
+  values: Record<string, string | boolean | undefined>,
+  output: (line: string) => void,
+  dependencies: Dependencies,
+): Promise<number> {
+  const port = parsePort(values.port as string | undefined);
+  let server: Awaited<ReturnType<typeof startReportServer>> | undefined;
+  try {
+    server = await startReportServer({
+      port,
+      dbFile: dependencies.reportDbFile,
+      onStart: (url) => output(`报表已启动：${url}（Ctrl+C 停止）`),
+    });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EADDRINUSE") {
+      throw new ZenxError("PORT_IN_USE", `端口 ${port} 已被占用；用 --port 指定其他端口。`);
+    }
+    throw error;
+  }
+  if (values.open === true) {
+    const url = `http://127.0.0.1:${port}/`;
+    // Windows 用 start，其他平台用 open/xdg-open；失败仅提示，不影响服务运行。
+    const command = process.platform === "win32" ? "cmd" : process.platform === "darwin" ? "open" : "xdg-open";
+    const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+    spawn(command, args, { shell: false, detached: true, stdio: "ignore" }).on("error", () => {
+      output(`无法自动打开浏览器，请手动访问 ${url}`);
+    }).unref();
+  }
+  // 保持进程存活直到收到中断信号。
+  await new Promise<void>((resolve) => {
+    const stop = () => resolve();
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+    server?.on("close", stop);
+  });
+  await new Promise<void>((resolve) => server?.close(() => resolve()) ?? resolve());
+  output("报表已停止。");
+  return 0;
 }
 
 export async function main(args: string[], dependencies: Dependencies = {}): Promise<number> {
@@ -86,7 +183,11 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
         "user-data-dir": { type: "string" },
         "profile-directory": { type: "string" },
         timeout: { type: "string" },
+        force: { type: "boolean" },
+        all: { type: "boolean" },
         "tab-id": { type: "string" },
+        port: { type: "string" },
+        open: { type: "boolean" },
       },
     });
     const { values, positionals, tokens } = parsed;
@@ -101,17 +202,28 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     const binding = group === "accounts" && action === "bind";
     const configuring = group === "accounts" && action === "configure-launch";
     const ensuring = group === "accounts" && action === "ensure-online";
+    const relinking = group === "accounts" && action === "relink-profile";
     const opening = group === "accounts" && action === "open-site";
     const inspecting = group === "accounts" && action === "inspect-site";
+    const closing = group === "accounts" && action === "close";
+    const checkingIn = group === "accounts" && action === "checkin";
+    const rechecking = group === "accounts" && action === "recheck";
+    const snapshotting = group === "accounts" && action === "snapshot";
+    const reporting = group === "report" && positionals.length === 1;
     const allowed = new Set(["json", "home", "help"]);
     if (binding) for (const key of ["instance-id", "expected-identity", "confirm"]) allowed.add(key);
     if (configuring) for (const key of ["edge-path", "user-data-dir", "profile-directory", "confirm"]) allowed.add(key);
-    if (ensuring || opening || inspecting) allowed.add("timeout");
+    if (ensuring || opening || inspecting || relinking || closing || rechecking || snapshotting) allowed.add("timeout");
+    if (snapshotting) allowed.add("all");
+    if (checkingIn) for (const key of ["timeout", "force"]) allowed.add(key);
+    if (relinking || closing) allowed.add("confirm");
     if (opening || inspecting) allowed.add("tab-id");
+    if (reporting) for (const key of ["port", "open"]) allowed.add(key);
     for (const key of Object.keys(values)) {
       if (!allowed.has(key)) throw new ZenxError("INVALID_ARGUMENT", `此命令不接受 --${key}。`);
     }
     if (values.home !== undefined && !values.home.trim()) throw new ZenxError("INVALID_ARGUMENT", "--home 不能为空。");
+    if (snapshotting && values.all === true && alias !== undefined) throw new ZenxError("INVALID_ARGUMENT", "--all 会采集全部账号，不能再指定别名。");
     const home = resolveHome(values.home, dependencies.home);
     const run = dependencies.run ?? createRunner(process.env.ZENX_BSK_PATH);
     let report: Record<string, unknown>;
@@ -138,14 +250,39 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
       report = { ok: true, account, identity: "not_verified", dataDirectory: home };
     } else if (ensuring && alias && positionals.length === 3) {
       report = await ensureOnline(home, run, alias, parseTimeout(values.timeout), dependencies.launchDependencies);
+    } else if (relinking && alias && positionals.length === 3) {
+      if (values.confirm !== true) throw new ZenxError("CONFIRM_REQUIRED", "改绑实例 ID 会修改账号配置，需要 --confirm。");
+      report = await relinkProfile(home, run, alias, parseTimeout(values.timeout ?? "2m"), dependencies.launchDependencies);
     } else if (opening && alias && positionals.length === 3) {
       report = await openSite(home, run, alias, parseTabId(values["tab-id"]), parseTimeout(values.timeout), dependencies.launchDependencies);
     } else if (inspecting && alias && positionals.length === 3) {
       report = await inspectSite(home, run, alias, parseTabId(values["tab-id"]), parseTimeout(values.timeout), dependencies.launchDependencies);
+    } else if (closing && alias && positionals.length === 3) {
+      if (values.confirm !== true) throw new ZenxError("CONFIRM_REQUIRED", "关闭会退出该实例的全部 Edge 窗口（含无关窗口，未保存内容会丢失），需要 --confirm。");
+      report = await closeBrowser(home, run, alias, parseTimeout(values.timeout), dependencies.launchDependencies);
+    } else if (checkingIn && alias && positionals.length === 3) {
+      report = await checkinAccount(home, run, alias, parseTimeout(values.timeout ?? "3m"), {
+        ...dependencies.checkinDependencies,
+        force: values.force === true,
+      });
+    } else if (rechecking && alias && positionals.length === 3) {
+      report = await recheckAccount(home, run, alias, parseTimeout(values.timeout), {
+        dbFile: dependencies.recheckDbFile,
+      });
+    } else if (snapshotting && values.all === true && positionals.length === 2) {
+      report = await snapshotAll(home, run, parseTimeout(values.timeout), {
+        dbFile: dependencies.snapshotDbFile,
+      });
+    } else if (snapshotting && alias && positionals.length === 3) {
+      report = await snapshotAccount(home, run, alias, parseTimeout(values.timeout), {
+        dbFile: dependencies.snapshotDbFile,
+      });
+    } else if (reporting) {
+      return await runReport(values, output, dependencies);
     } else {
       throw new ZenxError("INVALID_ARGUMENT", "命令或参数不正确；运行 zenx --help 查看用法。");
     }
-    if (!asJson) output("连接在线或打开站点不等于登录身份验证；未执行签到。");
+    if (!asJson && !checkingIn && !closing && !rechecking && !snapshotting) output("连接在线或打开站点不等于登录身份验证；未执行签到。");
     output(JSON.stringify(report, null, 2));
     return report.ok === false ? 1 : 0;
   } catch (error) {

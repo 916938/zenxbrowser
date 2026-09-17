@@ -4,3 +4,8 @@ coverage/
 .zenx/
 .codebuddy/
 *.tsbuildinfo
+# 签到账本含账号身份与余额，不进版本库
+zenxbrowser/*.db
+zenxbrowser/*.db-wal
+zenxbrowser/*.db-shm
+zenxbrowser/*.db

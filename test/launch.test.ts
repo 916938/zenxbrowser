@@ -8,7 +8,7 @@ import { EventEmitter } from "node:events";
 import { syncBuiltinESMExports } from "node:module";
 import { checkAccounts, createRunner, readStore, withStoreLock, ZenxError } from "../src/core.ts";
 import type { Account, Browser, Runner } from "../src/core.ts";
-import { configureLaunch, ensureOnline } from "../src/launch.ts";
+import { closeBrowser, configureLaunch, ensureOnline, relinkProfile } from "../src/launch.ts";
 import type { LaunchConfig } from "../src/launch.ts";
 
 const edge: Browser = {
@@ -48,6 +48,18 @@ test("旧版绑定无需启动配置，在线直接返回且不启动", async (t
   assert.equal(await readFile(join(home, "accounts.json"), "utf8"), before);
 });
 
+test("ensure-online 接受协议 1.3，不启动、不修改绑定", async (t) => {
+  const { home } = await fixture(t);
+  const before = await readFile(join(home, "accounts.json"), "utf8");
+  const run: Runner = async (args) => {
+    assert.deepEqual(args, ["browsers", "--json"]);
+    return { stdout: JSON.stringify([{ ...edge, extension_protocol_version: "1.3" }]), exitCode: 0 };
+  };
+  const result = await ensureOnline(home, run, "work", 1000, { now: () => 0, launch: async () => { assert.fail("不应启动"); } });
+  assert.deepEqual(result, { ok: true, alias: "work", instanceId: edge.instance_id, connection: "online", launched: false, identity: "not_verified" });
+  assert.equal(await readFile(join(home, "accounts.json"), "utf8"), before);
+});
+
 test("保存配置保留绑定、其他账号和未知字段，修改仍需确认", windows, async (t) => {
   const { home, config } = await fixture(t);
   const saved = await configureLaunch(home, "work", config, true);
@@ -65,6 +77,118 @@ test("保存配置保留绑定、其他账号和未知字段，修改仍需确�
   assert.equal(updated.accounts[0].launch.futureLaunch, 456);
   assert.deepEqual(updated.accounts[1], personal);
   assert.deepEqual((await readdir(home)).filter((name) => name.endsWith(".tmp") || name.endsWith(".lock")), []);
+});
+
+// Edge 重启后扩展实例 ID 会变，账号里存的旧 ID 随之失效。relink-profile 按已配置的
+// Profile 重新定位：给候选实例开临时探测窗口，用窗口标题里的 Profile 序号反查归属。
+const browserA: Browser = { ...edge, instance_id: "aaaa1111" };
+const browserB: Browser = { ...edge, instance_id: "bbbb2222" };
+
+/** 让 relink 对指定实例判定为匹配（标题里带配置中的 Profile 序号）。 */
+function relinkDeps(matchIds: string[], profileDirectory: string) {
+  const marker = /^Profile (\d+)$/.exec(profileDirectory)?.[1] ?? profileDirectory.toLowerCase();
+  const titles: string[] = [];
+  const stops: string[][] = [];
+  return {
+    deps: {
+      listWindowTitles: async () => [...titles],
+      detectProfile: async (_before: string[], expected: string) => (
+        expected === profileDirectory && titles.some((title) => title.includes(`- ${marker} -`)) ? marker : null
+      ),
+      sleep: async () => {
+        // 探测窗口"挂载"：把标题补上，模拟窗口出现。
+        titles.push(`about:blank - ${marker} - Microsoft Edge`);
+      },
+      now: () => 0,
+    },
+    titles,
+    stops,
+    matchIds,
+  };
+}
+
+function relinkRunner(browsers: Browser[], harness: ReturnType<typeof relinkDeps>, sessionId = "wxyz") {
+  const stops: string[][] = [];
+  const run: Runner = async (args) => {
+    if (args[0] === "browsers") return { stdout: JSON.stringify(browsers), exitCode: 0 };
+    if (args[0] === "session" && args[1] === "start") {
+      assert.deepEqual(args.slice(2, 4), ["--browser-id", harness.matchIds[0]]);
+      return { stdout: JSON.stringify({ session_id: sessionId }), exitCode: 0 };
+    }
+    if (args[0] === "session" && args[1] === "stop") { stops.push(args); return { stdout: "stopped", exitCode: 0 }; }
+    throw new Error(`unexpected: ${args.join(" ")}`);
+  };
+  return { run, stops };
+}
+
+test("relink-profile 按 Profile 命中唯一实例时改绑，并回收探测窗口", async (t) => {
+  const { home, config } = await fixture(t);
+  await configureLaunch(home, "work", config, true);
+  const harness = relinkDeps([browserA.instance_id], config.profileDirectory);
+  const { run, stops } = relinkRunner([browserA], harness);
+
+  const result = await relinkProfile(home, run, "work", 30_000, harness.deps);
+  assert.deepEqual(result, {
+    ok: true, alias: "work", profileDirectory: "Profile 3",
+    previousInstanceId: account.instanceId, instanceId: browserA.instance_id, changed: true,
+  });
+  assert.deepEqual(stops, [["session", "stop", "wxyz"]], "探测窗口必须关闭，不能在桌面留下空白 Edge");
+  assert.equal((await readStore(home)).accounts[0].instanceId, browserA.instance_id);
+});
+
+test("relink-profile 实例 ID 未变时报告 changed:false", async (t) => {
+  const { home, config } = await fixture(t);
+  await configureLaunch(home, "work", config, true);
+  const harness = relinkDeps([edge.instance_id], config.profileDirectory);
+  const { run } = relinkRunner([edge], harness);
+  const result = await relinkProfile(home, run, "work", 30_000, harness.deps);
+  assert.equal(result.changed, false);
+  assert.equal(result.instanceId, edge.instance_id);
+});
+
+test("relink-profile 没有实例属于该 Profile → PROFILE_NOT_FOUND，不改绑", async (t) => {
+  const { home, config } = await fixture(t);
+  await configureLaunch(home, "work", config, true);
+  const harness = relinkDeps([browserA.instance_id], config.profileDirectory);
+  // 探测永远不返回标记：模拟该实例属于别的 Profile。
+  const { run } = relinkRunner([browserA], harness);
+  const before = await readFile(join(home, "accounts.json"), "utf8");
+  await assert.rejects(
+    relinkProfile(home, run, "work", 30_000, { ...harness.deps, detectProfile: async () => null }),
+    { code: "PROFILE_NOT_FOUND" },
+  );
+  assert.equal(await readFile(join(home, "accounts.json"), "utf8"), before);
+});
+
+test("relink-profile 多个实例同属该 Profile → PROFILE_AMBIGUOUS，不改绑", async (t) => {
+  const { home, config } = await fixture(t);
+  await configureLaunch(home, "work", config, true);
+  const harness = relinkDeps([browserA.instance_id, browserB.instance_id], config.profileDirectory);
+  const runners: Runner[] = [];
+  for (const browser of [browserA, browserB]) {
+    runners.push(relinkRunner([browser], harness).run);
+  }
+  const before = await readFile(join(home, "accounts.json"), "utf8");
+  // 两个实例都报匹配（真实命令会逐个探测，这里直接构造两个匹配结果）。
+  const run: Runner = async (args) => {
+    if (args[0] === "browsers") return { stdout: JSON.stringify([browserA, browserB]), exitCode: 0 };
+    if (args[0] === "session" && args[1] === "start") return { stdout: JSON.stringify({ session_id: "wxyz" }), exitCode: 0 };
+    if (args[0] === "session" && args[1] === "stop") return { stdout: "stopped", exitCode: 0 };
+    throw new Error(`unexpected: ${args.join(" ")}`);
+  };
+  await assert.rejects(relinkProfile(home, run, "work", 30_000, harness.deps), { code: "PROFILE_AMBIGUOUS" });
+  assert.equal(await readFile(join(home, "accounts.json"), "utf8"), before);
+});
+
+test("relink-profile 未配置启动路径 → LAUNCH_NOT_CONFIGURED", async (t) => {
+  const { home } = await fixture(t);
+  await assert.rejects(relinkProfile(home, online, "work", 30_000), { code: "LAUNCH_NOT_CONFIGURED" });
+});
+
+test("relink-profile 无在线 Edge → NO_EDGE_CONNECTED", async (t) => {
+  const { home, config } = await fixture(t);
+  await configureLaunch(home, "work", config, true);
+  await assert.rejects(relinkProfile(home, offline, "work", 30_000), { code: "NO_EDGE_CONNECTED" });
 });
 
 test("未确认、未知别名均不保存配置", windows, async (t) => {
@@ -142,6 +266,12 @@ test("在线错误浏览器或协议不能成功，不调用启动", async (t) =
   const { home } = await fixture(t);
   for (const [browser, code] of [[{ ...edge, browser_name: "Chrome" }, "NOT_EDGE"], [{ ...edge, extension_protocol_version: "2.0" }, "UNSUPPORTED_PROTOCOL"]] as const) {
     await assert.rejects(ensureOnline(home, async () => ({ stdout: JSON.stringify([browser]), exitCode: 0 }), "work", 1000, { launch: async () => { assert.fail("不应启动"); } }), { code });
+  }
+  for (const extension_protocol_version of ["1.2", "1.4", "1.3.0", " 1.3", "1.3 "]) {
+    await assert.rejects(ensureOnline(home, async (args) => {
+      assert.deepEqual(args, ["browsers", "--json"]);
+      return { stdout: JSON.stringify([{ ...edge, extension_protocol_version }]), exitCode: 0 };
+    }, "work", 1000, { now: () => 0, launch: async () => { assert.fail("不应启动"); } }), { code: "UNSUPPORTED_PROTOCOL", message: /当前仅支持 1\.0 \/ 1\.1 \/ 1\.3。/ });
   }
   await assert.rejects(ensureOnline(home, offline, "work"), { code: "LAUNCH_NOT_CONFIGURED" });
 });
@@ -288,5 +418,71 @@ test("等待预算拒绝零、负数、无穷、非整数和超过五分钟", as
   const { home } = await fixture(t);
   for (const timeout of [0, -1, NaN, Infinity, 1.5, 300001]) {
     await assert.rejects(ensureOnline(home, async () => { assert.fail("不应查询"); }, "work", timeout), { code: "INVALID_TIMEOUT" });
+  }
+});
+
+const closeReply = JSON.stringify({ browser_id: edge.instance_id, closed: true, windows_closed: 2, sessions_stopped: 1, disconnected: false });
+
+test("关闭在线实例：精确实例 ID、零等待、回显结果且不改绑定", async (t) => {
+  const { home } = await fixture(t);
+  const before = await readFile(join(home, "accounts.json"), "utf8");
+  const time = clock();
+  const calls: string[][] = [];
+  const budgets: number[] = [];
+  const run: Runner = async (args, options) => {
+    calls.push(args);
+    if (args[0] === "browsers" && args[1] === "--json") {
+      assert.equal(options?.env?.BSK_BROWSER_WAIT_MS, "0");
+      budgets.push(options!.timeoutMs!);
+      time.advance(100);
+      return { stdout: JSON.stringify([edge]), exitCode: 0 };
+    }
+    budgets.push(options!.timeoutMs!);
+    return { stdout: closeReply, exitCode: 0 };
+  };
+  const result = await closeBrowser(home, run, "work", 5000, time);
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, [["browsers", "--json"], ["browsers", "close", "--browser-id", edge.instance_id, "--confirm", "--json"]]);
+  assert.deepEqual(budgets, [5000, 4900]);
+  assert.deepEqual(result, {
+    ok: true, alias: "work", instanceId: edge.instance_id, browser_id: edge.instance_id,
+    closed: true, windows_closed: 2, sessions_stopped: 1, disconnected: false, identity: "not_verified",
+  });
+  assert.equal(await readFile(join(home, "accounts.json"), "utf8"), before);
+});
+
+test("离线、非 Edge 或协议不兼容都不调用关闭", async (t) => {
+  const { home } = await fixture(t);
+  const offlineOrWrong: [Browser | null, string][] = [
+    [null, "INSTANCE_OFFLINE"],
+    [{ ...edge, browser_name: "Chrome" }, "NOT_EDGE"],
+    [{ ...edge, extension_protocol_version: "2.0" }, "UNSUPPORTED_PROTOCOL"],
+  ];
+  for (const [browser, code] of offlineOrWrong) {
+    let closed = 0;
+    await assert.rejects(closeBrowser(home, async (args) => {
+      if (args.includes("close")) { closed++; assert.fail("不应关闭"); }
+      return { stdout: JSON.stringify(browser ? [browser] : []), exitCode: 0 };
+    }, "work", 1000), { code });
+    assert.equal(closed, 0);
+  }
+  // 标签恰好等于目标 ID 也不能作为关闭对象。
+  await assert.rejects(closeBrowser(home, async () => ({ stdout: JSON.stringify([{ ...edge, instance_id: "eeee1111", label: edge.instance_id }]), exitCode: 0 }), "work", 1000), { code: "INSTANCE_OFFLINE" });
+});
+
+test("关闭失败或不回显目标实例都不重试，报错交给人工核对", async (t) => {
+  const { home } = await fixture(t);
+  for (const [reply, code] of [
+    [{ stdout: "", exitCode: 1 }, "BSK_FAILED"],
+    [{ stdout: "not-json", exitCode: 0 }, "INVALID_BSK_OUTPUT"],
+    [{ stdout: JSON.stringify({ browser_id: "eeee1111", closed: true, windows_closed: 1, sessions_stopped: 0, disconnected: false }), exitCode: 0 }, "INVALID_BSK_OUTPUT"],
+    [{ stdout: JSON.stringify({ browser_id: edge.instance_id, closed: "yes", windows_closed: 1, sessions_stopped: 0, disconnected: false }), exitCode: 0 }, "INVALID_BSK_OUTPUT"],
+  ] as const) {
+    let attempts = 0;
+    await assert.rejects(closeBrowser(home, async (args) => {
+      if (args.includes("close")) { attempts++; return reply; }
+      return { stdout: JSON.stringify([edge]), exitCode: 0 };
+    }, "work", 1000), { code });
+    assert.equal(attempts, 1);
   }
 });

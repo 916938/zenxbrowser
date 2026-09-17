@@ -66,12 +66,28 @@ test("标签恰好等于目标 ID 时不回退到该浏览器", async (t) => {
   await assert.rejects(bindAccount(home, mock([other]), binding, true), { code: "INSTANCE_OFFLINE" });
 });
 
+for (const extension_protocol_version of ["1.0", "1.1", "1.3"]) {
+  test(`协议 ${extension_protocol_version} 可绑定且 check 在线`, async (t) => {
+    const home = await temporary(t);
+    const run = mock([{ ...edge, extension_protocol_version }]);
+    await bindAccount(home, run, binding, true);
+    assert.equal((await readStore(home)).accounts[0].instanceId, edge.instance_id);
+    const result = await checkAccounts(home, run);
+    assert.equal(result.ok, true);
+    assert.equal(result.accounts[0].connection, "online");
+    assert.equal(result.accounts[0].identity, "not_verified");
+  });
+}
+
+const unsupportedProtocols = ["", "1.2", "1.4", "1.9", "2.0", "1.30", "1.3.0", " 1.3", "1.3 ", "v1.3", "1.3-beta"];
+
 test("绑定仅允许 Edge 和已支持协议", async (t) => {
   const home = await temporary(t);
   await assert.rejects(bindAccount(home, mock([{ ...edge, browser_name: "Chrome" }]), binding, true), { code: "NOT_EDGE" });
-  for (const extension_protocol_version of ["", "2.0", "1.9"]) {
-    await assert.rejects(bindAccount(home, mock([{ ...edge, extension_protocol_version }]), binding, true), { code: "UNSUPPORTED_PROTOCOL" });
+  for (const extension_protocol_version of unsupportedProtocols) {
+    await assert.rejects(bindAccount(home, mock([{ ...edge, extension_protocol_version }]), binding, true), { code: "UNSUPPORTED_PROTOCOL", message: /当前仅支持 1\.0 \/ 1\.1 \/ 1\.3。/ });
   }
+  assert.deepEqual((await readStore(home)).accounts, []);
 });
 
 test("重复别名或重复实例绑定不覆盖原数据", async (t) => {
@@ -115,7 +131,11 @@ test("连接使用错误浏览器或未知协议时失败", async (t) => {
   const home = await temporary(t);
   await bindAccount(home, mock(), binding, true);
   assert.equal((await checkAccounts(home, mock([{ ...edge, browser_name: "Chrome" }]))).accounts[0].connection, "wrong_browser");
-  assert.equal((await checkAccounts(home, mock([{ ...edge, extension_protocol_version: "2.0" }]))).accounts[0].connection, "unsupported_protocol");
+  for (const extension_protocol_version of unsupportedProtocols) {
+    const result = await checkAccounts(home, mock([{ ...edge, extension_protocol_version }]));
+    assert.equal(result.ok, false);
+    assert.equal(result.accounts[0].connection, "unsupported_protocol");
+  }
 });
 
 test("损坏、未来版本和重复配置均不覆盖", async (t) => {
@@ -242,9 +262,17 @@ const invalidLaunchCommands: { name: string; args: string[]; code: string }[] = 
   { name: "configure-launch 无关 instance-id", args: ["accounts", "configure-launch", "work", ...launchOptions, "--confirm", "--instance-id", edge.instance_id], code: "INVALID_ARGUMENT" },
   { name: "ensure-online 无关 confirm", args: ["accounts", "ensure-online", "work", "--confirm"], code: "INVALID_ARGUMENT" },
   { name: "ensure-online 无关 edge-path", args: ["accounts", "ensure-online", "work", "--edge-path", launchOptions[1]], code: "INVALID_ARGUMENT" },
+  { name: "relink-profile 无 confirm", args: ["accounts", "relink-profile", "work"], code: "CONFIRM_REQUIRED" },
+  { name: "relink-profile 缺 alias", args: ["accounts", "relink-profile", "--confirm"], code: "INVALID_ARGUMENT" },
+  { name: "relink-profile 无关 tab-id", args: ["accounts", "relink-profile", "work", "--confirm", "--tab-id", "1"], code: "INVALID_ARGUMENT" },
+  { name: "relink-profile 非法 timeout", args: ["accounts", "relink-profile", "work", "--confirm", "--timeout", "0s"], code: "INVALID_TIMEOUT" },
   { name: "check 无关 timeout", args: ["accounts", "check", "--timeout", "1s"], code: "INVALID_ARGUMENT" },
   { name: "configure-launch 重复 edge-path", args: ["accounts", "configure-launch", "work", ...launchOptions, "--edge-path=C:\\Other\\msedge.exe", "--confirm"], code: "INVALID_ARGUMENT" },
   { name: "ensure-online 重复 timeout", args: ["accounts", "ensure-online", "work", "--timeout", "1s", "--timeout=2s"], code: "INVALID_ARGUMENT" },
+  { name: "close 无 confirm", args: ["accounts", "close", "work"], code: "CONFIRM_REQUIRED" },
+  { name: "close 缺 alias", args: ["accounts", "close", "--confirm"], code: "INVALID_ARGUMENT" },
+  { name: "close 未知 alias", args: ["accounts", "close", "unknown", "--confirm"], code: "ACCOUNT_NOT_FOUND" },
+  { name: "close 无关 tab-id", args: ["accounts", "close", "work", "--confirm", "--tab-id", "1"], code: "INVALID_ARGUMENT" },
 ];
 for (const option of ["--edge-path", "--user-data-dir", "--profile-directory"]) {
   invalidLaunchCommands.push({
@@ -301,6 +329,41 @@ test("CLI ensure-online 在线无需配置，不启动且默认查询预算为 4
   assert.equal(lines.length, 1);
   assert.deepEqual(JSON.parse(lines[0]), { ok: true, alias: "work", instanceId: edge.instance_id, connection: "online", launched: false, identity: "not_verified" });
   assert.equal((await readStore(home)).accounts[0].launch, undefined);
+  assert.equal(await readFile(join(home, "accounts.json"), "utf8"), before);
+});
+
+const closeReply = JSON.stringify({ browser_id: edge.instance_id, closed: true, windows_closed: 2, sessions_stopped: 1, disconnected: false });
+
+test("CLI accounts close 按精确实例 ID 关闭，不启动也不改绑定", async (t) => {
+  const { home } = await launchFixture(t);
+  const before = await readFile(join(home, "accounts.json"), "utf8");
+  const lines: string[] = [];
+  const calls: string[][] = [];
+  let launches = 0;
+  const code = await main(["accounts", "close", "work", "--confirm", "--json"], {
+    home, output: (line) => lines.push(line),
+    run: async (args, options) => {
+      calls.push(args);
+      if (args[1] === "close") {
+        assert.deepEqual(options, { timeoutMs: 45_000 });
+        return { stdout: closeReply, exitCode: 0 };
+      }
+      assert.deepEqual(options, { timeoutMs: 45_000, env: { BSK_BROWSER_WAIT_MS: "0" } });
+      return { stdout: JSON.stringify([edge]), exitCode: 0 };
+    },
+    launchDependencies: { now: () => 1000, launch: async () => { launches++; } },
+  });
+  assert.equal(code, 0);
+  assert.deepEqual(calls, [
+    ["browsers", "--json"],
+    ["browsers", "close", "--browser-id", edge.instance_id, "--confirm", "--json"],
+  ]);
+  assert.equal(launches, 0);
+  assert.equal(lines.length, 1);
+  assert.deepEqual(JSON.parse(lines[0]), {
+    ok: true, alias: "work", instanceId: edge.instance_id, browser_id: edge.instance_id,
+    closed: true, windows_closed: 2, sessions_stopped: 1, disconnected: false, identity: "not_verified",
+  });
   assert.equal(await readFile(join(home, "accounts.json"), "utf8"), before);
 });
 

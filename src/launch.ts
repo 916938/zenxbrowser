@@ -7,6 +7,7 @@ import { isEdge, listBrowsers, protocolSupported, readStore, updateStore, withSt
 import type { Account, Runner, Store } from "./core.ts";
 import { isLaunchConfig } from "./launch-config.ts";
 import { isTabId, inspectAgentRouter, openAgentRouter } from "./site.ts";
+import { detectProfile, listEdgeWindowTitles } from "./window-titles.ts";
 import type { LaunchConfig } from "./launch-config.ts";
 
 export type { LaunchConfig } from "./launch-config.ts";
@@ -15,9 +16,12 @@ export type LaunchDependencies = {
   platform?: NodeJS.Platform;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  /** 启动后等待窗口挂载的探测钩子；返回新窗口所属 Profile 是否匹配。 */
+  detectProfile?: (before: string[], profileDirectory: string) => Promise<string | null>;
+  listWindowTitles?: () => Promise<string[]>;
 };
 
-function findAccount(store: Store, alias: string): Account {
+export function findAccount(store: Store, alias: string): Account {
   const account = store.accounts.find((item) => item.alias === alias);
   if (!account) throw new ZenxError("ACCOUNT_NOT_FOUND", "账号别名尚未绑定；请先核对并绑定精确实例 ID。");
   return account;
@@ -86,6 +90,19 @@ export async function configureLaunch(home: string, alias: string, config: Launc
   });
 }
 
+/** 探测窗口归属时的轮询参数（窗口挂载需要时间，不能只 sleep 固定值）。 */
+const PROFILE_PROBE_INTERVAL_MS = 500;
+const PROFILE_PROBE_ATTEMPTS = 12;
+
+function parseSessionStart(raw: string): string {
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { throw new Error("bad json"); }
+  if (typeof value !== "object" || value === null) throw new Error("bad shape");
+  const sessionId = (value as { session_id?: unknown }).session_id;
+  if (typeof sessionId !== "string" || !/^[a-z0-9]{4,12}$/i.test(sessionId)) throw new Error("bad id");
+  return sessionId;
+}
+
 async function launchEdge(config: LaunchConfig): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(config.edgePath, [
@@ -129,7 +146,7 @@ async function ensureOnlineLocked(store: Store, account: Account, run: Runner, r
     const browser = browsers.find((item) => item.instance_id === account.instanceId);
     if (browser) {
       if (!isEdge(browser)) throw new ZenxError("NOT_EDGE", "目标实例不是 Microsoft Edge；不会改选其他浏览器。");
-      if (!protocolSupported(browser)) throw new ZenxError("UNSUPPORTED_PROTOCOL", "目标扩展协议不兼容；当前仅支持 1.0 / 1.1。");
+      if (!protocolSupported(browser)) throw new ZenxError("UNSUPPORTED_PROTOCOL", "目标扩展协议不兼容；当前仅支持 1.0 / 1.1 / 1.3。");
       return launched;
     }
     if (!launched) {
@@ -164,6 +181,84 @@ export async function ensureOnline(
   });
 }
 
+function parseCloseReply(raw: string, instanceId: string): {
+  browser_id: string;
+  closed: boolean;
+  windows_closed: number;
+  sessions_stopped: number;
+  disconnected: boolean;
+} {
+  let value: unknown;
+  try { value = JSON.parse(raw); }
+  // 关闭可能已经生效：解析失败只报告"无法确认"，绝不重试、绝不改选实例。
+  catch { throw new ZenxError("INVALID_BSK_OUTPUT", "bsk 未返回有效 JSON；关闭可能已生效，不会重试，请用 zenx accounts check 确认。"); }
+  if (typeof value !== "object" || value === null) throw new ZenxError("INVALID_BSK_OUTPUT", "bsk 关闭结果不是对象；关闭可能已生效，不会重试。");
+  const result = value as { browser_id?: unknown; closed?: unknown; windows_closed?: unknown; sessions_stopped?: unknown; disconnected?: unknown };
+  if (result.browser_id !== instanceId || typeof result.closed !== "boolean" || typeof result.disconnected !== "boolean" ||
+    !Number.isSafeInteger(result.windows_closed) || !Number.isSafeInteger(result.sessions_stopped)) {
+    throw new ZenxError("INVALID_BSK_OUTPUT", "bsk 关闭结果字段异常或未回显目标实例；关闭可能已生效，不会重试，请用 zenx accounts check 确认。");
+  }
+  return {
+    browser_id: instanceId,
+    closed: result.closed,
+    windows_closed: result.windows_closed as number,
+    sessions_stopped: result.sessions_stopped as number,
+    disconnected: result.disconnected,
+  };
+}
+
+/**
+ * 与 ensure-online 成对：关闭账号绑定的那个 Edge 实例（停止其全部会话后关闭
+ * 所有窗口，浏览器进程随之退出）。
+ *
+ * 安全措施：
+ * - 只用账号里已绑定的精确 instanceId；不按标签/前缀匹配，离线直接报错，不会改选。
+ * - 调用前先确认该实例在线且是协议兼容的 Edge，避免关到别的浏览器。
+ * - bsk 侧要求 --confirm，本命令同样要求调用方已确认（CLI 层强制 --confirm）。
+ * - 失败一律不重试、不杀进程：关闭可能已生效，报告"无法确认"交给人工核对。
+ */
+export async function closeBrowser(
+  home: string,
+  run: Runner,
+  alias: string,
+  timeoutMs: number = 45_000,
+  dependencies: LaunchDependencies = {},
+): Promise<{
+  ok: true;
+  alias: string;
+  instanceId: string;
+  browser_id: string;
+  closed: boolean;
+  windows_closed: number;
+  sessions_stopped: number;
+  disconnected: boolean;
+  identity: "not_verified";
+}> {
+  const remaining = deadlineBudget(timeoutMs, dependencies);
+  const store = await readStore(home);
+  const account = findAccount(store, alias);
+  const browsers = await listBrowsers(run, {
+    timeoutMs: Math.min(60_000, remaining()),
+    env: { BSK_BROWSER_WAIT_MS: "0" },
+  });
+  remaining();
+  const browser = browsers.find((item) => item.instance_id === account.instanceId);
+  if (!browser) throw new ZenxError("INSTANCE_OFFLINE", "目标实例未在线：没有可关闭的 Edge；未调用关闭，也不会改选其他实例。");
+  if (!isEdge(browser)) throw new ZenxError("NOT_EDGE", "目标实例不是 Microsoft Edge；不会关闭。");
+  if (!protocolSupported(browser)) throw new ZenxError("UNSUPPORTED_PROTOCOL", "目标扩展协议不兼容；当前仅支持 1.0 / 1.1 / 1.3，不会关闭。");
+  remaining();
+  const reply = await run(
+    ["browsers", "close", "--browser-id", account.instanceId, "--confirm", "--json"],
+    { timeoutMs: Math.min(60_000, remaining()) },
+  );
+  if (reply.exitCode !== 0) {
+    const detail = reply.stdout.trim().slice(0, 200);
+    throw new ZenxError("BSK_FAILED", "bsk 未能确认浏览器已关闭；关闭可能已生效，不会自动重试，请用 zenx accounts check 核对。", detail ? { detail } : undefined);
+  }
+  const result = parseCloseReply(reply.stdout, account.instanceId);
+  return { ok: true, alias: account.alias, instanceId: account.instanceId, ...result, identity: "not_verified" };
+}
+
 export async function openSite(
   home: string,
   run: Runner,
@@ -180,6 +275,84 @@ export async function openSite(
     const launched = await ensureOnlineLocked(store, account, run, remaining, dependencies);
     const result = await openAgentRouter(run, account.instanceId, tabId, remaining);
     return { ok: true, alias: account.alias, instanceId: account.instanceId, ...result, identity: "not_verified", launched };
+  });
+}
+
+/**
+ * 按 Profile 重新定位实例：Edge 重启后扩展实例 ID 会变，账号里存的旧 ID 就失效了
+ * （表现为 ensure-online 一直报 offline）。本命令给每个在线实例开一个隔离窗口，
+ * 用窗口标题里的 Profile 序号反查它属于哪个 Profile，匹配上就把账号改绑到新 ID。
+ *
+ * 安全措施：
+ * - 必须 --confirm，且账号必须先配置好 launch（Profile 路径是唯一可信依据）。
+ * - 目标 Profile 在候选里必须唯一；多个实例报同一 Profile 时拒绝改绑。
+ * - 不启动、不关闭任何 Edge，只读取窗口标题。
+ */
+export async function relinkProfile(
+  home: string,
+  run: Runner,
+  alias: string,
+  timeoutMs: number = 120_000,
+  dependencies: LaunchDependencies = {},
+): Promise<{ ok: true; alias: string; profileDirectory: string; previousInstanceId: string; instanceId: string; changed: boolean }> {
+  const remaining = deadlineBudget(timeoutMs, dependencies);
+  const sleep = dependencies.sleep ?? delay;
+  const listTitles = dependencies.listWindowTitles ?? listEdgeWindowTitles;
+  const detect = dependencies.detectProfile ?? detectProfile;
+
+  return updateStore(home, async (store) => {
+    const account = findAccount(store, alias);
+    if (!account.launch) {
+      throw new ZenxError("LAUNCH_NOT_CONFIGURED", "该账号尚未配置启动路径；没有 Profile 可依据，无法按 Profile 定位。请先用 configure-launch 配置。");
+    }
+    const browsers = await listBrowsers(run, {
+      timeoutMs: Math.min(60_000, remaining()),
+      env: { BSK_BROWSER_WAIT_MS: "0" },
+    });
+    remaining();
+    const candidates = browsers.filter((item) => isEdge(item) && protocolSupported(item));
+    if (candidates.length === 0) throw new ZenxError("NO_EDGE_CONNECTED", "当前没有在线且兼容的 Edge 实例；请先启动目标 Profile 的 Edge。");
+
+    const matched: string[] = [];
+    for (const browser of candidates) {
+      // 已经指向自己的实例直接认定匹配，无需开窗口探测。
+      if (browser.instance_id === account.instanceId) { matched.push(browser.instance_id); continue; }
+      const before = await listTitles();
+      const startReply = await run(
+        ["session", "start", "--browser-id", browser.instance_id, "--width", "1280", "--height", "800", "--json"],
+        { timeoutMs: Math.min(60_000, remaining()), env: { BSK_BROWSER_WAIT_MS: "0" } },
+      );
+      remaining();
+      if (startReply.exitCode !== 0) continue;
+      let sessionId = "";
+      try { sessionId = parseSessionStart(startReply.stdout); } catch { continue; }
+      try {
+        // 窗口挂载需要时间，轮询等待而非固定 sleep。次数必须有上限：
+        // 若时间源停滞（注入的 now 不动），只靠 deadline 会变成死循环。
+        let marker: string | null = null;
+        for (let attempt = 0; attempt < PROFILE_PROBE_ATTEMPTS; attempt++) {
+          marker = await detect(before, account.launch.profileDirectory);
+          if (marker) break;
+          if (attempt > 0) await sleep(Math.min(PROFILE_PROBE_INTERVAL_MS, remaining()));
+        }
+        if (marker) matched.push(browser.instance_id);
+      } finally {
+        // 探测用的窗口必须回收，否则会在桌面留下空白 Edge 窗口。
+        await run(["session", "stop", sessionId], { timeoutMs: 30_000 }).catch(() => undefined);
+      }
+    }
+
+    if (matched.length === 0) {
+      throw new ZenxError("PROFILE_NOT_FOUND", `没有在线实例属于 Profile「${account.launch.profileDirectory}」；请确认该 Profile 的 Edge 已启动且扩展已连接。`);
+    }
+    if (matched.length > 1) {
+      throw new ZenxError("PROFILE_AMBIGUOUS", `有 ${matched.length} 个在线实例都指向 Profile「${account.launch.profileDirectory}」（${matched.join(", ")}）；无法判定，未改绑。`);
+    }
+    const [instanceId] = matched;
+    const changed = instanceId !== account.instanceId;
+    const previousInstanceId = account.instanceId;
+    account.instanceId = instanceId;
+    return { ok: true, alias: account.alias, profileDirectory: account.launch.profileDirectory, previousInstanceId, instanceId, changed };
   });
 }
 
