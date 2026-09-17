@@ -12,6 +12,8 @@ ZenX Browser 项目由以下三个子项目构成：
 
 `zenx` 是本仓库自带的 Windows Edge 多账号连接台（入口 `src/cli.ts`，Node ≥ 22.18 可直接运行 TypeScript），通过 `bsk` CLI 与 Edge 扩展管理多个 Edge Profile 上的 AgentRouter 账号。
 
+> **日常怎么跑、出问题怎么办、数字怎么算**，见 [`docs/operations.md`](docs/operations.md)（操作指南 / 排障手册）。本文件是命令与设计参考。
+
 ```powershell
 node src/cli.ts --help    # 查看全部用法；也可 npm start -- --help
 ```
