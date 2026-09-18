@@ -52,6 +52,18 @@ test("快照写入余额与站点累计消耗", async (t) => {
   assert.equal(rows[0].ok, true);
 });
 
+test("英文界面的账号也能读出余额与累计消耗", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  // Real page text from an account whose site UI renders in English.
+  const english = "Agent Router Home Console Docs 15 G github_16350 CONSOLE Dashboard " +
+    "Account Data Current balance $1187.41 Consumption $1412.59 Usage Statistics";
+  const result = await snapshotAccount(home, runner({ text: english }), account.alias, 45_000, { dbFile, ...fast });
+  assert.equal(result.ok, true);
+  assert.equal(result.balance, 1187.41);
+  assert.equal(result.totalSpent, 1412.59);
+  assert.equal(listSnapshots({ alias: account.alias }, dbFile)[0].totalSpent, 1412.59);
+});
+
 test("未登录也写快照并记失败原因", async (t) => {
   const { home, dbFile } = await temporary(t);
   const result = await snapshotAccount(home, runner({ text: LOGGED_OUT }), account.alias, 45_000, { dbFile, ...fast });

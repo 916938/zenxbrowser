@@ -46,9 +46,13 @@ function parseEvaluate(raw: string): string {
   return value.value;
 }
 
-/** 控制台上的"当前余额 $X"。页面没渲染出来时返回 null（不算失败）。 */
+/**
+ * 控制台上的"当前余额 $X"。页面没渲染出来时返回 null（不算失败）。
+ * 站点界面语言随账号而异（实测同一站点有的号是中文"当前余额"、有的是英文
+ * "Current balance"），两种都要认，否则英文界面的号永远读不到余额。
+ */
 export function extractBalance(text: string): number | null {
-  const match = /当前余额\s*\$([\d,]+(?:\.\d+)?)/.exec(text);
+  const match = /当前余额\s*\$([\d,]+(?:\.\d+)?)/.exec(text) ?? /\bCurrent balance\s*\$([\d,]+(?:\.\d+)?)/i.exec(text);
   if (!match) return null;
   const value = Number(match[1].replace(/,/g, ""));
   return Number.isFinite(value) ? value : null;
@@ -60,7 +64,7 @@ export function extractBalance(text: string): number | null {
  * 余额同时被签到发放和消耗影响，缺口法会把"没签到"误算成"花多了"。
  */
 export function extractTotalSpent(text: string): number | null {
-  const match = /历史消耗\s*\$([\d,]+(?:\.\d+)?)/.exec(text);
+  const match = /历史消耗\s*\$([\d,]+(?:\.\d+)?)/.exec(text) ?? /\bConsumption\s*\$([\d,]+(?:\.\d+)?)/i.exec(text);
   if (!match) return null;
   const value = Number(match[1].replace(/,/g, ""));
   return Number.isFinite(value) ? value : null;

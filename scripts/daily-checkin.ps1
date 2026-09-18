@@ -14,7 +14,8 @@ $repo    = "D:\916938\zenxbrowser"          # zenx repo path
 # edge-4 (linuxdo_25672) and edge-10 (linuxdo_27030) sign in through GitHub; the site keeps
 # the linuxdo_* identity, so they run through the same checkin flow as the github_* accounts.
 $aliases = @("edge-1", "edge-2", "edge-3", "edge-4", "edge-5", "edge-6", "edge-7", "edge-8", "edge-9", "edge-10",
-             "edge-p3", "edge-p11", "edge-p12", "edge-p13", "edge-p14")  # all bound accounts with a verified site identity
+             "edge-p3", "edge-p11", "edge-p12", "edge-p13", "edge-p14",
+             "edge-p15", "edge-p16")  # all bound accounts with a verified site identity
 $cli     = Join-Path $repo "src\cli.ts"
 $log     = Join-Path $repo ".zenx\logs\checkin-$(Get-Date -Format yyyyMMdd).log"
 New-Item (Split-Path $log) -ItemType Directory -Force | Out-Null
