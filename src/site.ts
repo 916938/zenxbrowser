@@ -1,7 +1,8 @@
 import { ZenxError } from "./core.ts";
 import type { Runner } from "./core.ts";
+import { agentRouter } from "./sites/agentrouter.ts";
 
-const siteUrl = "https://agentrouter.org/";
+const siteUrl = `${agentRouter.origin}/`;
 type UserTab = { tab_id: number; window_id: number; title: string; url: string; active: boolean; scope: "user" };
 
 export function isTabId(value: unknown): value is number {
@@ -40,7 +41,11 @@ function matchingOrigin(raw: string): string | undefined {
   const url = new URL(raw);
   if (!/^https?:\/\//i.test(raw) || /[\s\\]/.test(raw)) return;
   const authority = raw.slice(raw.indexOf("://") + 3).split(/[/?#]/)[0];
-  if (authority.includes("@") || url.username || url.password || url.port || url.hostname !== "agentrouter.org" ||
+  // 域名归属由站点适配器声明。注意是**精确匹配**，不是"以域名结尾"：
+  // sub.agentrouter.org、agentrouter.org.evil.test 这类都不是本站，
+  // 放宽到后缀匹配会让无关标签页混进候选（有测试专门守这条）。
+  if (authority.includes("@") || url.username || url.password || url.port ||
+    url.hostname !== agentRouter.domain ||
     !["http:", "https:"].includes(url.protocol)) return;
   return url.origin;
 }
@@ -100,8 +105,7 @@ export async function openAgentRouter(run: Runner, instanceId: string, tabId: nu
 
 // 只读观察：不创建/切换/刷新标签，不启动 Edge，不读取表单值、存储或网络。
 // 信号只是可见正文的启发式关键词命中，供人工或上层流程参考，不构成签到结论。
-const CHECKED_IN_PATTERNS = ["已签到", "已打卡", "今日已签到", "签到成功", "打卡成功", "checked in", "already checked in"];
-const CHECKIN_ACTION_PATTERNS = ["每日签到", "每日打卡", "立即签到", "今日签到", "check in", "check-in", "daily check"];
+
 
 export type Observation = {
   origin: string;
@@ -147,13 +151,12 @@ export async function inspectAgentRouter(run: Runner, instanceId: string, expect
   remaining();
   if (reply.exitCode !== 0) throw inspectFailure(reply.stdout);
   const observed = parseObservation(reply.stdout, instanceId, selected);
-  const lower = observed.text.toLowerCase();
   const observation: Observation = {
     ...observed,
     identity: observed.text.includes(expectedIdentity) ? "matched" : "absent",
     signals: {
-      checkedIn: CHECKED_IN_PATTERNS.filter((pattern) => lower.includes(pattern.toLowerCase())),
-      checkinAction: CHECKIN_ACTION_PATTERNS.filter((pattern) => lower.includes(pattern.toLowerCase())),
+      checkedIn: agentRouter.classify.checkedInSignals(observed.text),
+      checkinAction: agentRouter.classify.checkinActionSignals(observed.text),
     },
   };
   return { siteTab: { tabId: selected.tab_id, windowId: selected.window_id, active: selected.active }, observation };

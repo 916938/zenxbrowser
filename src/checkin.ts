@@ -4,6 +4,7 @@ import { isEdge, listBrowsers, protocolSupported, readStore, withStoreLock, Zenx
 import type { Account, Runner } from "./core.ts";
 import { DEFAULT_DB_FILE, hasCreditedBetween, insertCheckin } from "./db.ts";
 import { findAccount } from "./launch.ts";
+import { agentRouter } from "./sites/agentrouter.ts";
 
 export type CheckinDependencies = {
   now?: () => number;
@@ -16,7 +17,7 @@ export type CheckinDependencies = {
   force?: boolean;
 };
 
-const siteUrl = "https://agentrouter.org/console";
+const siteUrl = agentRouter.consoleUrl;
 const SESSION_OBSERVE_MAX_LENGTH = 100_000;
 const LOGIN_POLL_INTERVAL_MS = 2_000;
 const LOGIN_POLL_BUDGET_MS = 60_000;
@@ -192,37 +193,11 @@ function oauthNavigateExpression(url: string): string {
  * 站点登录限流特征。限流是**站点侧的共享配额**（同一出口 IP 连续登录若干次后触发），
  * 不是账号问题：此时站点只在页面上提示并拒绝跳转，UI 上的表现与"点击没生效"一样，
  * 唯一的症状是 LOGIN_TIMEOUT。认出它就交给 checkin-batch 冷却重试，避免继续把更多
- * 账号退出成登出态。
+ * 账号退出成登出态。特征清单在站点适配器里。
  */
-const LOGIN_RATE_LIMIT_PATTERNS = [
-  "登录次数过多",
-  "登录过于频繁",
-  "操作过于频繁",
-  "请求过于频繁",
-  "请稍后再试",
-  "too many login attempts",
-  "too many attempts",
-  "rate limit",
-  "rate limited",
-  "try again later",
-];
-
 function loginRateLimited(page: SessionPage): string | null {
-  const lower = page.text.toLowerCase();
-  for (const pattern of LOGIN_RATE_LIMIT_PATTERNS) {
-    if (lower.includes(pattern.toLowerCase())) return pattern;
-  }
-  return null;
+  return agentRouter.classify.loginRateLimited(page.text);
 }
-
-/** GitHub 授权/验证页特征：出现任一即认为需要人工介入。 */
-const MANUAL_INTERVENTION_PATTERNS = [
-  "Sign in to GitHub",
-  "Authorize",
-  "Two-factor",
-  "Verify",
-  "device verification",
-];
 
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -285,26 +260,15 @@ export function labelOfRef(page: SessionPage, ref: string): string | undefined {
 }
 
 function extractBalance(page: SessionPage): number | null {
-  const match = /当前余额\s*\$([\d,]+(?:\.\d+)?)/.exec(page.text);
-  if (!match) return null;
-  const value = Number(match[1].replace(/,/g, ""));
-  return Number.isFinite(value) ? value : null;
+  return agentRouter.parse.balance(page.text);
 }
 
 function hasAnnouncement(page: SessionPage): boolean {
-  return page.text.includes("系统公告") && (page.text.includes("今日关闭") || page.text.includes("关闭公告"));
+  return agentRouter.classify.hasAnnouncement(page.text);
 }
 
-/**
- * 站点"今日已签到"状态特征。
- * 刻意不含"签到成功"——那是动作提示（实测重复登录也会出现），不代表当天额度已发放；
- * 把它当状态会导致当天第一次签到就被跳过，反而丢额度。
- */
-const ALREADY_CHECKED_IN_PATTERNS = ["已签到", "已打卡", "今日已签到", "今日已打卡", "checked in", "already checked in"];
-
 function alreadyCheckedIn(page: SessionPage): boolean {
-  const lower = page.text.toLowerCase();
-  return ALREADY_CHECKED_IN_PATTERNS.some((pattern) => lower.includes(pattern.toLowerCase()));
+  return agentRouter.classify.alreadyCheckedIn(page.text);
 }
 
 /** 本地"今天"对应的 UTC 区间 [start, end)；按本地日界切，避免 UTC 日界把早上算到前一天。 */
@@ -315,14 +279,11 @@ function todayUtcRange(now: Date): { start: string; end: string } {
 }
 
 function isLoggedOut(page: SessionPage): boolean {
-  return page.text.includes("注销成功") || (page.text.includes("登 录") && page.text.includes("使用 GitHub 继续"));
+  return agentRouter.classify.loggedOut(page.text);
 }
 
 function needsManualIntervention(page: SessionPage): string | null {
-  for (const pattern of MANUAL_INTERVENTION_PATTERNS) {
-    if (page.text.includes(pattern)) return pattern;
-  }
-  return null;
+  return agentRouter.classify.manualIntervention(page.text);
 }
 
 function sessionCallArgs(sessionId: string, command: string[]): string[] {

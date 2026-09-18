@@ -1,12 +1,10 @@
 import { ZenxError } from "./core.ts";
 import type { Runner } from "./core.ts";
+import { agentRouter } from "./sites/agentrouter.ts";
 
-const siteUrl = "https://agentrouter.org/console";
+const siteUrl = agentRouter.consoleUrl;
 const PAGE_SETTLE_MS = 2_000;
 const SESSION_TEXT_MAX_LENGTH = 20_000;
-/** 站点"今日已签到"状态特征；刻意不含"签到成功"（那是动作提示，不代表额度已发放）。 */
-const ALREADY_CHECKED_IN_PATTERNS = ["已签到", "已打卡", "今日已签到", "今日已打卡", "checked in", "already checked in"];
-const MANUAL_INTERVENTION_PATTERNS = ["Sign in to GitHub", "Authorize", "Two-factor", "Verify", "device verification"];
 
 export type ConsoleState = {
   text: string;
@@ -48,14 +46,11 @@ function parseEvaluate(raw: string): string {
 
 /**
  * 控制台上的"当前余额 $X"。页面没渲染出来时返回 null（不算失败）。
- * 站点界面语言随账号而异（实测同一站点有的号是中文"当前余额"、有的是英文
- * "Current balance"），两种都要认，否则英文界面的号永远读不到余额。
+ * 站点界面语言随账号而异（中文"当前余额"、英文"Current balance"），
+ * 两种怎么认由站点适配器决定，这里只转发。
  */
 export function extractBalance(text: string): number | null {
-  const match = /当前余额\s*\$([\d,]+(?:\.\d+)?)/.exec(text) ?? /\bCurrent balance\s*\$([\d,]+(?:\.\d+)?)/i.exec(text);
-  if (!match) return null;
-  const value = Number(match[1].replace(/,/g, ""));
-  return Number.isFinite(value) ? value : null;
+  return agentRouter.parse.balance(text);
 }
 
 /**
@@ -64,14 +59,11 @@ export function extractBalance(text: string): number | null {
  * 余额同时被签到发放和消耗影响，缺口法会把"没签到"误算成"花多了"。
  */
 export function extractTotalSpent(text: string): number | null {
-  const match = /历史消耗\s*\$([\d,]+(?:\.\d+)?)/.exec(text) ?? /\bConsumption\s*\$([\d,]+(?:\.\d+)?)/i.exec(text);
-  if (!match) return null;
-  const value = Number(match[1].replace(/,/g, ""));
-  return Number.isFinite(value) ? value : null;
+  return agentRouter.parse.totalSpent(text);
 }
 
 function isLoggedOut(text: string): boolean {
-  return text.includes("注销成功") || (text.includes("登 录") && text.includes("使用 GitHub 继续"));
+  return agentRouter.classify.loggedOut(text);
 }
 
 /**
@@ -107,14 +99,14 @@ export async function readConsoleState(
     });
     remaining();
     const text = parseEvaluate(evaluate.stdout);
-    const manual = MANUAL_INTERVENTION_PATTERNS.find((pattern) => text.includes(pattern));
+    const manual = agentRouter.classify.manualIntervention(text);
     const state: ConsoleState = {
       text,
       login: manual ? "manual_intervention" : isLoggedOut(text) ? "logged_out" : "logged_in",
       identityMatch: text.includes(expectedIdentity),
       balance: extractBalance(text),
       totalSpent: extractTotalSpent(text),
-      siteCheckedIn: ALREADY_CHECKED_IN_PATTERNS.some((pattern) => text.toLowerCase().includes(pattern.toLowerCase())),
+      siteCheckedIn: agentRouter.classify.alreadyCheckedIn(text),
     };
     return manual ? { ...state, pageFeature: manual } : state;
   } finally {

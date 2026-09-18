@@ -3,33 +3,16 @@ import { isEdge, listBrowsers, protocolSupported, readStore, withStoreLock, Zenx
 import type { Runner } from "./core.ts";
 import { extractBalance } from "./console.ts";
 import { findAccount } from "./launch.ts";
+import { agentRouter } from "./sites/agentrouter.ts";
 
-const siteUrl = "https://agentrouter.org/console";
+const siteUrl = agentRouter.consoleUrl;
 const PAGE_SETTLE_MS = 2_000;
 const LOGIN_POLL_INTERVAL_MS = 3_000;
 const LOGIN_POLL_BUDGET_MS = 120_000;
 const TEXT_MAX_LENGTH = 20_000;
 /** 登录按钮的可访问名（VOM 行形如 `@e12 button "github_logo 使用 GitHub 继续"`）。 */
 const GITHUB_LOGIN_LABEL = "github_logo 使用 GitHub 继续";
-/** GitHub 授权/验证页特征：出现任一即认为需要人工介入。 */
-const MANUAL_INTERVENTION_PATTERNS = ["Sign in to GitHub", "Authorize", "Two-factor", "Verify", "device verification"];
-/**
- * 站点登录限流特征。同一出口 IP 短时间内多次登录会命中——站点只提示"登录次数过多
- * 请稍后再试"，不再跳转，表现为登录按钮点了没反应。它不是账号级问题，靠重跑解决不了，
- * 必须显式等待（见 checkin-batch.ts 的冷却重试）。
- */
-const LOGIN_RATE_LIMIT_PATTERNS = [
-  "登录次数过多",
-  "登录过于频繁",
-  "操作过于频繁",
-  "请求过于频繁",
-  "请稍后再试",
-  "too many login attempts",
-  "too many attempts",
-  "rate limit",
-  "rate limited",
-  "try again later",
-];
+// GitHub 授权页与登录限流的文案特征改由站点适配器统一提供（src/sites/agentrouter.ts）。
 /** 站点登录页特征，用于确认"确实已登出"而不是别的异常页面。 */
 const LOGGED_OUT_PATTERNS = ["使用 GitHub 继续", "使用 LinuxDO 继续", "登 录", "登录"];
 
@@ -67,18 +50,11 @@ function parseSessionStart(raw: string): string {
 }
 
 function detectRateLimit(text: string): string | null {
-  const lower = text.toLowerCase();
-  for (const pattern of LOGIN_RATE_LIMIT_PATTERNS) {
-    if (lower.includes(pattern.toLowerCase())) return pattern;
-  }
-  return null;
+  return agentRouter.classify.loginRateLimited(text);
 }
 
 function detectManualIntervention(text: string): string | null {
-  for (const pattern of MANUAL_INTERVENTION_PATTERNS) {
-    if (text.includes(pattern)) return pattern;
-  }
-  return null;
+  return agentRouter.classify.manualIntervention(text);
 }
 
 /**
