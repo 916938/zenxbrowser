@@ -37,7 +37,7 @@ const help = `ZenX Browser — Windows Edge 多账号连接台
   zenx accounts inspect-site <别名> [--tab-id <N>] [--timeout 45s]
   zenx accounts login <别名> [--timeout 3m]
   zenx accounts checkin <别名> [--timeout 3m] [--force]
-  zenx accounts checkin-all [--timeout 3m] [--wait 15m] [--retries 1] [--close-after] [--retry-codes CODES]
+  zenx accounts checkin-all [--timeout 3m] [--wait 15m] [--retries 1] [--window 6] [--close-after] [--retry-codes CODES]
   zenx accounts recheck <别名> [--timeout 45s] [--record yes|no]
   zenx accounts snapshot <别名> [--timeout 45s]
   zenx accounts snapshot --all [--timeout 45s]
@@ -99,9 +99,9 @@ checkin 在当天账本已有"确认到账"记录、或站点显示"今日已签
 login 只补"登录"这一步（不退出、不签到）：用于 checkin 在重登阶段失败后账号停在登出态、
   因而连 checkin 都无法再启动的自救；已登录则原样返回，不动账号状态。
 checkin-all 依次处理全部账号，并自动处理站点登录限流：命中限流/登录超时的账号记录等待起点，
-  冷却 --wait（默认 15 分钟）后自动重试 --retries 次（默认 1）。--close-after 在每个账号
-  签到成功后立即关闭其 Edge 实例，把内存还给系统（限流等待期间同样会关闭已完成账号）。
-  状态落在 .zenx/checkin-state.json；单个账号失败不中断后续账号。`;
+  冷却 --wait（默认 15 分钟）后自动重试 --retries 次（默认 1）。--window（默认 6）限制同时在线
+  的账号数：一组签完立刻关掉它们的 Edge 实例再拉下一组，把内存峰值压在窗口大小内（0=不分组）。
+  --close-after 即使不分组也逐个账号关闭；状态落在 .zenx/checkin-state.json，单个账号失败不中断后续。`;
 
 type Dependencies = {
   run?: Runner;
@@ -140,6 +140,15 @@ function parseRetries(value?: string): number {
   if (value === undefined) return 1;
   if (!/^\d{1,2}$/.test(value) || Number(value) > 5) throw new ZenxError("INVALID_RETRIES", "--retries 必须是 0 到 5 的整数。");
   return Number(value);
+}
+
+/** 同时在线账号上限：缺省=默认 6，0=不分组，1–64 为窗口大小。 */
+function parseWindow(value?: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (!/^\d{1,2}$/.test(value)) throw new ZenxError("INVALID_WINDOW", "--window 必须是 0 到 64 的整数（0 表示不分组）。");
+  const size = Number(value);
+  if (size > 64) throw new ZenxError("INVALID_WINDOW", "--window 上限 64。");
+  return size;
 }
 
 /** recheck 是否补记账本：`--record yes`（默认）/ `--record no`。 */
@@ -241,6 +250,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
         "retry-codes": { type: "string" },
         "close-after": { type: "boolean" },
         record: { type: "string" },
+        window: { type: "string" },
         all: { type: "boolean" },
         "tab-id": { type: "string" },
         port: { type: "string" },
@@ -276,7 +286,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     if (rechecking) allowed.add("record");
     if (snapshotting) allowed.add("all");
     if (loggingIn) allowed.add("timeout");
-    if (checkingInAll) for (const key of ["timeout", "wait", "retries", "retry-codes", "close-after"]) allowed.add(key);
+    if (checkingInAll) for (const key of ["timeout", "wait", "retries", "retry-codes", "close-after", "window"]) allowed.add(key);
     if (checkingIn) for (const key of ["timeout", "force"]) allowed.add(key);
     if (relinking || closing) allowed.add("confirm");
     if (opening || inspecting) allowed.add("tab-id");
@@ -333,6 +343,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
         maxRetries: parseRetries(values.retries),
         retryCodes: parseRetryCodes(values["retry-codes"]),
         closeAfter: values["close-after"] === true,
+        windowSize: parseWindow(values.window),
         dbFile: dependencies.snapshotDbFile,
         onProgress: (line) => { if (!asJson) output(line); },
       });

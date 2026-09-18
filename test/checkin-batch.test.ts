@@ -122,6 +122,60 @@ test("checkin-all: 默认把 LOGIN_RATE_LIMITED 与 LOGIN_TIMEOUT 视为限流",
   assert.deepEqual(DEFAULT_RETRY_CODES, ["LOGIN_RATE_LIMITED", "LOGIN_TIMEOUT"]);
 });
 
+// 内存峰值 = 窗口大小，而不是账号总数：一组签完就关掉它们的 Edge 实例再拉下一组。
+test("checkin-all: --window 把账号分组，每组结束就释放实例", async (t) => {
+  const four: Account[] = [
+    { alias: "a1", instanceId: "i1", expectedIdentity: "g1", boundAt: "2026-09-13T00:00:00Z" },
+    { alias: "a2", instanceId: "i2", expectedIdentity: "g2", boundAt: "2026-09-13T00:00:00Z" },
+    { alias: "a3", instanceId: "i3", expectedIdentity: "g3", boundAt: "2026-09-13T00:00:00Z" },
+    { alias: "a4", instanceId: "i4", expectedIdentity: "g4", boundAt: "2026-09-13T00:00:00Z" },
+  ];
+  const home = await fixture(t, four);
+  const time = clock();
+  const closeCalls: string[] = [];
+  const spy: Runner = (args, options) => {
+    if (args[0] === "browsers" && args[1] === "close") {
+      closeCalls.push(args[3]);
+      return Promise.resolve({ stdout: JSON.stringify({ browser_id: args[3], closed: true, windows_closed: 1, sessions_stopped: 0, disconnected: true }), exitCode: 0 });
+    }
+    if (args[0] === "browsers") return Promise.resolve({ stdout: JSON.stringify(four.map((item) => browser(item.instanceId))), exitCode: 0 });
+    return runner(args, options);
+  };
+  const report = await checkinAll(home, spy, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    waitMs: 60_000,
+    maxRetries: 1,
+    windowSize: 2,
+    ...time,
+  });
+  assert.equal(report.groups, 2, "4 个账号按 2 分组应分成 2 组");
+  assert.equal(report.windowSize, 2);
+  assert.equal(report.released, 4, "每组结束都应关闭其中账号的实例");
+  assert.equal(closeCalls.length, 4);
+  assert.deepEqual(closeCalls.sort(), ["i1", "i2", "i3", "i4"]);
+});
+
+test("checkin-all: --window 0 不分组、不自动关闭实例", async (t) => {
+  const home = await fixture(t);
+  const time = clock();
+  const closeCalls: string[] = [];
+  const spy: Runner = (args, options) => {
+    if (args[0] === "browsers" && args[1] === "close") { closeCalls.push(args[3]); }
+    return runner(args, options);
+  };
+  const report = await checkinAll(home, spy, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    windowSize: 0,
+    ...time,
+  });
+  assert.equal(report.groups, 1);
+  assert.equal(report.windowSize, 0);
+  assert.equal(report.released, 0);
+  assert.equal(closeCalls.length, 0);
+});
+
 test("状态文件：可回读，损坏时退化为空状态而不抛错", async (t) => {
   const home = await fixture(t);
   const file = join(home, "checkin-state.json");

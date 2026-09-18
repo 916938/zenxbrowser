@@ -58,9 +58,15 @@ export type CheckinBatchReport = {
   total: number;
   credited: number;
   failed: number;
-  /** 轮次：第几批尝试（限流冷却后进入下一轮）。 */
+  /** 轮次：各组累计的尝试批次（限流冷却后进入下一轮）。 */
   rounds: number;
   waitedMs: number;
+  /** 同时在线的账号上限；0 表示不分组。 */
+  windowSize: number;
+  /** 分了几组。 */
+  groups: number;
+  /** 本轮实际释放（关闭）的实例数。 */
+  released: number;
   accounts: AccountOutcome[];
   stateFile: string;
 };
@@ -78,6 +84,8 @@ export type CheckinBatchOptions = {
   retryCodes?: string[];
   /** 签到成功后立即关闭该 Edge 实例，释放内存。 */
   closeAfter?: boolean;
+  /** 同时在线的账号上限（默认 6）：一组签完就关掉再拉下一组，压住内存峰值；0 表示不分组。 */
+  windowSize?: number;
   force?: boolean;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -140,13 +148,27 @@ async function releaseInstance(
 }
 
 /**
- * 批量签到：串行处理账号，并在站点限流时自动冷却重试。
+ * 同时在线（同时占用 Edge 实例）的账号上限。默认 6：十几个 Edge Profile 一起常驻
+ * 是本机最大的内存开销，签完一批就关一批比"全部拉起再逐个关"稳得多。
+ * 设为 0 表示不分组（一次性跑完再统一收尾）。
+ */
+export const DEFAULT_WINDOW_SIZE = 6;
+
+function chunkAccounts(accounts: Account[], size: number): Account[][] {
+  const groups: Account[][] = [];
+  for (let index = 0; index < accounts.length; index += size) groups.push(accounts.slice(index, index + size));
+  return groups;
+}
+
+/**
+ * 批量签到：按窗口分组处理账号，并在站点限流时自动冷却重试。
  *
- * 两个关键点区别于"for 循环 + 每个账号重试"：
+ * 三个关键点区别于"for 循环 + 每个账号重试"：
  * 1. 限流是站点侧的共享配额，一旦命中就**停止本轮剩余账号**（否则会把更多账号退出成登出态，
  *    而登出态连 checkin 都无法再启动，只能靠 zenx accounts login 恢复）；
- * 2. 冷却期间把已完成账号的 Edge 实例关掉——十几个 Edge Profile 同时常驻是本机最大的内存开销，
- *    等待的 15 分钟里没必要占着。
+ * 2. **窗口上限**（默认 6）：一次只让这么多账号在线，一组签完立刻关掉它们的 Edge 实例，
+ *    再拉起下一组——内存占用的峰值因此被压在 6 个实例上；
+ * 3. 冷却等待期间已完成账号保持关闭状态，不会白占 15 分钟内存。
  */
 export async function checkinAll(home: string, run: Runner, options: CheckinBatchOptions = {}): Promise<CheckinBatchReport> {
   const now = options.now ?? (() => Date.now());
@@ -155,6 +177,7 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
   const maxRetries = options.maxRetries ?? 1;
   const retryCodes = new Set(options.retryCodes ?? DEFAULT_RETRY_CODES);
   const closeAfter = options.closeAfter === true;
+  const windowSize = options.windowSize ?? DEFAULT_WINDOW_SIZE;
   const onProgress = options.onProgress ?? (() => undefined);
   const file = stateFileFor(home, options.stateFile);
   const outcomes = new Map<string, AccountOutcome>();
@@ -169,55 +192,92 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
     })
     : [...store.accounts];
 
-  let pending: Account[] = wanted;
-  let round = 0;
+  const groups = windowSize > 0 ? chunkAccounts(wanted, windowSize) : [wanted];
+  let rounds = 0;
   let waited = 0;
+  let released = 0;
 
-  while (pending.length > 0) {
-    round += 1;
-    const deferred: Account[] = [];
-    for (let index = 0; index < pending.length; index++) {
-      const account = pending[index];
-      const attempt = (outcomes.get(account.alias)?.attempts ?? 0) + 1;
-      onProgress(`[轮 ${round}] ${account.alias}: 第 ${attempt} 次签到`);
-      const outcome = await runOne(home, run, account, { ...options, attempt, closeAfter, onProgress, now, sleep });
-      outcomes.set(account.alias, outcome);
-      state.accounts[account.alias] = {
-        lastAttempt: new Date(now()).toISOString(),
-        lastResult: outcome.ok ? (outcome.credited ? "credited" : "skipped") : outcome.rateLimited ? "rate_limited" : "failed",
-        lastCode: outcome.code ?? null,
-        attempts: attempt,
-        balanceAfter: outcome.balanceAfter,
-        credited: outcome.credited,
-      };
-      // 每次都落盘：批量跑可能被中断，状态文件要能反映最后一次真实结果。
-      await writeState(file, state);
-      if (outcome.ok) {
-        onProgress(`${account.alias}: ${outcome.skipped ? `跳过（${outcome.skipped}）` : `已到账 ${outcome.balanceBefore} → ${outcome.balanceAfter}`}`);
-        if (closeAfter && !outcome.closed) {
-          const release = await releaseInstance(home, run, account.alias, onProgress);
-          const updated = { ...outcome, closed: release.closed, closureError: release.error };
-          outcomes.set(account.alias, updated);
-          if (release.closed) {
-            state.accounts[account.alias] = { ...state.accounts[account.alias], lastResult: "closed" };
-            await writeState(file, state);
-          }
+  const remember = async (alias: string, outcome: AccountOutcome) => {
+    outcomes.set(alias, outcome);
+    state.accounts[alias] = {
+      lastAttempt: new Date(now()).toISOString(),
+      lastResult: outcome.ok ? (outcome.credited ? "credited" : "skipped") : outcome.rateLimited ? "rate_limited" : "failed",
+      lastCode: outcome.code ?? null,
+      attempts: outcome.attempts,
+      balanceAfter: outcome.balanceAfter,
+      credited: outcome.credited,
+    };
+    // 每次都落盘：批量跑可能被中断，状态文件要能反映最后一次真实结果。
+    await writeState(file, state);
+  };
+
+  for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+    const group = groups[groupIndex];
+    if (groups.length > 1) {
+      onProgress(`[组 ${groupIndex + 1}/${groups.length}] ${group.length} 个账号（同时在线上限 ${windowSize}）`);
+    }
+    let pending: Account[] = group;
+    let round = 0;
+
+    while (pending.length > 0) {
+      round += 1;
+      rounds += 1;
+      const deferred: Account[] = [];
+      for (let index = 0; index < pending.length; index++) {
+        const account = pending[index];
+        const attempt = (outcomes.get(account.alias)?.attempts ?? 0) + 1;
+        onProgress(`[轮 ${round}] ${account.alias}: 第 ${attempt} 次签到`);
+        const outcome = await runOne(home, run, account, { ...options, attempt, closeAfter, onProgress, now, sleep });
+        await remember(account.alias, outcome);
+        if (outcome.ok) {
+          onProgress(`${account.alias}: ${outcome.skipped ? `跳过（${outcome.skipped}）` : `已到账 ${outcome.balanceBefore} → ${outcome.balanceAfter}`}`);
+          continue;
         }
-        continue;
+        onProgress(`${account.alias}: 失败 ${outcome.code ?? "UNKNOWN"} — ${outcome.message ?? ""}`);
+        if (outcome.rateLimited) {
+          // 本轮剩下的账号同样会命中共享配额，一并推迟到冷却之后再试。
+          deferred.push(...pending.slice(index));
+          onProgress(`命中站点登录限流：剩余 ${deferred.length} 个账号推迟到冷却后重试`);
+          break;
+        }
       }
-      onProgress(`${account.alias}: 失败 ${outcome.code ?? "UNKNOWN"} — ${outcome.message ?? ""}`);
-      if (outcome.rateLimited) {
-        // 本轮剩下的账号同样会命中共享配额，一并推迟到冷却之后再试。
-        deferred.push(...pending.slice(index));
-        onProgress(`命中站点登录限流：剩余 ${deferred.length} 个账号推迟到冷却后重试`);
-        break;
+      if (deferred.length === 0 || round > maxRetries) break;
+      onProgress(`冷却 ${Math.round(waitMs / 60_000)} 分钟后重试 ${deferred.length} 个账号…`);
+      await sleep(waitMs);
+      waited += waitMs;
+      pending = deferred;
+    }
+
+    // 这一组结束就释放它们的 Edge 实例：内存峰值 = 窗口大小，而不是账号总数。
+    // 失败也要关——失败的账号同样占着一个 Edge 进程。
+    if (closeAfter || windowSize > 0) {
+      for (const account of group) {
+        const current = outcomes.get(account.alias);
+        if (current?.closed) continue;
+        const release = await releaseInstance(home, run, account.alias, onProgress);
+        if (release.closed) released += 1;
+        await remember(account.alias, {
+          ...(current ?? {
+            alias: account.alias,
+            ok: false,
+            code: "NOT_ATTEMPTED",
+            message: "本轮未尝试。",
+            credited: false,
+            attempts: 0,
+            rateLimited: false,
+            balanceBefore: null,
+            balanceAfter: null,
+            closed: false,
+          }),
+          closed: release.closed,
+          closureError: release.error,
+        });
+        if (release.closed) {
+          state.accounts[account.alias] = { ...state.accounts[account.alias], lastResult: "closed" };
+          await writeState(file, state);
+        }
       }
     }
-    if (deferred.length === 0 || round > maxRetries) break;
-    onProgress(`冷却 ${Math.round(waitMs / 60_000)} 分钟后重试 ${deferred.length} 个账号…`);
-    await sleep(waitMs);
-    waited += waitMs;
-    pending = deferred;
   }
 
   const accounts = wanted.map((account) => outcomes.get(account.alias) ?? {
@@ -238,8 +298,13 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
     total: accounts.length,
     credited: accounts.filter((item) => item.credited).length,
     failed,
-    rounds: round,
+    rounds,
     waitedMs: waited,
+    /** 同时在线上限；0 表示不分组。 */
+    windowSize,
+    groups: groups.length,
+    /** 本轮实际关闭的实例数（释放内存）。 */
+    released,
     accounts,
     stateFile: file,
   };

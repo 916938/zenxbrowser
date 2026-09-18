@@ -69,13 +69,15 @@ node src/cli.ts accounts close edge-1 --confirm   # 关闭该实例的所有 Edg
 ```powershell
 node src/cli.ts accounts checkin-all                       # 全部账号，命中限流自动冷却重试一次
 node src/cli.ts accounts checkin-all --wait 12m --retries 1
-node src/cli.ts accounts checkin-all --close-after         # 每个账号成功即关掉其 Edge，释放内存
+node src/cli.ts accounts checkin-all --window 6            # 同时在线不超过 6 个（默认），一组签完即关再拉下一组
+node src/cli.ts accounts checkin-all --close-after         # 不分组也逐个账号关掉 Edge，释放内存
 node src/cli.ts accounts checkin-all --retry-codes LOGIN_RATE_LIMITED,LOGIN_TIMEOUT
 ```
 
-三条行为准则：
+四条行为准则：
 
 - **命中限流立刻停手**：限流是站点侧的**共享配额**（同一出口 IP 连续登录若干次触发），此时任何账号都登录不上。本轮剩下的账号会被推迟到冷却后统一重试，而不是继续把更多账号退出成登出态。
+- **窗口上限**（默认 6）：一次只让这么多账号在线，一组签完立刻关掉它们的 Edge 实例再拉下一组——十几个 Edge Profile 同时常驻是本机最大的内存开销，把峰值压在窗口大小内比"全部拉起再逐个关"稳得多。`--window 0` 关闭分组。
 - **每次尝试都记状态**：`.zenx\checkin-state.json` 记录每个账号的最后尝试时间、结果、错误码与重试次数，中断后可接着看。
 - **默认重试一次**（`--retries`），冷却默认 15 分钟（`--wait`）。重试后仍失败就以失败收尾，不再无限循环。
 

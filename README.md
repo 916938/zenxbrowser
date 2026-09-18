@@ -41,7 +41,7 @@ node src/cli.ts --help    # 查看全部用法；也可 npm start -- --help
 | `zenx accounts inspect-site <别名>` | 只读核对登录身份与签到信号 |
 | `zenx accounts checkin <别名>` | 执行完整退出重登签到流程（支持无人值守/计划任务） |
 | `zenx accounts login <别名>` | 只补“登录”这一步：把重登失败后停在登出态的账号拉回登录态（不退出、不签到） |
-| `zenx accounts checkin-all` | 批量签到：自动处理站点登录限流（冷却 `--wait` 后重试 `--retries` 次），`--close-after` 成功后立即释放实例内存 |
+| `zenx accounts checkin-all` | 批量签到：自动处理站点登录限流（冷却 `--wait` 后重试 `--retries` 次），`--window`（默认 6）限制同时在线账号数，`--close-after` 逐个释放实例内存 |
 | `zenx accounts recheck <别名>` | 只读复查该账号今日签到额度是否已到账（不退出、不重登） |
 | `zenx accounts snapshot <别名>` / `--all` | 采集余额与站点累计消耗，写入账本（周/月对比的观测点） |
 | `zenx report [--port 8787] [--open]` | 启动本地网页报表，查看签到统计与余额趋势 |
