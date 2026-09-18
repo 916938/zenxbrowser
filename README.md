@@ -40,6 +40,8 @@ node src/cli.ts --help    # 查看全部用法；也可 npm start -- --help
 | `zenx accounts open-site <别名>` | 打开（或切换到）AgentRouter 标签页 |
 | `zenx accounts inspect-site <别名>` | 只读核对登录身份与签到信号 |
 | `zenx accounts checkin <别名>` | 执行完整退出重登签到流程（支持无人值守/计划任务） |
+| `zenx accounts login <别名>` | 只补“登录”这一步：把重登失败后停在登出态的账号拉回登录态（不退出、不签到） |
+| `zenx accounts checkin-all` | 批量签到：自动处理站点登录限流（冷却 `--wait` 后重试 `--retries` 次），`--close-after` 成功后立即释放实例内存 |
 | `zenx accounts recheck <别名>` | 只读复查该账号今日签到额度是否已到账（不退出、不重登） |
 | `zenx accounts snapshot <别名>` / `--all` | 采集余额与站点累计消耗，写入账本（周/月对比的观测点） |
 | `zenx report [--port 8787] [--open]` | 启动本地网页报表，查看签到统计与余额趋势 |
@@ -363,7 +365,8 @@ Register-ScheduledTask -TaskName "ZenX 每日签到" -Action $action -Trigger $t
 | `ANNOUNCEMENT_CLOSE_FAILED` | 两次尝试后公告弹窗仍未关闭 |
 | `LOGOUT_FAILED` | 点击退出后未出现登录页 |
 | `MANUAL_INTERVENTION_REQUIRED` | 出现 GitHub 授权/验证页，需人工处理 |
-| `LOGIN_TIMEOUT` | 重新登录轮询超 60s |
+| `LOGIN_TIMEOUT` | 重新登录轮询超 60s（多数是站点限流的间接症状，可用 `zenx accounts login` 恢复登录态） |
+| `LOGIN_RATE_LIMITED` | 站点登录限流（页面明示“登录次数过多/请稍后再试”）；必须等待冷却，不可连续重试 |
 | `CHECKIN_UNCONFIRMED` | 流程完成但余额未变且无“签到成功”提示 |
 | `RECHECK_EVAL_FAILED` | 复查时读不到页面正文；未给出额度结论 |
 | `RECHECK_TIMEOUT` | 复查总预算耗尽 |

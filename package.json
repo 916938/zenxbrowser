@@ -8,6 +8,6 @@
   "scripts": {
     "start": "node src/cli.ts",
     "test": "node --test test/*.test.ts",
-    "check": "node --check src/cli.ts && node --check src/core.ts && node --check src/launch.ts && node --check src/launch-config.ts && node --check src/site.ts && node --check src/checkin.ts && node --check src/recheck.ts && node --check src/console.ts && node --check src/snapshot.ts && node --check src/db.ts && node --check src/report.ts && node --check src/profile-marker.ts && node --check src/profile-account.ts && node --check src/window-titles.ts"
+    "check": "node --check src/cli.ts && node --check src/core.ts && node --check src/launch.ts && node --check src/launch-config.ts && node --check src/site.ts && node --check src/checkin.ts && node --check src/checkin-batch.ts && node --check src/login.ts && node --check src/recheck.ts && node --check src/console.ts && node --check src/snapshot.ts && node --check src/db.ts && node --check src/report.ts && node --check src/profile-marker.ts && node --check src/profile-account.ts && node --check src/window-titles.ts"
   }
 }

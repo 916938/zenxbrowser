@@ -7,6 +7,8 @@ import { bindAccount, checkAccounts, createRunner, doctor, isEdge, listBrowsers,
 import type { Runner } from "./core.ts";
 import { closeBrowser, configureLaunch, ensureOnline, inspectSite, openSite, relinkAccount } from "./launch.ts";
 import { checkinAccount } from "./checkin.ts";
+import { loginAccount } from "./login.ts";
+import { checkinAll } from "./checkin-batch.ts";
 import { recheckAccount } from "./recheck.ts";
 import { snapshotAccount, snapshotAll } from "./snapshot.ts";
 import { startReportServer } from "./report.ts";
@@ -33,7 +35,9 @@ const help = `ZenX Browser — Windows Edge 多账号连接台
   zenx accounts close <别名> --confirm [--timeout 45s]
   zenx accounts open-site <别名> [--tab-id <N>] [--timeout 45s]
   zenx accounts inspect-site <别名> [--tab-id <N>] [--timeout 45s]
+  zenx accounts login <别名> [--timeout 3m]
   zenx accounts checkin <别名> [--timeout 3m] [--force]
+  zenx accounts checkin-all [--timeout 3m] [--wait 15m] [--retries 1] [--close-after] [--retry-codes CODES]
   zenx accounts recheck <别名> [--timeout 45s]
   zenx accounts snapshot <别名> [--timeout 45s]
   zenx accounts snapshot --all [--timeout 45s]
@@ -88,7 +92,13 @@ checkin 执行完整退出重登签到流程（隔离 session、退出前核对�
   （计划任务脚本需先恢复最小化的 Edge 窗口）；遇 GitHub 授权/验证页或签到未确认时
   停止并报错，由人工处理后重试；其余命令保持只读。
 checkin 在当天账本已有"确认到账"记录、或站点显示"今日已签到"时直接跳过（不退出重登），
-  避免白扣站点登录配额；确需重跑加 --force。`;
+  避免白扣站点登录配额；确需重跑加 --force。
+login 只补"登录"这一步（不退出、不签到）：用于 checkin 在重登阶段失败后账号停在登出态、
+  因而连 checkin 都无法再启动的自救；已登录则原样返回，不动账号状态。
+checkin-all 依次处理全部账号，并自动处理站点登录限流：命中限流/登录超时的账号记录等待起点，
+  冷却 --wait（默认 15 分钟）后自动重试 --retries 次（默认 1）。--close-after 在每个账号
+  签到成功后立即关闭其 Edge 实例，把内存还给系统（限流等待期间同样会关闭已完成账号）。
+  状态落在 .zenx/checkin-state.json；单个账号失败不中断后续账号。`;
 
 type Dependencies = {
   run?: Runner;
@@ -110,6 +120,30 @@ function parseTimeout(value = "45s"): number {
   const amount = Number(match[1]) * (match[2] === "m" ? 60_000 : match[2] === "s" ? 1000 : 1);
   if (!Number.isSafeInteger(amount) || amount < 1 || amount > 300_000) throw new ZenxError("INVALID_TIMEOUT", "--timeout 必须在 1ms 到 5m 之间。");
   return amount;
+}
+
+/** 冷却时长：接受正整数加 ms/s/m，默认与上限均为 60 分钟。 */
+function parseDuration(value: string, invalidCode: string, label: string): number {
+  const match = /^(\d+)(ms|s|m)$/.exec(value);
+  if (!match) throw new ZenxError(invalidCode, `${label} 需要正整数和 ms/s/m 单位，例如 15m。`);
+  const amount = Number(match[1]) * (match[2] === "m" ? 60_000 : match[2] === "s" ? 1000 : 1);
+  if (!Number.isSafeInteger(amount) || amount < 1 || amount > 3_600_000) {
+    throw new ZenxError(invalidCode, `${label} 必须在 1ms 到 60m 之间。`);
+  }
+  return amount;
+}
+
+function parseRetries(value?: string): number {
+  if (value === undefined) return 1;
+  if (!/^\d{1,2}$/.test(value) || Number(value) > 5) throw new ZenxError("INVALID_RETRIES", "--retries 必须是 0 到 5 的整数。");
+  return Number(value);
+}
+
+function parseRetryCodes(value?: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  const codes = value.split(",").map((item) => item.trim().toUpperCase()).filter((item) => item.length > 0);
+  if (codes.length === 0) throw new ZenxError("INVALID_RETRY_CODES", "--retry-codes 至少需要一个错误码，例如 LOGIN_RATE_LIMITED,LOGIN_TIMEOUT。");
+  return codes;
 }
 
 function parseTabId(value?: string): number | undefined {
@@ -189,6 +223,10 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
         "profile-directory": { type: "string" },
         timeout: { type: "string" },
         force: { type: "boolean" },
+        wait: { type: "string" },
+        retries: { type: "string" },
+        "retry-codes": { type: "string" },
+        "close-after": { type: "boolean" },
         all: { type: "boolean" },
         "tab-id": { type: "string" },
         port: { type: "string" },
@@ -211,6 +249,8 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     const opening = group === "accounts" && action === "open-site";
     const inspecting = group === "accounts" && action === "inspect-site";
     const closing = group === "accounts" && action === "close";
+    const loggingIn = group === "accounts" && action === "login";
+    const checkingInAll = group === "accounts" && action === "checkin-all";
     const checkingIn = group === "accounts" && action === "checkin";
     const rechecking = group === "accounts" && action === "recheck";
     const snapshotting = group === "accounts" && action === "snapshot";
@@ -220,6 +260,8 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     if (configuring) for (const key of ["edge-path", "user-data-dir", "profile-directory", "confirm"]) allowed.add(key);
     if (ensuring || opening || inspecting || relinking || closing || rechecking || snapshotting) allowed.add("timeout");
     if (snapshotting) allowed.add("all");
+    if (loggingIn) allowed.add("timeout");
+    if (checkingInAll) for (const key of ["timeout", "wait", "retries", "retry-codes", "close-after"]) allowed.add(key);
     if (checkingIn) for (const key of ["timeout", "force"]) allowed.add(key);
     if (relinking || closing) allowed.add("confirm");
     if (opening || inspecting) allowed.add("tab-id");
@@ -265,6 +307,20 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     } else if (closing && alias && positionals.length === 3) {
       if (values.confirm !== true) throw new ZenxError("CONFIRM_REQUIRED", "关闭会退出该实例的全部 Edge 窗口（含无关窗口，未保存内容会丢失），需要 --confirm。");
       report = await closeBrowser(home, run, alias, parseTimeout(values.timeout), dependencies.launchDependencies);
+    } else if (loggingIn && alias && positionals.length === 3) {
+      report = await loginAccount(home, run, alias, parseTimeout(values.timeout ?? "3m"), {
+        dbFile: dependencies.recheckDbFile,
+      });
+    } else if (checkingInAll && positionals.length === 2) {
+      report = await checkinAll(home, run, {
+        checkinTimeoutMs: parseTimeout(values.timeout ?? "3m"),
+        waitMs: values.wait === undefined ? undefined : parseDuration(values.wait, "INVALID_WAIT", "--wait"),
+        maxRetries: parseRetries(values.retries),
+        retryCodes: parseRetryCodes(values["retry-codes"]),
+        closeAfter: values["close-after"] === true,
+        dbFile: dependencies.snapshotDbFile,
+        onProgress: (line) => { if (!asJson) output(line); },
+      });
     } else if (checkingIn && alias && positionals.length === 3) {
       report = await checkinAccount(home, run, alias, parseTimeout(values.timeout ?? "3m"), {
         ...dependencies.checkinDependencies,
@@ -287,7 +343,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     } else {
       throw new ZenxError("INVALID_ARGUMENT", "命令或参数不正确；运行 zenx --help 查看用法。");
     }
-    if (!asJson && !checkingIn && !closing && !rechecking && !snapshotting) output("连接在线或打开站点不等于登录身份验证；未执行签到。");
+    if (!asJson && !checkingIn && !checkingInAll && !closing && !rechecking && !snapshotting && !loggingIn) output("连接在线或打开站点不等于登录身份验证；未执行签到。");
     output(JSON.stringify(report, null, 2));
     return report.ok === false ? 1 : 0;
   } catch (error) {

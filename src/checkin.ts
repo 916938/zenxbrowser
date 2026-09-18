@@ -188,6 +188,33 @@ function oauthNavigateExpression(url: string): string {
 })()`;
 }
 
+/**
+ * 站点登录限流特征。限流是**站点侧的共享配额**（同一出口 IP 连续登录若干次后触发），
+ * 不是账号问题：此时站点只在页面上提示并拒绝跳转，UI 上的表现与"点击没生效"一样，
+ * 唯一的症状是 LOGIN_TIMEOUT。认出它就交给 checkin-batch 冷却重试，避免继续把更多
+ * 账号退出成登出态。
+ */
+const LOGIN_RATE_LIMIT_PATTERNS = [
+  "登录次数过多",
+  "登录过于频繁",
+  "操作过于频繁",
+  "请求过于频繁",
+  "请稍后再试",
+  "too many login attempts",
+  "too many attempts",
+  "rate limit",
+  "rate limited",
+  "try again later",
+];
+
+function loginRateLimited(page: SessionPage): string | null {
+  const lower = page.text.toLowerCase();
+  for (const pattern of LOGIN_RATE_LIMIT_PATTERNS) {
+    if (lower.includes(pattern.toLowerCase())) return pattern;
+  }
+  return null;
+}
+
 /** GitHub 授权/验证页特征：出现任一即认为需要人工介入。 */
 const MANUAL_INTERVENTION_PATTERNS = [
   "Sign in to GitHub",
@@ -739,6 +766,10 @@ async function runCheckinSteps(
     await sleep(LOGIN_POLL_INTERVAL_MS);
     page = await preparePage(clickTarget);
     sawCheckinSuccess = sawCheckinSuccess || page.text.includes("签到成功");
+    const limited = loginRateLimited(page);
+    if (limited) {
+      throw new ZenxError("LOGIN_RATE_LIMITED", `站点登录限流（${limited}）；停止本次重登，等待冷却后由 checkin-all 自动重试。`, { pageFeature: limited });
+    }
     const manual = needsManualIntervention(page);
     if (manual) {
       throw new ZenxError("MANUAL_INTERVENTION_REQUIRED", `检测到需要人工处理的页面特征（${manual}）；停止，请人工完成登录后重试。`, { pageFeature: manual });

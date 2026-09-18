@@ -57,11 +57,27 @@ Register-ScheduledTask -TaskName "ZenX 每日签到" -Action $action -Trigger $t
 ```powershell
 node src/cli.ts accounts ensure-online edge-1     # 离线时拉起对应 Edge Profile
 node src/cli.ts accounts checkin edge-1           # 签到（退出 → 重登 → 确认到账）
+node src/cli.ts accounts login edge-1             # 只补登录：把停在登出态的账号拉回登录态
 node src/cli.ts accounts recheck edge-1           # 只读复查：今天到底到账没有
 node src/cli.ts accounts snapshot edge-1          # 采集该账号的余额/消耗快照
 node src/cli.ts accounts snapshot --all           # 采集全部账号
 node src/cli.ts accounts close edge-1 --confirm   # 关闭该实例的所有 Edge 窗口
 ```
+
+### 批量签到（推荐替代 PowerShell 脚本）
+
+```powershell
+node src/cli.ts accounts checkin-all                       # 全部账号，命中限流自动冷却重试一次
+node src/cli.ts accounts checkin-all --wait 12m --retries 1
+node src/cli.ts accounts checkin-all --close-after         # 每个账号成功即关掉其 Edge，释放内存
+node src/cli.ts accounts checkin-all --retry-codes LOGIN_RATE_LIMITED,LOGIN_TIMEOUT
+```
+
+三条行为准则：
+
+- **命中限流立刻停手**：限流是站点侧的**共享配额**（同一出口 IP 连续登录若干次触发），此时任何账号都登录不上。本轮剩下的账号会被推迟到冷却后统一重试，而不是继续把更多账号退出成登出态。
+- **每次尝试都记状态**：`.zenx\checkin-state.json` 记录每个账号的最后尝试时间、结果、错误码与重试次数，中断后可接着看。
+- **默认重试一次**（`--retries`），冷却默认 15 分钟（`--wait`）。重试后仍失败就以失败收尾，不再无限循环。
 
 几点约定：
 
@@ -156,7 +172,8 @@ powershell -ExecutionPolicy Bypass -File scripts\edge-window.ps1 -Marker "916938
 |---|---|
 | `IDENTITY_MISMATCH` | 页面身份与绑定身份不符（通常是账号已登出），**未执行退出**。人工登录该账号后再签到。 |
 | `LOGOUT_FAILED` | 多数是隐藏窗口导致，退出其实已生效 → 激活窗口重跑；真失败时账号仍在登录态，可直接重跑。 |
-| `LOGIN_TIMEOUT` | 三种可能：隐藏窗口 `window.open` 被拦截（激活窗口）、GitHub 会话过期（人工登录）、站点限流（等约 10 分钟）。 |
+| `LOGIN_TIMEOUT` | 三种可能：隐藏窗口 `window.open` 被拦截（激活窗口）、GitHub 会话过期（人工登录）、**站点限流**（等待 10–15 分钟后用 `zenx accounts login` 恢复）。 |
+| `LOGIN_RATE_LIMITED` | 站点明示“登录次数过多/请稍后再试”。**不要再接着跑**：所有账号都受影响，让 `checkin-all` 冷却重试，或等待 10–15 分钟后用 `login` + `recheck` 收尾。 |
 | `MANUAL_INTERVENTION_REQUIRED` | 撞上 GitHub 授权/验证页，**只能人工**完成一次登录。 |
 | `CHECKIN_UNCONFIRMED` | 流程跑完但余额没涨。用 `recheck` 核实；若当天早些时候登录过，额度可能已在那时发放。 |
 | `CHECKIN_TIMEOUT` | 总预算（默认 3 分钟）耗尽，可用 `--timeout` 放宽到 5 分钟。 |
@@ -166,7 +183,27 @@ powershell -ExecutionPolicy Bypass -File scripts\edge-window.ps1 -Marker "916938
 
 连续登录约 10 次后站点会临时拒绝登录（点击有响应但不跳转，最终 `LOGIN_TIMEOUT`），约 10 分钟后恢复。批量脚本已内置"每 10 次登录冷却 11 分钟"。**不要短时间内手工反复退出重登同一批账号。**
 
-### 5.4 工具本身的问题
+### 5.4 账号停在登出态（checkin 已无法自救）
+
+checkin 在重登阶段失败（限流、GitHub 会话过期、隐藏窗口）后，账号会留在**登出态**；而 checkin 的身份验证要求先处于正确登录态，于是它只会报 `IDENTITY_MISMATCH`，再也完不成签到。**此时不要继续跑 checkin**，改用只做登录的命令：
+
+```powershell
+node src/cli.ts accounts login edge-1     # 已登录则原样返回；在登录页则点 GitHub 登录并等落地
+node src/cli.ts accounts recheck edge-1   # 用余额增量确认今天到账没有（+25 即已发放）
+```
+
+因为签到额度是"登录即发放"，登录恢复后 `recheck` 看到余额相对昨日基线涨了 25，就说明当日额度已到，无需再跑一次 checkin（再跑只会白白再退出一次）。
+
+### 5.5 内存：签到完就释放
+
+十几个 Edge Profile 同时常驻是本机最大的内存开销。两条约定：
+
+- `checkin-all --close-after`：每个账号签到成功（或确认已到账）后立即 `accounts close`，把该实例的窗口与进程一并退出；批量跑到中途遇限流冷却时，已完成账号也会保持关闭状态，不会白占 15 分钟内存。
+- 不想关时至少确认没有残留 session：`bsk session list` 应显示 `no active sessions`。
+
+注意 `close` 依赖 fork 构建的 `browser.close`；本机扩展仍是 0.2.3 时会报 `unknown_method: browser.close not implemented`，此时兜底用 `scripts\edge-window.ps1 -Marker <显示名> -Action Close`（见 5.1）。
+
+### 5.6 工具本身的问题
 
 | 症状 | 原因与处理 |
 |---|---|

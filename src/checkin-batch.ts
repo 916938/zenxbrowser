@@ -1,0 +1,310 @@
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { readStore, ZenxError } from "./core.ts";
+import type { Account, Runner } from "./core.ts";
+import { checkinAccount } from "./checkin.ts";
+import type { CheckinResult } from "./checkin.ts";
+import { closeBrowser, ensureOnline } from "./launch.ts";
+
+/**
+ * 站点登录限流后的默认冷却时间。站点约 10 分钟恢复，脚本取 15 分钟留余量。
+ * 关键是：限流不是账号级的，而是**站点侧的共享配额**——同一出口 IP 连续登录若干次后，
+ * 站点对所有账号都只提示"登录次数过多请稍后再试"，此时继续跑只会把更多账号退出成登出态。
+ */
+export const DEFAULT_RETRY_WAIT_MS = 15 * 60_000;
+/** 默认视为"可能是限流、值得冷却后重试"的错误码。 */
+export const DEFAULT_RETRY_CODES = ["LOGIN_RATE_LIMITED", "LOGIN_TIMEOUT"];
+
+const STATE_VERSION = 1;
+const DEFAULT_CLOSE_TIMEOUT_MS = 45_000;
+
+export type BatchAccountState = {
+  lastAttempt: string;
+  lastResult: "credited" | "skipped" | "rate_limited" | "failed" | "closed";
+  lastCode: string | null;
+  attempts: number;
+  balanceAfter: number | null;
+  credited: boolean;
+};
+
+export type BatchState = {
+  version: typeof STATE_VERSION;
+  updatedAt: string;
+  accounts: Record<string, BatchAccountState>;
+};
+
+export type AccountOutcome = {
+  alias: string;
+  ok: boolean;
+  /** 错误码；成功或跳过时为 undefined。 */
+  code?: string;
+  message?: string;
+  credited: boolean;
+  skipped?: string;
+  attempts: number;
+  /** 命中限流（已排入冷却重试队列）。 */
+  rateLimited: boolean;
+  balanceBefore: number | null;
+  balanceAfter: number | null;
+  /** 签到成功后是否已关闭该实例释放内存（未开 --close-after 时为 false）。 */
+  closed: boolean;
+  closureError?: string;
+};
+
+export type CheckinBatchReport = {
+  ok: boolean;
+  total: number;
+  credited: number;
+  failed: number;
+  /** 轮次：第几批尝试（限流冷却后进入下一轮）。 */
+  rounds: number;
+  waitedMs: number;
+  accounts: AccountOutcome[];
+  stateFile: string;
+};
+
+export type CheckinBatchOptions = {
+  /** 限定账号；缺省为 store 里的全部账号。 */
+  aliases?: string[];
+  checkinTimeoutMs?: number;
+  ensureTimeoutMs?: number;
+  /** 限流冷却时长；默认 15 分钟。 */
+  waitMs?: number;
+  /** 每个账号最多自动重试几次；默认 1。 */
+  maxRetries?: number;
+  /** 哪些错误码算限流；默认 LOGIN_RATE_LIMITED 与 LOGIN_TIMEOUT。 */
+  retryCodes?: string[];
+  /** 签到成功后立即关闭该 Edge 实例，释放内存。 */
+  closeAfter?: boolean;
+  force?: boolean;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+  /** 批量状态文件；默认 .zenx/checkin-state.json。 */
+  stateFile?: string;
+  dbFile?: string;
+  onProgress?: (line: string) => void;
+};
+
+function stateFileFor(home: string, explicit?: string): string {
+  return explicit ?? join(home, "checkin-state.json");
+}
+
+export async function readState(file: string): Promise<BatchState> {
+  let raw: string;
+  try { raw = await readFile(file, "utf8"); }
+  catch { return { version: STATE_VERSION, updatedAt: "", accounts: {} }; }
+  try {
+    const value: unknown = JSON.parse(raw);
+    if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error();
+    const record = value as Partial<BatchState>;
+    if (record.version !== STATE_VERSION || record.accounts === null || typeof record.accounts !== "object") throw new Error();
+    return { version: STATE_VERSION, updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : "", accounts: record.accounts as BatchState["accounts"] };
+  } catch {
+    // 状态文件只用于追踪，损坏不该让签到跑不起来。
+    return { version: STATE_VERSION, updatedAt: "", accounts: {} };
+  }
+}
+
+export async function writeState(file: string, state: BatchState): Promise<void> {
+  const payload = { ...state, updatedAt: new Date().toISOString() };
+  const temp = join(dirname(file), `.checkin-state-${randomUUID()}.tmp`);
+  try {
+    await mkdir(dirname(file), { recursive: true });
+    await writeFile(temp, `${JSON.stringify(payload, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+    await rename(temp, file);
+  } catch {
+    // 状态写失败不影响签到结果。
+  } finally {
+    await rm(temp, { force: true });
+  }
+}
+
+/** 释放单个账号占用的浏览器资源；失败只报告，不改变签到结论。 */
+async function releaseInstance(
+  home: string,
+  run: Runner,
+  alias: string,
+  onProgress: (line: string) => void,
+): Promise<{ closed: boolean; error?: string }> {
+  try {
+    const reply = await closeBrowser(home, run, alias, DEFAULT_CLOSE_TIMEOUT_MS);
+    if (reply.disconnected) return { closed: true };
+    return { closed: false, error: "实例仍处于连接状态；未关闭。" };
+  } catch (error) {
+    const message = error instanceof ZenxError ? `${error.code}: ${error.message}` : error instanceof Error ? error.message : "关闭失败。";
+    onProgress(`${alias}: 释放实例失败（${message}）；可稍后用 zenx accounts close 处理。`);
+    return { closed: false, error: message };
+  }
+}
+
+/**
+ * 批量签到：串行处理账号，并在站点限流时自动冷却重试。
+ *
+ * 两个关键点区别于"for 循环 + 每个账号重试"：
+ * 1. 限流是站点侧的共享配额，一旦命中就**停止本轮剩余账号**（否则会把更多账号退出成登出态，
+ *    而登出态连 checkin 都无法再启动，只能靠 zenx accounts login 恢复）；
+ * 2. 冷却期间把已完成账号的 Edge 实例关掉——十几个 Edge Profile 同时常驻是本机最大的内存开销，
+ *    等待的 15 分钟里没必要占着。
+ */
+export async function checkinAll(home: string, run: Runner, options: CheckinBatchOptions = {}): Promise<CheckinBatchReport> {
+  const now = options.now ?? (() => Date.now());
+  const sleep = options.sleep ?? delay;
+  const waitMs = options.waitMs ?? DEFAULT_RETRY_WAIT_MS;
+  const maxRetries = options.maxRetries ?? 1;
+  const retryCodes = new Set(options.retryCodes ?? DEFAULT_RETRY_CODES);
+  const closeAfter = options.closeAfter === true;
+  const onProgress = options.onProgress ?? (() => undefined);
+  const file = stateFileFor(home, options.stateFile);
+  const outcomes = new Map<string, AccountOutcome>();
+  const state = await readState(file);
+
+  const store = await readStore(home);
+  const wanted = options.aliases && options.aliases.length > 0
+    ? options.aliases.map((alias) => {
+      const account = store.accounts.find((item) => item.alias === alias);
+      if (!account) throw new ZenxError("ACCOUNT_NOT_FOUND", `账号别名 ${alias} 尚未绑定；请先核对 accounts.json。`);
+      return account;
+    })
+    : [...store.accounts];
+
+  let pending: Account[] = wanted;
+  let round = 0;
+  let waited = 0;
+
+  while (pending.length > 0) {
+    round += 1;
+    const deferred: Account[] = [];
+    for (let index = 0; index < pending.length; index++) {
+      const account = pending[index];
+      const attempt = (outcomes.get(account.alias)?.attempts ?? 0) + 1;
+      onProgress(`[轮 ${round}] ${account.alias}: 第 ${attempt} 次签到`);
+      const outcome = await runOne(home, run, account, { ...options, attempt, closeAfter, onProgress, now, sleep });
+      outcomes.set(account.alias, outcome);
+      state.accounts[account.alias] = {
+        lastAttempt: new Date(now()).toISOString(),
+        lastResult: outcome.ok ? (outcome.credited ? "credited" : "skipped") : outcome.rateLimited ? "rate_limited" : "failed",
+        lastCode: outcome.code ?? null,
+        attempts: attempt,
+        balanceAfter: outcome.balanceAfter,
+        credited: outcome.credited,
+      };
+      // 每次都落盘：批量跑可能被中断，状态文件要能反映最后一次真实结果。
+      await writeState(file, state);
+      if (outcome.ok) {
+        onProgress(`${account.alias}: ${outcome.skipped ? `跳过（${outcome.skipped}）` : `已到账 ${outcome.balanceBefore} → ${outcome.balanceAfter}`}`);
+        if (closeAfter && !outcome.closed) {
+          const release = await releaseInstance(home, run, account.alias, onProgress);
+          const updated = { ...outcome, closed: release.closed, closureError: release.error };
+          outcomes.set(account.alias, updated);
+          if (release.closed) {
+            state.accounts[account.alias] = { ...state.accounts[account.alias], lastResult: "closed" };
+            await writeState(file, state);
+          }
+        }
+        continue;
+      }
+      onProgress(`${account.alias}: 失败 ${outcome.code ?? "UNKNOWN"} — ${outcome.message ?? ""}`);
+      if (outcome.rateLimited) {
+        // 本轮剩下的账号同样会命中共享配额，一并推迟到冷却之后再试。
+        deferred.push(...pending.slice(index));
+        onProgress(`命中站点登录限流：剩余 ${deferred.length} 个账号推迟到冷却后重试`);
+        break;
+      }
+    }
+    if (deferred.length === 0 || round > maxRetries) break;
+    onProgress(`冷却 ${Math.round(waitMs / 60_000)} 分钟后重试 ${deferred.length} 个账号…`);
+    await sleep(waitMs);
+    waited += waitMs;
+    pending = deferred;
+  }
+
+  const accounts = wanted.map((account) => outcomes.get(account.alias) ?? {
+    alias: account.alias,
+    ok: false,
+    code: "NOT_ATTEMPTED",
+    message: "本轮未尝试（前序账号限流推迟后超出重试上限）。",
+    credited: false,
+    attempts: 0,
+    rateLimited: false,
+    balanceBefore: null,
+    balanceAfter: null,
+    closed: false,
+  });
+  const failed = accounts.filter((item) => !item.ok).length;
+  return {
+    ok: failed === 0,
+    total: accounts.length,
+    credited: accounts.filter((item) => item.credited).length,
+    failed,
+    rounds: round,
+    waitedMs: waited,
+    accounts,
+    stateFile: file,
+  };
+}
+
+async function runOne(
+  home: string,
+  run: Runner,
+  account: Account,
+  context: {
+    attempt: number;
+    closeAfter: boolean;
+    onProgress: (line: string) => void;
+    now: () => number;
+    sleep: (ms: number) => Promise<void>;
+    checkinTimeoutMs?: number;
+    ensureTimeoutMs?: number;
+    force?: boolean;
+    retryCodes?: string[];
+    maxRetries?: number;
+    dbFile?: string;
+  },
+): Promise<AccountOutcome> {
+  const retryCodes = new Set(context.retryCodes ?? DEFAULT_RETRY_CODES);
+  const maxRetries = context.maxRetries ?? 1;
+  const base = {
+    alias: account.alias,
+    attempts: context.attempt,
+    rateLimited: false,
+    balanceBefore: null,
+    balanceAfter: null,
+    closed: false,
+    credited: false,
+  };
+  try {
+    await ensureOnline(home, run, account.alias, context.ensureTimeoutMs ?? 60_000);
+  } catch (error) {
+    return {
+      ...base,
+      ok: false,
+      code: error instanceof ZenxError ? error.code : "COMMAND_FAILED",
+      message: error instanceof Error ? error.message : "无法拉起 Edge。",
+    };
+  }
+  try {
+    const result: CheckinResult = await checkinAccount(home, run, account.alias, context.checkinTimeoutMs ?? 180_000, {
+      force: context.force === true,
+      dbFile: context.dbFile,
+      now: context.now,
+      sleep: context.sleep,
+    });
+    return {
+      ...base,
+      ok: result.ok,
+      credited: result.checkinCredited === true && result.skipped === undefined,
+      skipped: result.skipped,
+      balanceBefore: result.balanceBefore,
+      balanceAfter: result.balanceAfter,
+      code: result.code,
+      message: result.code === "CHECKIN_UNCONFIRMED" ? "流程跑完但未确认到账；用 zenx accounts recheck 核对。" : undefined,
+    };
+  } catch (error) {
+    const code = error instanceof ZenxError ? error.code : "COMMAND_FAILED";
+    const message = error instanceof Error ? error.message : "签到失败。";
+    const rateLimited = retryCodes.has(code) && context.attempt <= maxRetries;
+    return { ...base, ok: false, code, message, rateLimited };
+  }
+}

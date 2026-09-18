@@ -1197,3 +1197,34 @@ test("CLI checkin --help 提到新命令", async () => {
   assert.match(help, /支持无人值守/);
   assert.doesNotMatch(help, /不执行签到。$/);
 });
+
+/** 站点限流页：登录按钮还在，但站点明确给出"次数过多"。 */
+const observeRateLimited = vom([
+  'L1 page',
+  '    @e12 button "github_logo 使用 GitHub 继续"',
+  '    main "登录次数过多，请稍后再试"',
+].join("\n"));
+
+// 限流是站点侧共享配额，必须能从"登录超时"这类模糊症状里被认出来，
+// 交给 checkin-all 冷却重试——否则继续跑只会把更多账号退出成登出态。
+test("checkin 重登遇到站点限流 → 报 LOGIN_RATE_LIMITED 而非泛化 LOGIN_TIMEOUT", async (t) => {
+  const home = await fixture(t);
+  const script = scriptRunner({
+    observes: [
+      reply(observeWithAnnouncement),
+      reply(observeConsole),
+      reply(observeMenuOpen),
+      reply(observeLoggedOut),
+      reply(observeRateLimited),
+    ],
+  });
+  await assert.rejects(
+    checkinAccount(home, script.run, "work", 180_000, deps()),
+    (error: unknown) => {
+      const zenx = error as { code?: string; message?: string };
+      return zenx.code === "LOGIN_RATE_LIMITED" && /登录次数过多/.test(zenx.message ?? "");
+    },
+    "应报 LOGIN_RATE_LIMITED，并在说明里带上站点给出的限流特征",
+  );
+  assertStopped(script);
+});
