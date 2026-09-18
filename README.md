@@ -35,7 +35,8 @@ node src/cli.ts --help    # 查看全部用法；也可 npm start -- --help
 | `zenx accounts check` | 检查所有账号连接状态 |
 | `zenx accounts configure-launch <别名> --edge-path <msedge.exe> --user-data-dir <用户数据根目录> --profile-directory <Profile子目录> --confirm` | 配置 Edge 启动参数 |
 | `zenx accounts ensure-online <别名>` | 离线时启动对应 Edge Profile |
-| `zenx accounts relink-profile <别名> --confirm` | 实例 ID 变化后按 Profile 重新定位并改绑 |
+| `zenx accounts relink-account <别名> --confirm` | **推荐**：实例 ID 变化后按账号锚点重新定位并改绑 |
+| `zenx accounts relink-profile <别名> --confirm` | 旧路径：按窗口标题的 Profile 显示名重新定位（改名过的 Profile 匹配不上） |
 | `zenx accounts close <别名> --confirm` | 关闭该账号绑定的 Edge 实例（与 `ensure-online` 成对） |
 | `zenx accounts open-site <别名>` | 打开（或切换到）AgentRouter 标签页 |
 | `zenx accounts inspect-site <别名>` | 只读核对登录身份与签到信号 |

@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { bindAccount, checkAccounts, createRunner, doctor, isEdge, listBrowsers, ZenxError } from "./core.ts";
 import type { Runner } from "./core.ts";
-import { closeBrowser, configureLaunch, ensureOnline, inspectSite, openSite, relinkProfile } from "./launch.ts";
+import { closeBrowser, configureLaunch, ensureOnline, inspectSite, openSite, relinkAccount, relinkProfile } from "./launch.ts";
 import { checkinAccount } from "./checkin.ts";
 import { recheckAccount } from "./recheck.ts";
 import { snapshotAccount, snapshotAll } from "./snapshot.ts";
@@ -30,6 +30,7 @@ const help = `ZenX Browser — Windows Edge 多账号连接台
   zenx accounts configure-launch <别名> --edge-path <msedge.exe绝对路径> --user-data-dir <用户数据根目录> --profile-directory <Profile子目录> --confirm
   zenx accounts ensure-online <别名> [--timeout 45s]
   zenx accounts relink-profile <别名> --confirm [--timeout 2m]
+  zenx accounts relink-account <别名> --confirm [--timeout 2m]
   zenx accounts close <别名> --confirm [--timeout 45s]
   zenx accounts open-site <别名> [--tab-id <N>] [--timeout 45s]
   zenx accounts inspect-site <别名> [--tab-id <N>] [--timeout 45s]
@@ -52,6 +53,13 @@ bsk 查询可能自动启动本地 daemon；check 保持只读，不启动 Edge�
 ensure-online / open-site 在线不启动，离线只启动一次已配置的 Windows Edge Profile。
 relink-profile 在 Edge 重启导致实例 ID 变化后，按已配置的 Profile 重新定位并改绑；
   不启动也不关闭 Edge，只开临时探测窗口（必定回收）；目标 Profile 不唯一时拒绝改绑。
+  判定依据是窗口标题里的 Profile **显示名**，本机多个 Profile 被改名过，该命令常匹配不上。
+relink-account（推荐）用**账号锚点**重新定位，不受显示名改名影响：
+  先读该 Profile 的 Preferences.account_info.account_id 作为锚点；若 bsk 直接上报
+  profile_account_id（fork 构建 + 扩展开关）就直接比对，零探测；否则回退到开临时
+  隔离窗口 + 标题标记定位 Profile 子目录，再读其 account_id 比对。
+  锚点缺失报 ACCOUNT_ANCHOR_MISSING；命中多个实例报 PROFILE_AMBIGUOUS，均不改绑。
+  锚点只是不透明账号 ID，不是邮箱或凭证；configure-launch 时自动记录。
 close 与 ensure-online 成对：关闭账号绑定的那个 Edge 实例（停止其全部会话后关闭所有窗口，
   浏览器进程随之退出）；只用已绑定的精确实例 ID，离线、非 Edge 或协议不兼容都直接报错，
   不按标签匹配也不改选；必须 --confirm；失败不重试（可能已关闭），用 zenx accounts check 核对。
@@ -202,7 +210,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     const binding = group === "accounts" && action === "bind";
     const configuring = group === "accounts" && action === "configure-launch";
     const ensuring = group === "accounts" && action === "ensure-online";
-    const relinking = group === "accounts" && action === "relink-profile";
+    const relinking = group === "accounts" && (action === "relink-profile" || action === "relink-account");
     const opening = group === "accounts" && action === "open-site";
     const inspecting = group === "accounts" && action === "inspect-site";
     const closing = group === "accounts" && action === "close";
@@ -250,9 +258,12 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
       report = { ok: true, account, identity: "not_verified", dataDirectory: home };
     } else if (ensuring && alias && positionals.length === 3) {
       report = await ensureOnline(home, run, alias, parseTimeout(values.timeout), dependencies.launchDependencies);
-    } else if (relinking && alias && positionals.length === 3) {
+    } else if (relinking && alias && positionals.length === 3 && action === "relink-profile") {
       if (values.confirm !== true) throw new ZenxError("CONFIRM_REQUIRED", "改绑实例 ID 会修改账号配置，需要 --confirm。");
       report = await relinkProfile(home, run, alias, parseTimeout(values.timeout ?? "2m"), dependencies.launchDependencies);
+    } else if (relinking && alias && positionals.length === 3) {
+      if (values.confirm !== true) throw new ZenxError("CONFIRM_REQUIRED", "改绑实例 ID 会修改账号配置，需要 --confirm。");
+      report = await relinkAccount(home, run, alias, parseTimeout(values.timeout ?? "2m"), dependencies.launchDependencies);
     } else if (opening && alias && positionals.length === 3) {
       report = await openSite(home, run, alias, parseTabId(values["tab-id"]), parseTimeout(values.timeout), dependencies.launchDependencies);
     } else if (inspecting && alias && positionals.length === 3) {

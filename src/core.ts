@@ -26,6 +26,11 @@ export type Browser = {
   label: string;
   extension_protocol_version: string;
   version_skew: boolean;
+  /**
+   * 浏览器 Profile 已登录账号的不透明 ID（fork 构建 + 扩展开关打开后才有）。
+   * 旧版 bsk 没有这个字段，这里按缺省空串处理，便于按账号锚点定位时降级。
+   */
+  profile_account_id?: string;
 };
 export type Account = {
   alias: string;
@@ -33,6 +38,10 @@ export type Account = {
   expectedIdentity: string;
   boundAt: string;
   launch?: LaunchConfig;
+  /** 绑定时记录的账号锚点，供实例 ID 变化后按账号重新定位。 */
+  profileAccountId?: string;
+  /** 锚点采集来源，便于判断可信度。 */
+  profileAccountSource?: "preferences" | "bsk" | "manual";
 };
 export type Store = { version: 1; accounts: Account[] };
 
@@ -84,6 +93,9 @@ export function parseBrowsers(raw: string): Browser[] {
       typeof item.label !== "string" || typeof item.extension_protocol_version !== "string" || typeof item.version_skew !== "boolean") {
       throw new ZenxError("INVALID_BSK_OUTPUT", "浏览器列表缺少所需字段；请更新 bsk 和扩展。");
     }
+    if (item.profile_account_id !== undefined && typeof item.profile_account_id !== "string") {
+      throw new ZenxError("INVALID_BSK_OUTPUT", "浏览器列表的账号 ID 字段类型异常；请更新 bsk 和扩展。");
+    }
     if (ids.has(item.instance_id as string)) throw new ZenxError("DUPLICATE_INSTANCE", "浏览器列表包含重复实例 ID；停止绑定。");
     ids.add(item.instance_id as string);
     return {
@@ -94,6 +106,7 @@ export function parseBrowsers(raw: string): Browser[] {
       label: item.label,
       extension_protocol_version: item.extension_protocol_version,
       version_skew: item.version_skew,
+      profile_account_id: (item.profile_account_id as string | undefined) ?? "",
     };
   });
 }
@@ -157,6 +170,8 @@ export async function readStore(home: string): Promise<Store> {
       if (!object(item) || typeof item.alias !== "string" || typeof item.instanceId !== "string" || typeof item.expectedIdentity !== "string" || !text(item.boundAt) || Number.isNaN(Date.parse(item.boundAt))) throw new Error();
       validateBinding(item.alias, item.instanceId, item.expectedIdentity);
       if ("launch" in item && !isLaunchConfig(item.launch)) throw new Error();
+      if ("profileAccountId" in item && typeof item.profileAccountId !== "string") throw new Error();
+      if ("profileAccountSource" in item && !["preferences", "bsk", "manual"].includes(item.profileAccountSource as string)) throw new Error();
       if (aliases.has(item.alias) || ids.has(item.instanceId)) throw new Error();
       aliases.add(item.alias);
       ids.add(item.instanceId);

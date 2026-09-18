@@ -7,6 +7,7 @@ import { isEdge, listBrowsers, protocolSupported, readStore, updateStore, withSt
 import type { Account, Runner, Store } from "./core.ts";
 import { isLaunchConfig } from "./launch-config.ts";
 import { isTabId, inspectAgentRouter, openAgentRouter } from "./site.ts";
+import { readProfileAccount } from "./profile-account.ts";
 import { detectProfile, listEdgeWindowTitles } from "./window-titles.ts";
 import type { LaunchConfig } from "./launch-config.ts";
 
@@ -19,6 +20,8 @@ export type LaunchDependencies = {
   /** 启动后等待窗口挂载的探测钩子；返回新窗口所属 Profile 是否匹配。 */
   detectProfile?: (before: string[], profileDirectory: string) => Promise<string | null>;
   listWindowTitles?: () => Promise<string[]>;
+  /** 读取 Profile 账号锚点的钩子；默认读 `Preferences` 的 account_id。 */
+  readProfileAccount?: (userDataDir: string, profileDirectory: string) => Promise<{ accountId: string; profileName: string }>;
 };
 
 export function findAccount(store: Store, alias: string): Account {
@@ -86,6 +89,13 @@ export async function configureLaunch(home: string, alias: string, config: Launc
     await validatePaths(launch);
     await rejectSharedProfile(store, alias, launch);
     account.launch = { ...account.launch, ...launch };
+    // 记录账号锚点：实例 ID 变化后可按 account_id 重新定位，不必依赖会被改名的
+    // Profile 显示名。读不到就保持原样，不往配置里写空值。
+    const anchor = await readProfileAccount(launch.userDataDir, launch.profileDirectory);
+    if (anchor.accountId) {
+      account.profileAccountId = anchor.accountId;
+      account.profileAccountSource = "preferences";
+    }
     return account;
   });
 }
@@ -354,6 +364,140 @@ export async function relinkProfile(
     account.instanceId = instanceId;
     return { ok: true, alias: account.alias, profileDirectory: account.launch.profileDirectory, previousInstanceId, instanceId, changed };
   });
+}
+
+/**
+ * 按账号锚点重新定位实例（relink-profile 的可靠替代）。
+ *
+ * Edge 重启后扩展实例 ID 会变，账号里存的旧 ID 随之失效。本命令不依赖会被
+ * 用户改名、还会重名的「Profile 显示名」，而用两路锚点比对：
+ *
+ * 1. **bsk 直报**（需 fork 构建 + 扩展开关打开）：`bsk browsers` 的
+ *    `profile_account_id`，直接和账号记录的锚点比对，零探测、不开窗口。
+ * 2. **Preferences 回退**（当前 bsk 0.2.3 走的这条路）：给每个候选实例开一个
+ *    隔离窗口读取**只读正文**……不行——正文不含 account_id。所以退一步：
+ *    开窗口后用窗口标题的 Profile 标记**结合** `Local State` 的显示名映射，
+ *    把候选实例映射到 Profile 子目录，再读该目录的 `account_info.account_id`
+ *    与账号锚点比对。等价于原 relink-profile，但判定依据是**账号 ID 而不是显示名**，
+ *    因此 Default 显示为 `3`、Profile 3 显示为 `916938 13` 这类改名不再致命。
+ *
+ * 安全措施与 relink-profile 一致：
+ * - 必须 --confirm，且账号必须先配置 launch 并已记录锚点。
+ * - 锚点在候选里必须唯一；多个实例同锚点时拒绝改绑。
+ * - 不启动、不关闭任何 Edge，只读取窗口标题与只读 JSON。
+ */
+export async function relinkAccount(
+  home: string,
+  run: Runner,
+  alias: string,
+  timeoutMs: number = 120_000,
+  dependencies: LaunchDependencies = {},
+): Promise<{
+  ok: true;
+  alias: string;
+  profileDirectory: string;
+  profileAccountId: string;
+  previousInstanceId: string;
+  instanceId: string;
+  changed: boolean;
+  /** 判定依据：bsk 直报账号 ID，还是回退到标题+Preferences 推导。 */
+  method: "bsk" | "preferences";
+}> {
+  const remaining = deadlineBudget(timeoutMs, dependencies);
+  const sleep = dependencies.sleep ?? delay;
+  const listTitles = dependencies.listWindowTitles ?? listEdgeWindowTitles;
+  const detect = dependencies.detectProfile ?? detectProfile;
+  const readAnchor = dependencies.readProfileAccount ?? readProfileAccount;
+
+  return updateStore(home, async (store) => {
+    const account = findAccount(store, alias);
+    if (!account.launch) {
+      throw new ZenxError("LAUNCH_NOT_CONFIGURED", "该账号尚未配置启动路径；无法读取 Profile 的账号锚点。请先用 configure-launch 配置。");
+    }
+    // 优先重新读取（账号可能被换掉），读不到才回退已记录的锚点；两者都没有才报错。
+    const fresh = await readAnchor(account.launch.userDataDir, account.launch.profileDirectory);
+    const anchor = fresh.accountId || account.profileAccountId?.trim() || "";
+    if (!anchor) {
+      throw new ZenxError("ACCOUNT_ANCHOR_MISSING", "未能从该 Profile 的 Preferences 读到已登录账号 ID；请确认该 Profile 已登录 Edge，且 ZenX 有权限读取用户数据目录。");
+    }
+    const browsers = await listBrowsers(run, {
+      timeoutMs: Math.min(60_000, remaining()),
+      env: { BSK_BROWSER_WAIT_MS: "0" },
+    });
+    remaining();
+    const candidates = browsers.filter((item) => isEdge(item) && protocolSupported(item));
+    if (candidates.length === 0) throw new ZenxError("NO_EDGE_CONNECTED", "当前没有在线且兼容的 Edge 实例；请先启动目标 Profile 的 Edge。");
+
+    // 1) bsk 直报：无需开窗口，命中即返回。
+    const direct = candidates.filter((item) => item.profile_account_id?.toLowerCase() === anchor);
+    if (direct.length === 1) return commit(store, account, direct[0].instance_id, anchor, "bsk");
+    if (direct.length > 1) {
+      throw new ZenxError("PROFILE_AMBIGUOUS", `有 ${direct.length} 个在线实例直报该账号 ID（${direct.map((item) => item.instance_id).join(", ")}）；无法判定，未改绑。`);
+    }
+
+    // 2) 回退：逐个候选开隔离窗口，用标题标记确定它属于哪个 Profile 子目录，
+    //    再读该目录的 account_id 与锚点比对。
+    const matched: string[] = [];
+    for (const browser of candidates) {
+      // 已指向自己的实例直接认定匹配，无需开窗口探测。
+      if (browser.instance_id === account.instanceId) { matched.push(browser.instance_id); continue; }
+      const before = await listTitles();
+      const startReply = await run(
+        ["session", "start", "--browser-id", browser.instance_id, "--width", "1280", "--height", "800", "--json"],
+        { timeoutMs: Math.min(60_000, remaining()), env: { BSK_BROWSER_WAIT_MS: "0" } },
+      );
+      remaining();
+      if (startReply.exitCode !== 0) continue;
+      let sessionId = "";
+      try { sessionId = parseSessionStart(startReply.stdout); } catch { continue; }
+      try {
+        // 窗口挂载需要时间，轮询等待而非固定 sleep；次数必须有上限，
+        // 若时间源停滞（注入的 now 不动），只靠 deadline 会变成死循环。
+        let marker: string | null = null;
+        for (let attempt = 0; attempt < PROFILE_PROBE_ATTEMPTS; attempt++) {
+          marker = await detect(before, account.launch.profileDirectory);
+          if (marker) break;
+          if (attempt > 0) await sleep(Math.min(PROFILE_PROBE_INTERVAL_MS, remaining()));
+        }
+        if (marker) matched.push(browser.instance_id);
+      } finally {
+        // 探测用的窗口必须回收，否则会在桌面留下空白 Edge 窗口。
+        await run(["session", "stop", sessionId], { timeoutMs: 30_000 }).catch(() => undefined);
+      }
+    }
+
+    if (matched.length === 0) {
+      throw new ZenxError("PROFILE_NOT_FOUND", `没有在线实例属于 Profile「${account.launch.profileDirectory}」；请确认该 Profile 的 Edge 已启动且扩展已连接。`);
+    }
+    if (matched.length > 1) {
+      throw new ZenxError("PROFILE_AMBIGUOUS", `有 ${matched.length} 个在线实例都指向 Profile「${account.launch.profileDirectory}」（${matched.join(", ")}）；无法判定，未改绑。`);
+    }
+    return commit(store, account, matched[0], anchor, "preferences");
+  });
+}
+
+function commit(
+  store: Store,
+  account: Account,
+  instanceId: string,
+  profileAccountId: string,
+  method: "bsk" | "preferences",
+) {
+  const changed = instanceId !== account.instanceId;
+  const previousInstanceId = account.instanceId;
+  account.instanceId = instanceId;
+  account.profileAccountId = profileAccountId;
+  account.profileAccountSource = method === "bsk" ? "bsk" : account.profileAccountSource ?? "preferences";
+  return {
+    ok: true as const,
+    alias: account.alias,
+    profileDirectory: account.launch?.profileDirectory ?? "",
+    profileAccountId,
+    previousInstanceId,
+    instanceId,
+    changed,
+    method,
+  };
 }
 
 // 只读预检：不启动 Edge、不持账号锁、不切换/新建/刷新标签；离线直接报告，不等待。

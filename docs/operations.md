@@ -110,6 +110,28 @@ node -e "const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync('
 
 ## 5. 排障手册
 
+### 5.0 实例 ID 漂移与 `relink-account`（推荐）
+
+Edge 重启后扩展实例 ID 会变，账号里存的旧 ID 随之失效（表现为一直 `offline`）。`relink-account` 用**账号锚点**重新定位，而不是窗口标题里的显示名：
+
+- 锚点 = 该 Profile 的 `Preferences → account_info.account_id`，浏览器给已登录账号分配的不透明 ID（本机实测 16 位十六进制），**不是邮箱、不是凭证**，跨 Edge 重启稳定、各 Profile 互不相同。
+- `configure-launch` 会自动记录锚点；已配置的账号可用一次性补写脚本或直接跑一次本命令（读不到时会回退已记录的锚点）。
+- 判定顺序：① `bsk browsers` 直报 `profile_account_id`（需 fork 构建 + 扩展开关，零探测不开窗口）→ ② 开临时隔离窗口，用标题标记确定 Profile 子目录，再读其 account_id 比对（必定回收探测窗口）。
+- 结果里的 `method` 字段说明走了哪条路（`bsk` / `preferences`）。
+
+```powershell
+zenx accounts relink-account edge-p15 --confirm
+# { "ok": true, "previousInstanceId": "deadbeef", "instanceId": "ddb6e152", "changed": true, "method": "preferences" }
+```
+
+| 错误码 | 含义与处理 |
+|---|---|
+| `ACCOUNT_ANCHOR_MISSING` | 该 Profile 的 Preferences 读不到 account_id，且配置里也没记录。通常意味着**这个 Profile 没登录 Edge**，先人工登录一次。 |
+| `PROFILE_NOT_FOUND` | 没有在线实例属于该 Profile；先 `ensure-online` 启动对应 Profile 的 Edge。 |
+| `PROFILE_AMBIGUOUS` | 多个在线实例都指向同一锚点（同一 Profile 开了多个 Edge 进程）。**不会改绑**，先关掉多余的 Edge。 |
+
+> 注意 `account_info` 在不同 Profile 里形状不同（有的是对象、有的是数组），解析时两种都要兼容；数组里出现多个不同账号 ID 时按"无法确定"处理，不猜。
+
 ### 5.1 窗口隐藏（最常见，且症状具有误导性）
 
 Edge 窗口在后台/被完全遮挡/最小化时，页面不渲染余额，CDP 派发的输入也会被静默丢弃。表现为：
@@ -150,7 +172,7 @@ powershell -ExecutionPolicy Bypass -File scripts\edge-window.ps1 -Marker "916938
 |---|---|
 | `STORE_BUSY` | 账号锁 `.zenx\accounts.lock` 残留（进程被中断所致）。用 `node -e "require('fs').rmSync('.zenx/accounts.lock',{recursive:true,force:true})"` 清掉 —— **别用 PowerShell `Remove-Item`**，它会走环境的删除钩子、经常超时。 |
 | `zenx accounts close` 报 `BSK_FAILED: browser.close not implemented` | 本机扩展版本不支持 `browser.close`。用 `scripts\edge-window.ps1 -Action Close` 兜底（关窗后 Edge 进程会后台驻留十几秒才退出，稍等即可，不用杀进程）。 |
-| 账号一直 `offline`，`ensure-online` 也拉不回 | Edge 重启后扩展实例 ID 变了。用 `zenx accounts relink-profile <别名> --confirm`；**本机多数 Profile 被改名过，该命令基本匹配不上**，直接按 `Local State` 的显示名核对后改 `.zenx\accounts.json` 更可靠。 |
+| 账号一直 `offline`，`ensure-online` 也拉不回 | Edge 重启后扩展实例 ID 变了。用 **`zenx accounts relink-account <别名> --confirm`**（按账号锚点定位，不受 Profile 改名影响）。旧的 `relink-profile` 靠窗口标题的显示名匹配，本机多个 Profile 被改名过（Default 显示为 `3`、Profile 3 显示为 `916938 13`），基本匹配不上，已不推荐使用。 |
 | `accounts.json` 损坏导致所有命令报 `INVALID_STORE` | `readStore` 要求 alias 与 instanceId 均唯一，重复就全挂。手工编辑后务必 `zenx accounts check` 验证。 |
 | 关闭浏览器后某账号第二天签到 `IDENTITY_MISMATCH` | 该账号的站点会话没持久化（实测 `edge-p3` 会这样，其它账号不会）。收尾前确认它是登录态，或次日补一次登录。 |
 
