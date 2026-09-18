@@ -8,7 +8,7 @@ import { EventEmitter } from "node:events";
 import { syncBuiltinESMExports } from "node:module";
 import { checkAccounts, createRunner, readStore, withStoreLock, ZenxError } from "../src/core.ts";
 import type { Account, Browser, Runner } from "../src/core.ts";
-import { closeBrowser, configureLaunch, ensureOnline, relinkProfile } from "../src/launch.ts";
+import { closeBrowser, configureLaunch, ensureOnline } from "../src/launch.ts";
 import type { LaunchConfig } from "../src/launch.ts";
 
 const edge: Browser = {
@@ -79,117 +79,8 @@ test("保存配置保留绑定、其他账号和未知字段，修改仍需确�
   assert.deepEqual((await readdir(home)).filter((name) => name.endsWith(".tmp") || name.endsWith(".lock")), []);
 });
 
-// Edge 重启后扩展实例 ID 会变，账号里存的旧 ID 随之失效。relink-profile 按已配置的
-// Profile 重新定位：给候选实例开临时探测窗口，用窗口标题里的 Profile 序号反查归属。
-const browserA: Browser = { ...edge, instance_id: "aaaa1111" };
-const browserB: Browser = { ...edge, instance_id: "bbbb2222" };
-
-/** 让 relink 对指定实例判定为匹配（标题里带配置中的 Profile 序号）。 */
-function relinkDeps(matchIds: string[], profileDirectory: string) {
-  const marker = /^Profile (\d+)$/.exec(profileDirectory)?.[1] ?? profileDirectory.toLowerCase();
-  const titles: string[] = [];
-  const stops: string[][] = [];
-  return {
-    deps: {
-      listWindowTitles: async () => [...titles],
-      detectProfile: async (_before: string[], expected: string) => (
-        expected === profileDirectory && titles.some((title) => title.includes(`- ${marker} -`)) ? marker : null
-      ),
-      sleep: async () => {
-        // 探测窗口"挂载"：把标题补上，模拟窗口出现。
-        titles.push(`about:blank - ${marker} - Microsoft Edge`);
-      },
-      now: () => 0,
-    },
-    titles,
-    stops,
-    matchIds,
-  };
-}
-
-function relinkRunner(browsers: Browser[], harness: ReturnType<typeof relinkDeps>, sessionId = "wxyz") {
-  const stops: string[][] = [];
-  const run: Runner = async (args) => {
-    if (args[0] === "browsers") return { stdout: JSON.stringify(browsers), exitCode: 0 };
-    if (args[0] === "session" && args[1] === "start") {
-      assert.deepEqual(args.slice(2, 4), ["--browser-id", harness.matchIds[0]]);
-      return { stdout: JSON.stringify({ session_id: sessionId }), exitCode: 0 };
-    }
-    if (args[0] === "session" && args[1] === "stop") { stops.push(args); return { stdout: "stopped", exitCode: 0 }; }
-    throw new Error(`unexpected: ${args.join(" ")}`);
-  };
-  return { run, stops };
-}
-
-test("relink-profile 按 Profile 命中唯一实例时改绑，并回收探测窗口", async (t) => {
-  const { home, config } = await fixture(t);
-  await configureLaunch(home, "work", config, true);
-  const harness = relinkDeps([browserA.instance_id], config.profileDirectory);
-  const { run, stops } = relinkRunner([browserA], harness);
-
-  const result = await relinkProfile(home, run, "work", 30_000, harness.deps);
-  assert.deepEqual(result, {
-    ok: true, alias: "work", profileDirectory: "Profile 3",
-    previousInstanceId: account.instanceId, instanceId: browserA.instance_id, changed: true,
-  });
-  assert.deepEqual(stops, [["session", "stop", "wxyz"]], "探测窗口必须关闭，不能在桌面留下空白 Edge");
-  assert.equal((await readStore(home)).accounts[0].instanceId, browserA.instance_id);
-});
-
-test("relink-profile 实例 ID 未变时报告 changed:false", async (t) => {
-  const { home, config } = await fixture(t);
-  await configureLaunch(home, "work", config, true);
-  const harness = relinkDeps([edge.instance_id], config.profileDirectory);
-  const { run } = relinkRunner([edge], harness);
-  const result = await relinkProfile(home, run, "work", 30_000, harness.deps);
-  assert.equal(result.changed, false);
-  assert.equal(result.instanceId, edge.instance_id);
-});
-
-test("relink-profile 没有实例属于该 Profile → PROFILE_NOT_FOUND，不改绑", async (t) => {
-  const { home, config } = await fixture(t);
-  await configureLaunch(home, "work", config, true);
-  const harness = relinkDeps([browserA.instance_id], config.profileDirectory);
-  // 探测永远不返回标记：模拟该实例属于别的 Profile。
-  const { run } = relinkRunner([browserA], harness);
-  const before = await readFile(join(home, "accounts.json"), "utf8");
-  await assert.rejects(
-    relinkProfile(home, run, "work", 30_000, { ...harness.deps, detectProfile: async () => null }),
-    { code: "PROFILE_NOT_FOUND" },
-  );
-  assert.equal(await readFile(join(home, "accounts.json"), "utf8"), before);
-});
-
-test("relink-profile 多个实例同属该 Profile → PROFILE_AMBIGUOUS，不改绑", async (t) => {
-  const { home, config } = await fixture(t);
-  await configureLaunch(home, "work", config, true);
-  const harness = relinkDeps([browserA.instance_id, browserB.instance_id], config.profileDirectory);
-  const runners: Runner[] = [];
-  for (const browser of [browserA, browserB]) {
-    runners.push(relinkRunner([browser], harness).run);
-  }
-  const before = await readFile(join(home, "accounts.json"), "utf8");
-  // 两个实例都报匹配（真实命令会逐个探测，这里直接构造两个匹配结果）。
-  const run: Runner = async (args) => {
-    if (args[0] === "browsers") return { stdout: JSON.stringify([browserA, browserB]), exitCode: 0 };
-    if (args[0] === "session" && args[1] === "start") return { stdout: JSON.stringify({ session_id: "wxyz" }), exitCode: 0 };
-    if (args[0] === "session" && args[1] === "stop") return { stdout: "stopped", exitCode: 0 };
-    throw new Error(`unexpected: ${args.join(" ")}`);
-  };
-  await assert.rejects(relinkProfile(home, run, "work", 30_000, harness.deps), { code: "PROFILE_AMBIGUOUS" });
-  assert.equal(await readFile(join(home, "accounts.json"), "utf8"), before);
-});
-
-test("relink-profile 未配置启动路径 → LAUNCH_NOT_CONFIGURED", async (t) => {
-  const { home } = await fixture(t);
-  await assert.rejects(relinkProfile(home, online, "work", 30_000), { code: "LAUNCH_NOT_CONFIGURED" });
-});
-
-test("relink-profile 无在线 Edge → NO_EDGE_CONNECTED", async (t) => {
-  const { home, config } = await fixture(t);
-  await configureLaunch(home, "work", config, true);
-  await assert.rejects(relinkProfile(home, offline, "work", 30_000), { code: "NO_EDGE_CONNECTED" });
-});
+// 实例漂移后按账号锚点重新定位的用例集中在 test/relink-account.test.ts。
+// （旧的 relink-profile 依赖窗口标题的 Profile 显示名，已被移除。）
 
 test("未确认、未知别名均不保存配置", windows, async (t) => {
   const { home, config } = await fixture(t);

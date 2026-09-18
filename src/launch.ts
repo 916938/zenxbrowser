@@ -289,85 +289,7 @@ export async function openSite(
 }
 
 /**
- * 按 Profile 重新定位实例：Edge 重启后扩展实例 ID 会变，账号里存的旧 ID 就失效了
- * （表现为 ensure-online 一直报 offline）。本命令给每个在线实例开一个隔离窗口，
- * 用窗口标题里的 Profile 序号反查它属于哪个 Profile，匹配上就把账号改绑到新 ID。
- *
- * 安全措施：
- * - 必须 --confirm，且账号必须先配置好 launch（Profile 路径是唯一可信依据）。
- * - 目标 Profile 在候选里必须唯一；多个实例报同一 Profile 时拒绝改绑。
- * - 不启动、不关闭任何 Edge，只读取窗口标题。
- */
-export async function relinkProfile(
-  home: string,
-  run: Runner,
-  alias: string,
-  timeoutMs: number = 120_000,
-  dependencies: LaunchDependencies = {},
-): Promise<{ ok: true; alias: string; profileDirectory: string; previousInstanceId: string; instanceId: string; changed: boolean }> {
-  const remaining = deadlineBudget(timeoutMs, dependencies);
-  const sleep = dependencies.sleep ?? delay;
-  const listTitles = dependencies.listWindowTitles ?? listEdgeWindowTitles;
-  const detect = dependencies.detectProfile ?? detectProfile;
-
-  return updateStore(home, async (store) => {
-    const account = findAccount(store, alias);
-    if (!account.launch) {
-      throw new ZenxError("LAUNCH_NOT_CONFIGURED", "该账号尚未配置启动路径；没有 Profile 可依据，无法按 Profile 定位。请先用 configure-launch 配置。");
-    }
-    const browsers = await listBrowsers(run, {
-      timeoutMs: Math.min(60_000, remaining()),
-      env: { BSK_BROWSER_WAIT_MS: "0" },
-    });
-    remaining();
-    const candidates = browsers.filter((item) => isEdge(item) && protocolSupported(item));
-    if (candidates.length === 0) throw new ZenxError("NO_EDGE_CONNECTED", "当前没有在线且兼容的 Edge 实例；请先启动目标 Profile 的 Edge。");
-
-    const matched: string[] = [];
-    for (const browser of candidates) {
-      // 已经指向自己的实例直接认定匹配，无需开窗口探测。
-      if (browser.instance_id === account.instanceId) { matched.push(browser.instance_id); continue; }
-      const before = await listTitles();
-      const startReply = await run(
-        ["session", "start", "--browser-id", browser.instance_id, "--width", "1280", "--height", "800", "--json"],
-        { timeoutMs: Math.min(60_000, remaining()), env: { BSK_BROWSER_WAIT_MS: "0" } },
-      );
-      remaining();
-      if (startReply.exitCode !== 0) continue;
-      let sessionId = "";
-      try { sessionId = parseSessionStart(startReply.stdout); } catch { continue; }
-      try {
-        // 窗口挂载需要时间，轮询等待而非固定 sleep。次数必须有上限：
-        // 若时间源停滞（注入的 now 不动），只靠 deadline 会变成死循环。
-        let marker: string | null = null;
-        for (let attempt = 0; attempt < PROFILE_PROBE_ATTEMPTS; attempt++) {
-          marker = await detect(before, account.launch.profileDirectory);
-          if (marker) break;
-          if (attempt > 0) await sleep(Math.min(PROFILE_PROBE_INTERVAL_MS, remaining()));
-        }
-        if (marker) matched.push(browser.instance_id);
-      } finally {
-        // 探测用的窗口必须回收，否则会在桌面留下空白 Edge 窗口。
-        await run(["session", "stop", sessionId], { timeoutMs: 30_000 }).catch(() => undefined);
-      }
-    }
-
-    if (matched.length === 0) {
-      throw new ZenxError("PROFILE_NOT_FOUND", `没有在线实例属于 Profile「${account.launch.profileDirectory}」；请确认该 Profile 的 Edge 已启动且扩展已连接。`);
-    }
-    if (matched.length > 1) {
-      throw new ZenxError("PROFILE_AMBIGUOUS", `有 ${matched.length} 个在线实例都指向 Profile「${account.launch.profileDirectory}」（${matched.join(", ")}）；无法判定，未改绑。`);
-    }
-    const [instanceId] = matched;
-    const changed = instanceId !== account.instanceId;
-    const previousInstanceId = account.instanceId;
-    account.instanceId = instanceId;
-    return { ok: true, alias: account.alias, profileDirectory: account.launch.profileDirectory, previousInstanceId, instanceId, changed };
-  });
-}
-
-/**
- * 按账号锚点重新定位实例（relink-profile 的可靠替代）。
+ * 按账号锚点重新定位实例。
  *
  * Edge 重启后扩展实例 ID 会变，账号里存的旧 ID 随之失效。本命令不依赖会被
  * 用户改名、还会重名的「Profile 显示名」，而用两路锚点比对：
@@ -375,13 +297,11 @@ export async function relinkProfile(
  * 1. **bsk 直报**（需 fork 构建 + 扩展开关打开）：`bsk browsers` 的
  *    `profile_account_id`，直接和账号记录的锚点比对，零探测、不开窗口。
  * 2. **Preferences 回退**（当前 bsk 0.2.3 走的这条路）：给每个候选实例开一个
- *    隔离窗口读取**只读正文**……不行——正文不含 account_id。所以退一步：
- *    开窗口后用窗口标题的 Profile 标记**结合** `Local State` 的显示名映射，
- *    把候选实例映射到 Profile 子目录，再读该目录的 `account_info.account_id`
- *    与账号锚点比对。等价于原 relink-profile，但判定依据是**账号 ID 而不是显示名**，
+ *    隔离窗口，用窗口标题的 Profile 标记确定它属于哪个 Profile 子目录，再读该目录
+ *    的 `account_info.account_id` 与锚点比对。判定依据是**账号 ID 而不是显示名**，
  *    因此 Default 显示为 `3`、Profile 3 显示为 `916938 13` 这类改名不再致命。
  *
- * 安全措施与 relink-profile 一致：
+ * 安全措施：
  * - 必须 --confirm，且账号必须先配置 launch 并已记录锚点。
  * - 锚点在候选里必须唯一；多个实例同锚点时拒绝改绑。
  * - 不启动、不关闭任何 Edge，只读取窗口标题与只读 JSON。

@@ -172,7 +172,7 @@ powershell -ExecutionPolicy Bypass -File scripts\edge-window.ps1 -Marker "916938
 |---|---|
 | `STORE_BUSY` | 账号锁 `.zenx\accounts.lock` 残留（进程被中断所致）。用 `node -e "require('fs').rmSync('.zenx/accounts.lock',{recursive:true,force:true})"` 清掉 —— **别用 PowerShell `Remove-Item`**，它会走环境的删除钩子、经常超时。 |
 | `zenx accounts close` 报 `BSK_FAILED: browser.close not implemented` | 本机扩展版本不支持 `browser.close`。用 `scripts\edge-window.ps1 -Action Close` 兜底（关窗后 Edge 进程会后台驻留十几秒才退出，稍等即可，不用杀进程）。 |
-| 账号一直 `offline`，`ensure-online` 也拉不回 | Edge 重启后扩展实例 ID 变了。用 **`zenx accounts relink-account <别名> --confirm`**（按账号锚点定位，不受 Profile 改名影响）。旧的 `relink-profile` 靠窗口标题的显示名匹配，本机多个 Profile 被改名过（Default 显示为 `3`、Profile 3 显示为 `916938 13`），基本匹配不上，已不推荐使用。 |
+| 账号一直 `offline`，`ensure-online` 也拉不回 | Edge 重启后扩展实例 ID 变了。用 `zenx accounts relink-account <别名> --confirm`（按账号锚点定位，不受 Profile 改名影响；本机多个 Profile 被改名过，Default 显示为 `3`、Profile 3 显示为 `916938 13`）。 |
 | `accounts.json` 损坏导致所有命令报 `INVALID_STORE` | `readStore` 要求 alias 与 instanceId 均唯一，重复就全挂。手工编辑后务必 `zenx accounts check` 验证。 |
 | 关闭浏览器后某账号第二天签到 `IDENTITY_MISMATCH` | 该账号的站点会话没持久化（实测 `edge-p3` 会这样，其它账号不会）。收尾前确认它是登录态，或次日补一次登录。 |
 

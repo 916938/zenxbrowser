@@ -35,8 +35,7 @@ node src/cli.ts --help    # 查看全部用法；也可 npm start -- --help
 | `zenx accounts check` | 检查所有账号连接状态 |
 | `zenx accounts configure-launch <别名> --edge-path <msedge.exe> --user-data-dir <用户数据根目录> --profile-directory <Profile子目录> --confirm` | 配置 Edge 启动参数 |
 | `zenx accounts ensure-online <别名>` | 离线时启动对应 Edge Profile |
-| `zenx accounts relink-account <别名> --confirm` | **推荐**：实例 ID 变化后按账号锚点重新定位并改绑 |
-| `zenx accounts relink-profile <别名> --confirm` | 旧路径：按窗口标题的 Profile 显示名重新定位（改名过的 Profile 匹配不上） |
+| `zenx accounts relink-account <别名> --confirm` | 实例 ID 变化后按账号锚点重新定位并改绑 |
 | `zenx accounts close <别名> --confirm` | 关闭该账号绑定的 Edge 实例（与 `ensure-online` 成对） |
 | `zenx accounts open-site <别名>` | 打开（或切换到）AgentRouter 标签页 |
 | `zenx accounts inspect-site <别名>` | 只读核对登录身份与签到信号 |
@@ -143,27 +142,33 @@ node src/cli.ts accounts recheck edge-1 --json
 
 Edge 重启后扩展的**实例 ID 会变**，而 `accounts.json` 里存的是固定 ID。一旦变化，账号就会一直报 `offline`（`ensure-online` 也拉不回来），看起来像“Edge 挂了”，其实是绑错了对象。
 
-用 `relink-profile` 按 Profile 重新定位：
+用 `relink-account` 按**账号锚点**重新定位：
 
 ```powershell
-zenx accounts relink-profile edge-8 --confirm
+zenx accounts relink-account edge-8 --confirm
 ```
 
-它会给每个在线实例开一个临时探测窗口，从窗口标题（形如 `New tab - 8 - Microsoft Edge`）里的 Profile 序号反查归属，匹配上就改绑。
+锚点就是该 Profile 的 `Preferences → account_info.account_id`：浏览器给已登录账号分配的不透明 ID（本机实测 16 位十六进制），**不是邮箱也不是凭证**，跨 Edge 重启稳定、各 Profile 互不相同——因此不受"Profile 显示名被改名"的影响（本机 Default 显示成 `3`、Profile 3 显示成 `916938 13`，按显示名匹配的老办法早已失效）。
 
 ```json
 { "ok": true, "alias": "edge-8", "profileDirectory": "Profile 8",
-  "previousInstanceId": "6fae1ec3", "instanceId": "d9067149", "changed": true }
+  "profileAccountId": "580c3c71de3c6b3b", "previousInstanceId": "6fae1ec3",
+  "instanceId": "d9067149", "changed": true, "method": "preferences" }
 ```
+
+两路判定，`method` 字段说明走了哪条：
+
+- **`bsk`**：`bsk browsers` 直接上报 `profile_account_id`（需 fork 构建 + 扩展里打开「共享 Profile 账号 ID」）。零探测、不开任何窗口。
+- **`preferences`**（当前本机走的这条）：给候选实例开临时探测窗口，用窗口标题（形如 `New tab - 8 - Microsoft Edge`）确定它属于哪个 Profile 子目录，再读该目录的 `account_id` 与锚点比对。
 
 说明：
 
-- **前提**是账号已用 `configure-launch` 配置过 Profile——这是唯一可信的依据，命令不会猜。
+- **前提**是账号已用 `configure-launch` 配置过 Profile（锚点会随之自动记录），命令不会猜。
 - 不启动也不关闭任何 Edge；临时探测窗口必定回收（失败也会尝试 `session stop`）。
-- **目标 Profile 在候选里必须唯一**，多个实例报同一 Profile 时报 `PROFILE_AMBIGUOUS` 且**不改绑**——宁可不动，也不绑错账号。
-- 没找到报 `PROFILE_NOT_FOUND`；未配置启动路径报 `LAUNCH_NOT_CONFIGURED`。
+- **锚点在候选里必须唯一**，多个实例同锚点时报 `PROFILE_AMBIGUOUS` 且**不改绑**——宁可不动，也不绑错账号。
+- 没找到报 `PROFILE_NOT_FOUND`；未配置启动路径报 `LAUNCH_NOT_CONFIGURED`；读不到账号 ID 报 `ACCOUNT_ANCHOR_MISSING`（通常是该 Profile 没登录 Edge）。
 - 批量修复所有账号：`zenx accounts check` 找出 offline 的，逐个跑上面的命令。
-- 仅 Windows 可用（依赖窗口标题枚举）。
+- 仅 Windows 可用（依赖窗口标题枚举与 Edge 用户数据目录）。
 
 ### 签到统计（SQLite + 网页报表）
 
