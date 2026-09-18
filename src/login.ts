@@ -121,7 +121,7 @@ export async function loginAccount(
   const deadline = now() + timeoutMs;
   const remaining = () => {
     const budget = Math.floor(deadline - now());
-    if (budget < 1) throw new ZenxError("LOGIN_TIMEOUT", "登录总预算已耗尽；停止，不重试。");
+    if (budget < 1) throw new ZenxError("LOGIN_TIMEOUT", "登录总预算已耗尽；停止，不重试。", { alias });
     return budget;
   };
   return withStoreLock(home, async () => {
@@ -251,7 +251,7 @@ export async function loginAccount(
           throw new ZenxError("LOGIN_RATE_LIMITED", `站点登录限流（${nowLimited}）；不要连续重试，等待后再继续。`, { pageFeature: nowLimited });
         }
         if (now() >= loginDeadline) {
-          throw new ZenxError("LOGIN_TIMEOUT", `登录后 ${LOGIN_POLL_BUDGET_MS / 1000}s 内未完成；站点可能仍在限流，等待后再重试。`);
+          throw new ZenxError("LOGIN_TIMEOUT", `登录后 ${LOGIN_POLL_BUDGET_MS / 1000}s 内未完成；站点可能仍在限流，等待后再重试。`, { alias });
         }
       }
     } finally {

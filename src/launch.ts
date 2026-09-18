@@ -253,7 +253,7 @@ export async function closeBrowser(
   });
   remaining();
   const browser = browsers.find((item) => item.instance_id === account.instanceId);
-  if (!browser) throw new ZenxError("INSTANCE_OFFLINE", "目标实例未在线：没有可关闭的 Edge；未调用关闭，也不会改选其他实例。");
+  if (!browser) throw new ZenxError("INSTANCE_OFFLINE", "目标实例未在线：没有可关闭的 Edge；未调用关闭，也不会改选其他实例。", { alias: account.alias });
   if (!isEdge(browser)) throw new ZenxError("NOT_EDGE", "目标实例不是 Microsoft Edge；不会关闭。");
   if (!protocolSupported(browser)) throw new ZenxError("UNSUPPORTED_PROTOCOL", "目标扩展协议不兼容；当前仅支持 1.0 / 1.1 / 1.3，不会关闭。");
   remaining();
@@ -283,7 +283,7 @@ export async function openSite(
     const store = await readStore(home);
     const account = findAccount(store, alias);
     const launched = await ensureOnlineLocked(store, account, run, remaining, dependencies);
-    const result = await openAgentRouter(run, account.instanceId, tabId, remaining);
+    const result = await openAgentRouter(run, account.instanceId, tabId, remaining, account.alias);
     return { ok: true, alias: account.alias, instanceId: account.instanceId, ...result, identity: "not_verified", launched };
   });
 }
@@ -387,7 +387,7 @@ export async function relinkAccount(
     }
 
     if (matched.length === 0) {
-      throw new ZenxError("PROFILE_NOT_FOUND", `没有在线实例属于 Profile「${account.launch.profileDirectory}」；请确认该 Profile 的 Edge 已启动且扩展已连接。`);
+      throw new ZenxError("PROFILE_NOT_FOUND", `没有在线实例属于 Profile「${account.launch.profileDirectory}」；请确认该 Profile 的 Edge 已启动且扩展已连接。`, { alias: account.alias });
     }
     if (matched.length > 1) {
       throw new ZenxError("PROFILE_AMBIGUOUS", `有 ${matched.length} 个在线实例都指向 Profile「${account.launch.profileDirectory}」（${matched.join(", ")}）；无法判定，未改绑。`);
@@ -443,6 +443,6 @@ export async function inspectSite(
   if (connection !== "online") {
     return { ok: false, alias: account.alias, instanceId: account.instanceId, connection, siteTab: null, identity: "not_verified" };
   }
-  const result = await inspectAgentRouter(run, account.instanceId, account.expectedIdentity, tabId, remaining);
+  const result = await inspectAgentRouter(run, account.instanceId, account.expectedIdentity, tabId, remaining, account.alias);
   return { ok: true, alias: account.alias, instanceId: account.instanceId, connection, ...result, identity: result.observation?.identity ?? "not_verified" };
 }

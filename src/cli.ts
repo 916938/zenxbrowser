@@ -377,7 +377,12 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     const code = error instanceof ZenxError ? error.code : "COMMAND_FAILED";
     const message = error instanceof Error ? error.message : "命令失败。";
     const details = error instanceof ZenxError ? error.details : undefined;
-    output(asJson ? JSON.stringify({ ok: false, error: { code, message, ...details } }) : `${code}: ${message}`);
+    const hint = error instanceof ZenxError ? error.hint : undefined;
+    if (asJson) {
+      output(JSON.stringify({ ok: false, error: { code, message, ...(hint ? { hint } : {}), ...details } }));
+    } else {
+      output(hint ? `${code}: ${message}\nhint: ${hint}` : `${code}: ${message}`);
+    }
     return 1;
   }
 }

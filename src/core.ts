@@ -4,14 +4,21 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { isLaunchConfig } from "./launch-config.ts";
 import type { LaunchConfig } from "./launch-config.ts";
+import { hintFor } from "./hints.ts";
 
 export class ZenxError extends Error {
   code: string;
   details?: Record<string, unknown>;
+  /**
+   * 可执行的下一步建议。构造时留空则由错误码 + details 合成
+   * （见 hints.ts）；抛出点也可以直接给，用于覆盖默认建议。
+   */
+  hint?: string;
   constructor(code: string, message: string, details?: Record<string, unknown>) {
     super(message);
     this.code = code;
     this.details = details;
+    this.hint = hintFor(this) ?? undefined;
   }
 }
 

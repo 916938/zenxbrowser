@@ -652,7 +652,7 @@ async function runCheckinSteps(
     const urls = Array.isArray(captured.urls) ? captured.urls : [];
     const url = urls.find((item): item is string => typeof item === "string" && item.startsWith("https://github.com/"));
     if (!url) {
-      throw new ZenxError("LOGIN_TIMEOUT", "未能捕获 GitHub 授权地址（window.open 未触发）；停止，不重试。");
+      throw new ZenxError("LOGIN_TIMEOUT", "未能捕获 GitHub 授权地址（window.open 未触发）；停止，不重试。", { alias: account.alias });
     }
     await evaluateJson(run, sessionId, oauthNavigateExpression(url), remaining);
   };
@@ -661,7 +661,7 @@ async function runCheckinSteps(
 
   // ④ 身份验证（红线：不匹配立即停止）。
   if (!page.text.includes(account.expectedIdentity)) {
-    throw new ZenxError("IDENTITY_MISMATCH", `控制台正文未包含预期身份 ${account.expectedIdentity}；立即停止，不执行退出。若该账号当前未登录，请先人工登录后再执行签到。`);
+    throw new ZenxError("IDENTITY_MISMATCH", `控制台正文未包含预期身份 ${account.expectedIdentity}；立即停止，不执行退出。若该账号当前未登录，请先人工登录后再执行签到。`, { alias: account.alias });
   }
 
   // ⑤ 记录退出前余额。
@@ -717,7 +717,7 @@ async function runCheckinSteps(
   // 登录成功的标志是用户菜单按钮（G <身份> chevron）出现——余额已不在落地页，
   // 到账核对统一放在 ⑧ 的控制台余额对比。
   const githubRef = findRefByLabel(page, "github_logo 使用 GitHub 继续");
-  if (!githubRef) throw new ZenxError("LOGIN_TIMEOUT", "登录页未找到 GitHub 登录按钮 ref；停止，不重试。");
+  if (!githubRef) throw new ZenxError("LOGIN_TIMEOUT", "登录页未找到 GitHub 登录按钮 ref；停止，不重试。", { alias: account.alias });
   await startGitHubLogin(page, githubRef);
 
   const loginDeadline = now() + LOGIN_POLL_BUDGET_MS;
@@ -737,7 +737,7 @@ async function runCheckinSteps(
     }
     if (menuPattern.test(page.text)) { loggedIn = true; break; }
   }
-  if (!loggedIn) throw new ZenxError("LOGIN_TIMEOUT", "重新登录轮询超时（60s）；停止，不重试。");
+  if (!loggedIn) throw new ZenxError("LOGIN_TIMEOUT", "重新登录轮询超时（60s）；停止，不重试。", { alias: account.alias });
 
   // ⑧ 签到确认：回控制台仪表盘读新余额。
   await navigateConsole();

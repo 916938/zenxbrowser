@@ -59,10 +59,10 @@ function siteCandidates(tabs: UserTab[]): Candidate[] {
   });
 }
 
-function pickSiteTab(candidates: Candidate[], tabId: number | undefined): Candidate | undefined {
+function pickSiteTab(candidates: Candidate[], tabId: number | undefined, alias: string): Candidate | undefined {
   if (tabId !== undefined) {
     const selected = candidates.find((tab) => tab.tab_id === tabId);
-    if (!selected) throw new ZenxError("SITE_TAB_NOT_FOUND", "指定 --tab-id 不是该绑定实例内匹配 AgentRouter 的用户标签；不会新建。", { candidateTabIds: candidates.map((tab) => tab.tab_id) });
+    if (!selected) throw new ZenxError("SITE_TAB_NOT_FOUND", "指定 --tab-id 不是该绑定实例内匹配 AgentRouter 的用户标签；不会新建。", { candidateTabIds: candidates.map((tab) => tab.tab_id), alias });
     return selected;
   }
   if (candidates.length <= 1) return candidates[0];
@@ -83,9 +83,9 @@ async function listSiteTabs(run: Runner, instanceId: string, remaining: () => nu
   return parseTabs(reply.stdout);
 }
 
-export async function openAgentRouter(run: Runner, instanceId: string, tabId: number | undefined, remaining: () => number) {
+export async function openAgentRouter(run: Runner, instanceId: string, tabId: number | undefined, remaining: () => number, alias = "") {
   const candidates = siteCandidates(await listSiteTabs(run, instanceId, remaining));
-  const selected = pickSiteTab(candidates, tabId);
+  const selected = pickSiteTab(candidates, tabId, alias);
   const args = selected
     ? ["tab", "select", String(selected.tab_id), "--browser-id", instanceId, "--expected-origin", selected.origin, "--json"]
     : ["tab", "create", siteUrl, "--browser-id", instanceId, "--json"];
@@ -141,9 +141,9 @@ export type InspectResult = {
   observation?: Observation;
 };
 
-export async function inspectAgentRouter(run: Runner, instanceId: string, expectedIdentity: string, tabId: number | undefined, remaining: () => number): Promise<InspectResult> {
+export async function inspectAgentRouter(run: Runner, instanceId: string, expectedIdentity: string, tabId: number | undefined, remaining: () => number, alias = ""): Promise<InspectResult> {
   const candidates = siteCandidates(await listSiteTabs(run, instanceId, remaining));
-  const selected = pickSiteTab(candidates, tabId);
+  const selected = pickSiteTab(candidates, tabId, alias);
   if (!selected) return { siteTab: null };
   const reply = await run(["tab", "observe", "--browser-id", instanceId, "--tab-id", String(selected.tab_id), "--expected-origin", selected.origin, "--json"], {
     timeoutMs: Math.min(60_000, remaining()), env: { BSK_BROWSER_WAIT_MS: "0" },
