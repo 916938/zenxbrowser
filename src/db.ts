@@ -211,13 +211,15 @@ export function summarizeAccounts(file: string = DEFAULT_DB_FILE): AccountSummar
     );
     // 余额取"最近一次已知值"：与统计时点无关地回答"这个号现在有多少钱"。
     // 同一时刻快照与打卡同时存在时优先快照（它才是被刻意采集的观测点）。
+    // balance > 0 的过滤：页面没渲染出余额时站点会显示 0（实测），把它当成真余额
+    // 会让"当前余额"突然归零，必须当缺失处理。
     const balanceStmt = db.prepare(`
       SELECT balance, time, source FROM (
         SELECT balance_after AS balance, time, 'checkin' AS source FROM checkins
-        WHERE alias = ? AND balance_after IS NOT NULL
+        WHERE alias = ? AND balance_after IS NOT NULL AND balance_after > 0
         UNION ALL
         SELECT balance, time, 'snapshot' AS source FROM balance_snapshots
-        WHERE alias = ? AND ok = 1 AND balance IS NOT NULL
+        WHERE alias = ? AND ok = 1 AND balance IS NOT NULL AND balance > 0
       ) ORDER BY time DESC, source DESC LIMIT 1
     `);
     const identityStmt = db.prepare(`
@@ -268,10 +270,10 @@ export function lastBalanceBefore(alias: string, timeIso: string, file: string =
     const row = db.prepare(`
       SELECT balance FROM (
         SELECT balance_after AS balance, time FROM checkins
-        WHERE alias = ? AND balance_after IS NOT NULL AND time < ?
+        WHERE alias = ? AND balance_after IS NOT NULL AND balance_after > 0 AND time < ?
         UNION ALL
         SELECT balance, time FROM balance_snapshots
-        WHERE alias = ? AND ok = 1 AND balance IS NOT NULL AND time < ?
+        WHERE alias = ? AND ok = 1 AND balance IS NOT NULL AND balance > 0 AND time < ?
       ) ORDER BY time DESC LIMIT 1
     `).get(alias, timeIso, alias, timeIso) as { balance?: number | null } | undefined;
     return row?.balance ?? null;
@@ -477,62 +479,145 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
       "SELECT alias, time, balance, total_spent FROM balance_snapshots WHERE ok = 1 ORDER BY time, id",
     ).all() as { alias: string; time: string; balance: number | null; total_spent: number | null }[];
 
-    const perAlias = new Map<string, Map<string, { balance: number | null; totalSpent: number | null }>>();
+    type DayValue = { balance: number | null; totalSpent: number | null };
+    /** alias → (本地日 → 该日最后一次观测值)，插入顺序即时间顺序。 */
+    const perAlias = new Map<string, Map<string, DayValue>>();
+    /** alias → 观测点序列（含时间与原始值），用于按真实时序反推当日到账。 */
+    const points = new Map<string, { day: string; balance: number | null; totalSpent: number | null }[]>();
     for (const row of snapshots) {
       if (!perAlias.has(row.alias)) perAlias.set(row.alias, new Map());
+      if (!points.has(row.alias)) points.set(row.alias, []);
+      const day = localDay(row.time);
+      // balance <= 0 不是真余额：窗口隐藏时页面渲染不出余额会读到 0，
+      // 把它当真值会让"当日到账"凭空多出上千（实测 edge-p11 一次 0 → 1175 的假到账）。
+      const value: DayValue = {
+        balance: row.balance !== null && row.balance > 0 ? row.balance : null,
+        totalSpent: row.total_spent ?? null,
+      };
       // 同一天多次采集时后写的覆盖先写的（已按时间排序）。
-      perAlias.get(row.alias)!.set(localDay(row.time), { balance: row.balance ?? null, totalSpent: row.total_spent ?? null });
+      perAlias.get(row.alias)!.set(day, value);
+      points.get(row.alias)!.push({ day, ...value });
     }
 
-    const totals = new Map<string, { balanceSum: number; balanceAccounts: number; spentSum: number; spentAccounts: number }>();
-    const entryFor = (day: string) => {
+    /** day → alias → 快照反推的当日到账：到账 = Δ余额 + Δ消耗（余额变化 = 到账 − 消耗）。 */
+    const creditedFromSnapshots = new Map<string, Map<string, number>>();
+    for (const [alias, series] of points) {
+      for (let index = 1; index < series.length; index++) {
+        const previous = series[index - 1];
+        const current = series[index];
+        if (current.balance === null || previous.balance === null) continue;
+        const spentDelta = current.totalSpent !== null && previous.totalSpent !== null
+          ? Math.max(0, current.totalSpent - previous.totalSpent)
+          : 0;
+        const credit = Math.max(0, round2((current.balance - previous.balance) + spentDelta));
+        const byDay = creditedFromSnapshots.get(current.day) ?? new Map<string, number>();
+        byDay.set(alias, credit);
+        creditedFromSnapshots.set(current.day, byDay);
+      }
+    }
+
+    const checkins = db.prepare("SELECT alias, time, balance_before, balance_after FROM checkins").all() as
+      { alias: string; time: string; balance_before: number | null; balance_after: number | null }[];
+    /** day → alias → 签到记录里的余额真实增长，优先于上面的反推值。 */
+    const creditedFromCheckins = new Map<string, Map<string, number>>();
+    for (const row of checkins) {
+      if (row.balance_after === null || row.balance_before === null || row.balance_after <= row.balance_before) continue;
+      const byDay = creditedFromCheckins.get(localDay(row.time)) ?? new Map<string, number>();
+      byDay.set(row.alias, (byDay.get(row.alias) ?? 0) + (row.balance_after - row.balance_before));
+      creditedFromCheckins.set(localDay(row.time), byDay);
+    }
+
+    // 日期全集：有任何观测点或任何签到记录的日子都要出现在表里（哪怕当日没有余额数据）。
+    const daySet = new Set<string>();
+    for (const days of perAlias.values()) for (const day of days.keys()) daySet.add(day);
+    for (const [alias, series] of points) for (const point of series) daySet.add(point.day);
+    for (const row of checkins) daySet.add(localDay(row.time));
+    const days = [...daySet].sort();
+
+    type Entry = { balanceSum: number; balanceAccounts: number; stale: number; spentSum: number; spentAccounts: number };
+    const totals = new Map<string, Entry>();
+    const entryFor = (day: string): Entry => {
       const existing = totals.get(day);
       if (existing) return existing;
-      const created = { balanceSum: 0, balanceAccounts: 0, spentSum: 0, spentAccounts: 0 };
+      const created: Entry = { balanceSum: 0, balanceAccounts: 0, stale: 0, spentSum: 0, spentAccounts: 0 };
       totals.set(day, created);
       return created;
     };
 
-    for (const days of perAlias.values()) {
+    for (const series of points.values()) {
+      // 观测点按本地日压缩：同一天多次采集以最后一次为准。
+      const observations: { day: string; balance: number | null; totalSpent: number | null }[] = [];
+      const index = new Map<string, number>();
+      for (const point of series) {
+        if (point.balance === null && point.totalSpent === null) continue;
+        const existing = index.get(point.day);
+        if (existing === undefined) {
+          index.set(point.day, observations.length);
+          observations.push({ day: point.day, balance: point.balance, totalSpent: point.totalSpent });
+          continue;
+        }
+        const target = observations[existing];
+        if (point.balance !== null) target.balance = point.balance;
+        if (point.totalSpent !== null) target.totalSpent = point.totalSpent;
+      }
+
+      // 消耗：相邻两个观测点的"历史消耗"增量，记在较晚那个观测点所在的日子。
       let previousSpent: number | null = null;
-      for (const [day, value] of [...days.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
-        const entry = entryFor(day);
-        if (value.balance !== null) {
-          entry.balanceSum += value.balance;
-          entry.balanceAccounts += 1;
-        }
-        if (value.totalSpent !== null) {
-          if (previousSpent !== null) {
-            const delta = value.totalSpent - previousSpent;
-            if (delta >= 0) {
-              entry.spentSum += delta;
-              entry.spentAccounts += 1;
-            }
+      for (const observation of observations) {
+        if (observation.totalSpent === null) continue;
+        if (previousSpent !== null) {
+          const delta = observation.totalSpent - previousSpent;
+          if (delta >= 0) {
+            const entry = entryFor(observation.day);
+            entry.spentSum += delta;
+            entry.spentAccounts += 1;
           }
-          previousSpent = value.totalSpent;
         }
+        previousSpent = observation.totalSpent;
+      }
+
+      // 余额：向前填充到该观测点之后的每一天，并注明是否沿用了更早的观测点。
+      let cursor = 0;
+      let carried: number | null = null;
+      for (const day of days) {
+        while (cursor < observations.length && observations[cursor].day <= day) {
+          if (observations[cursor].balance !== null) carried = observations[cursor].balance;
+          cursor += 1;
+        }
+        if (carried === null) continue;
+        const entry = entryFor(day);
+        entry.balanceSum += carried;
+        entry.balanceAccounts += 1;
+        const observedDay = cursor > 0 ? observations[cursor - 1].day : null;
+        if (observedDay !== day) entry.stale += 1;
       }
     }
 
-    const credited = new Map<string, number>();
-    const checkins = db.prepare("SELECT time, balance_before, balance_after FROM checkins").all() as
-      { time: string; balance_before: number | null; balance_after: number | null }[];
-    for (const row of checkins) {
-      if (row.balance_after === null || row.balance_before === null || row.balance_after <= row.balance_before) continue;
-      const day = localDay(row.time);
-      credited.set(day, (credited.get(day) ?? 0) + (row.balance_after - row.balance_before));
-    }
-
-    const days = [...new Set([...totals.keys(), ...credited.keys()])].sort();
     const result = days.map((day) => {
       const entry = totals.get(day);
+      // 到账：先取签到记录的真实增长；同一账号同一天没有增长记录时才用快照反推的数值。
+      const fromCheckins = creditedFromCheckins.get(day) ?? new Map<string, number>();
+      const fromSnapshots = creditedFromSnapshots.get(day) ?? new Map<string, number>();
+      let creditedSum = 0;
+      const aliases = new Set<string>();
+      for (const [alias, value] of fromCheckins) {
+        creditedSum += value;
+        aliases.add(alias);
+      }
+      for (const [alias, value] of fromSnapshots) {
+        if (fromCheckins.has(alias)) continue;   // 签到口径优先，避免重复计数
+        creditedSum += value;
+        if (value > 0) aliases.add(alias);
+      }
       return {
         day,
         balanceSum: entry && entry.balanceAccounts > 0 ? round2(entry.balanceSum) : null,
         balanceAccounts: entry?.balanceAccounts ?? 0,
+        balanceStaleAccounts: entry?.stale ?? 0,
         spentSum: entry && entry.spentAccounts > 0 ? round2(entry.spentSum) : null,
         spentAccounts: entry?.spentAccounts ?? 0,
-        creditedSum: round2(credited.get(day) ?? 0),
+        creditedSum: round2(creditedSum),
+        creditedAccounts: aliases.size,
       };
     });
     const limit = options.days === undefined ? result.length : Math.max(0, Math.floor(options.days));
@@ -542,23 +627,31 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
   }
 }
 
-/** 供报表使用的时间序列：每个账号按时间正序的余额点。 */
+/**
+ * 供报表使用的时间序列：每个账号按时间正序的余额点。
+ *
+ * 同时收录每日快照：只靠签到记录的话，从未跑过 checkin 的账号在趋势图上完全消失，
+ * 而且两次签到之间的余额变化也看不见。
+ */
 export function balanceSeries(
   file: string = DEFAULT_DB_FILE,
 ): { alias: string; points: { time: string; balance: number }[] }[] {
   const db = openDatabase(file);
   try {
     const rows = db.prepare(`
-      SELECT alias, time, balance_after
-      FROM checkins
-      WHERE balance_after IS NOT NULL
-      ORDER BY alias, time, id
+      SELECT alias, time, balance FROM (
+        SELECT alias, time, balance_after AS balance FROM checkins
+        WHERE balance_after IS NOT NULL AND balance_after > 0
+        UNION ALL
+        SELECT alias, time, balance FROM balance_snapshots
+        WHERE ok = 1 AND balance IS NOT NULL AND balance > 0
+      ) ORDER BY alias, time
     `).all() as Record<string, unknown>[];
     const byAlias = new Map<string, { time: string; balance: number }[]>();
     for (const row of rows) {
       const alias = row.alias as string;
       if (!byAlias.has(alias)) byAlias.set(alias, []);
-      byAlias.get(alias)!.push({ time: row.time as string, balance: row.balance_after as number });
+      byAlias.get(alias)!.push({ time: row.time as string, balance: row.balance as number });
     }
     return [...byAlias.entries()].map(([alias, points]) => ({ alias, points }));
   } finally {

@@ -1,7 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { isEdge, listBrowsers, protocolSupported, readStore, withStoreLock, ZenxError } from "./core.ts";
 import type { Runner } from "./core.ts";
-import { DEFAULT_DB_FILE, hasCreditedBetween, lastBalanceBefore } from "./db.ts";
+import { DEFAULT_DB_FILE, hasCreditedBetween, insertCheckin, lastBalanceBefore } from "./db.ts";
 import { readConsoleState } from "./console.ts";
 import { findAccount } from "./launch.ts";
 
@@ -14,6 +14,13 @@ export type RecheckDependencies = {
   sleep?: (ms: number) => Promise<void>;
   /** 签到账本；默认项目根 zenxbrowser/checkin.db。 */
   dbFile?: string;
+  /**
+   * 确认到账但账本今天没有记录时，是否补记一条到账记录。默认 true。
+   * 存在的理由：额度不一定由 checkin 发放（例如 `zenx accounts login` 恢复登录态也会发放），
+   * 那种情况下钱是真领到了，账本却只有一条失败记录，报表会把它当成"没签到"。
+   * 记账本不影响站点状态，也不消耗登录配额。
+   */
+  record?: boolean;
 };
 
 export type RecheckResult = {
@@ -36,6 +43,8 @@ export type RecheckResult = {
   verdict: "credited" | "not_credited" | "logged_out" | "manual_intervention" | "identity_mismatch" | "unknown";
   pageFeature?: string;
   note?: string;
+  /** 本次是否为到账补记了一条签到记录（钱到了但账本原本没记录时才会发生）。 */
+  recorded?: boolean;
 };
 
 /** 本地"今天"对应的 UTC 区间 [start, end)；按本地日界切，避免 UTC 日界把早上算到前一天。 */
@@ -55,6 +64,39 @@ function deadlineBudget(timeoutMs: number, now: () => number): () => number {
     if (budget < 1) throw new ZenxError("RECHECK_TIMEOUT", "复查总预算已耗尽；停止，不重试。");
     return budget;
   };
+}
+
+/**
+ * 补记账本：确认到账、但今天还没有到账记录时补一条 credited 记录。
+ *
+ * 只为"钱已经领到、只是没走 checkin 路径"纠偏（例如用 `zenx accounts login` 恢复登录态
+ * 触发发放）。写失败不影响复查结论——账本只是 Remembering，不是判定依据。
+ */
+function recordMissingCredit(
+  account: { alias: string; instanceId: string; expectedIdentity: string },
+  balance: number | null,
+  baselineBalance: number | null,
+  creditedToday: boolean,
+  dependencies: RecheckDependencies,
+  now: number,
+): boolean {
+  if (dependencies.record === false || creditedToday) return false;
+  try {
+    insertCheckin({
+      time: new Date(now).toISOString(),
+      alias: account.alias,
+      instanceId: account.instanceId,
+      identity: account.expectedIdentity,
+      ok: true,
+      balanceBefore: baselineBalance,
+      balanceAfter: balance,
+      credited: true,
+      errorCode: null,
+    }, dependencies.dbFile ?? DEFAULT_DB_FILE);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -149,6 +191,7 @@ export async function recheckAccount(
         ...base, ok: true, connection, login: "logged_in", identityMatch: true,
         balance, siteCheckedIn, creditedToday, baselineBalance, balanceDelta,
         verdict: "credited", note: `已确认今日到账（依据：${source}）。`,
+        recorded: recordMissingCredit(account, balance, baselineBalance, creditedToday, dependencies, now()),
       };
     }
     return {

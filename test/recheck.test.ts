@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main } from "../src/cli.ts";
-import { insertCheckin } from "../src/db.ts";
+import { insertCheckin, listCheckins } from "../src/db.ts";
 import { recheckAccount } from "../src/recheck.ts";
 import type { Browser, Runner } from "../src/core.ts";
 
@@ -102,6 +102,39 @@ test("余额相对基线增长达到每日额度即判为已到账（补登录�
   assert.equal(result.baselineBalance, 1000);
   assert.equal(result.balanceDelta, 25);
   assert.equal(result.creditedToday, false);
+});
+
+// 额度未必由 checkin 发放（login 恢复登录态也会发放）。钱领到了就不该因为记录路径
+// 不同而从账本里消失，否则报表会把它当"没签到"——这正是"统计与实际不符"的一大来源。
+test("确认到账但账本今天没有记录时补记一条到账记录", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  record(dbFile, { time: new Date(Date.now() - 86_400_000).toISOString(), balanceAfter: 1000, credited: false });
+  const result = await recheckAccount(home, runner({ text: "控制台 当前余额 $1025.00 G github_16350 chevron_down" }), account.alias, 45_000, { dbFile, ...fast });
+  assert.equal(result.verdict, "credited");
+  assert.equal(result.recorded, true);
+  const rows = listCheckins({ alias: account.alias }, dbFile);
+  const today = rows.find((row) => row.credited && row.balanceAfter === 1025);
+  assert.ok(today, "今天应出现一条 credited 记录");
+  assert.equal(today?.balanceBefore, 1000);
+  assert.equal(today?.ok, true);
+});
+
+test("--record no 时不写账本", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  record(dbFile, { time: new Date(Date.now() - 86_400_000).toISOString(), balanceAfter: 1000, credited: false });
+  const result = await recheckAccount(home, runner({ text: "控制台 当前余额 $1025.00 G github_16350 chevron_down" }), account.alias, 45_000, { dbFile, record: false, ...fast });
+  assert.equal(result.verdict, "credited");
+  assert.equal(result.recorded, false);
+  assert.equal(listCheckins({ alias: account.alias }, dbFile).length, 1, "只留原来那条");
+});
+
+test("账本今天已有到账记录时不重复补记", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  record(dbFile, { balanceBefore: 100, balanceAfter: 125, credited: true });
+  const result = await recheckAccount(home, runner({ text: LOGGED_IN }), account.alias, 45_000, { dbFile, ...fast });
+  assert.equal(result.verdict, "credited");
+  assert.equal(result.recorded, false);
+  assert.equal(listCheckins({ alias: account.alias }, dbFile).length, 1);
 });
 
 test("已登录但无任何到账证据时判为未到账", async (t) => {

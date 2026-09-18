@@ -8,6 +8,8 @@ import {
   balanceSeries,
   DEFAULT_DB_FILE,
   insertCheckin,
+  insertSnapshot,
+  lastBalanceBefore,
   listCheckins,
   summarizeAccounts,
 } from "../src/db.ts";
@@ -132,6 +134,48 @@ test("db 汇总：多账号各自独立统计", (t) => {
   assert.equal(summaries.length, 2);
   assert.deepEqual(summaries.map((s) => s.alias).sort(), ["edge-1", "edge-2"]);
   assert.ok(summaries.every((s) => s.totalGained === 25));
+});
+
+// 新账号往往只采集过快照（还没跑过 checkin），不能因为没签到记录就从汇总里消失——
+// 报表里的"账号数"曾经因此停在过去的某个阶段。
+test("db 汇总：只有快照没有签到记录的账号也计入，余额取快照", (t) => {
+  const file = tempDb(t);
+  insertSnapshot({ time: "2026-09-18T02:00:00.000Z", alias: "fresh", instanceId: "i", identity: "github_9", balance: 1187.41, totalSpent: 1412.59, ok: true, errorCode: null }, file);
+  const [summary] = summarizeAccounts(file);
+  assert.equal(summary.alias, "fresh");
+  assert.equal(summary.identity, "github_9");
+  assert.equal(summary.total, 0, "没有签到记录，次数为 0");
+  assert.equal(summary.currentBalance, 1187.41);
+  assert.equal(summary.balanceSource, "snapshot");
+  assert.equal(summary.lastOk, null);
+  assert.equal(summary.snapshots, 1);
+});
+
+test("db 汇总：余额取跨两张表的最近观测点", (t) => {
+  const file = tempDb(t);
+  insertCheckin(record({ alias: "mix", balanceBefore: 100, balanceAfter: 125, time: "2026-09-18T02:00:00.000Z" }), file);
+  insertSnapshot({ time: "2026-09-18T09:00:00.000Z", alias: "mix", instanceId: "i", identity: "id", balance: 200, totalSpent: 0, ok: true, errorCode: null }, file);
+  const [summary] = summarizeAccounts(file);
+  assert.equal(summary.currentBalance, 200, "快照晚于签到，应以快照为准");
+  assert.equal(summary.balanceSource, "snapshot");
+  assert.equal(summary.balanceTime, "2026-09-18T09:00:00.000Z");
+  assert.equal(summary.totalGained, 25);
+});
+
+test("db 汇总：失败的签到不再把余额覆盖成未知", (t) => {
+  const file = tempDb(t);
+  insertCheckin(record({ alias: "mix", balanceBefore: 100, balanceAfter: 125, time: "2026-09-18T02:00:00.000Z" }), file);
+  insertCheckin(record({ alias: "mix", ok: false, credited: false, balanceBefore: null, balanceAfter: null, errorCode: "LOGIN_TIMEOUT", time: "2026-09-18T05:00:00.000Z" }), file);
+  const [summary] = summarizeAccounts(file);
+  assert.equal(summary.currentBalance, 125);
+  assert.equal(summary.lastOk, false);
+});
+
+test("db 基准余额：没有签到记录时也能用快照建立发放前基准", (t) => {
+  const file = tempDb(t);
+  insertSnapshot({ time: "2026-09-18T02:00:00.000Z", alias: "fresh", instanceId: "i", identity: "id", balance: 900, totalSpent: 0, ok: true, errorCode: null }, file);
+  assert.equal(lastBalanceBefore("fresh", "2026-09-19T00:00:00.000Z", file), 900);
+  assert.equal(lastBalanceBefore("fresh", "2026-09-18T00:00:00.000Z", file), null);
 });
 
 test("db 空库时汇总与列表返回空数组，不报错", (t) => {

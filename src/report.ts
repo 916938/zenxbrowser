@@ -1,10 +1,13 @@
 import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
+import { readStore } from "./core.ts";
 import { balanceSeries, dailyTotals, listCheckins, rangeSummary, summarizeAccounts } from "./db.ts";
 
 export type ReportOptions = {
   port?: number;
   dbFile?: string;
+  /** 账号目录；用于把"已绑定账号"与"账本里有记录的账号"对照。 */
+  home?: string;
   /** 端口被占用等启动失败时的回调（CLI 用于输出错误）。 */
   onError?: (error: NodeJS.ErrnoException) => void;
   onStart?: (url: string) => void;
@@ -79,46 +82,78 @@ const local = t => t ? new Date(t).toLocaleString("zh-CN", { hour12:false }) : '
 const gain = v => v ? '<span class="gain">+$' + Number(v).toFixed(2) + '</span>' : '<span class="muted">$0.00</span>';
 const spentCell = v => (v === null || v === undefined)
   ? '<span class="muted">—</span>' : '<span class="bad">-$' + Number(v).toFixed(2) + '</span>';
+// 余额是"某个时刻的读数"而不是实时数：把它观测于哪天标出来，避免把上周的数字当今天。
+const observedAt = t => {
+  if (!t) return '<span class="muted">—</span>';
+  const d = new Date(t);
+  const today = new Date().toDateString() === d.toDateString();
+  const label = d.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" })
+    + " " + d.toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit" });
+  return today ? '<span class="ok">' + label + '</span>' : '<span class="muted">' + label + '</span>';
+};
 const netCell = v => (v === null || v === undefined) ? '<span class="muted">—</span>'
   : v >= 0 ? '<span class="gain">+$' + v.toFixed(2) + '</span>'
            : '<span class="bad">-$' + Math.abs(v).toFixed(2) + '</span>';
 
 async function load() {
-  const [sum, rows, series, ranges, daily] = await Promise.all([
+  const [sum, rows, series, ranges, daily, bound] = await Promise.all([
     fetch("/api/summary").then(r => r.json()),
     fetch("/api/checkins?limit=500").then(r => r.json()),
     fetch("/api/series").then(r => r.json()),
     fetch("/api/ranges").then(r => r.json()),
     fetch("/api/daily").then(r => r.json()),
+    fetch("/api/accounts").then(r => r.json()).catch(() => ({ ok: false, accounts: [] })),
   ]);
 
   const accounts = sum.length;
+  const boundCount = bound.accounts ? bound.accounts.length : 0;
+  const missing = bound.accounts
+    ? bound.accounts.filter(a => !sum.some(s => s.alias === a.alias)).map(a => a.alias)
+    : [];
   const totalRuns = sum.reduce((a, s) => a + s.total, 0);
   const totalCredited = sum.reduce((a, s) => a + s.credited, 0);
   const totalGain = sum.reduce((a, s) => a + s.totalGained, 0);
   document.getElementById("meta").textContent =
-    accounts ? accounts + " 个账号 · 共 " + totalRuns + " 次打卡 · 数据为 UTC，显示已转本地时间"
-             : "暂无数据";
+    (accounts ? accounts + " 个账号有数据 · 共 " + totalRuns + " 次打卡 · " : "暂无数据 · ")
+    + "数据为 UTC，显示已转本地时间";
+  if (bound.ok && missing.length) {
+    document.getElementById("meta").innerHTML +=
+      ' · <span class="bad">' + missing.length + ' 个已绑定账号暂无观测点：' + esc(missing.join("、")) + '</span>';
+  }
   const latestDay = daily.length ? daily[daily.length - 1] : null;
   const totalBalance = latestDay && latestDay.balanceSum !== null ? latestDay.balanceSum : null;
+  const balanceNote = latestDay
+    ? '<div class="k">' + (latestDay.balanceAccounts || 0) + " 个账号合计"
+      + (latestDay.balanceStaleAccounts ? " · " + latestDay.balanceStaleAccounts + " 个沿用更早观测点" : "") + '</div>'
+    : "";
   document.getElementById("cards").innerHTML = [
-    ["账号数", accounts], ["打卡次数", totalRuns],
+    ["账号数", boundCount
+      ? '<span title="账本有数据 / 已绑定">' + accounts + ' / ' + boundCount + '</span>'
+      : String(accounts)],
+    ["打卡次数", totalRuns],
     ["成功到账", totalCredited], ["累计获得", "$" + totalGain.toFixed(2)],
-    ["余额总额", totalBalance === null ? '<span class="muted">—</span>' : "$" + totalBalance.toFixed(2)],
+    ["余额总额", totalBalance === null ? '<span class="muted">—</span>' : "$" + totalBalance.toFixed(2) + balanceNote],
     ["最近一日消耗", spentCell(latestDay ? latestDay.spentSum : null)],
   ].map(([k, v]) => '<div class="card"><div class="k">' + k + '</div><div class="v">' + v + '</div></div>').join("");
 
-  document.getElementById("summary").innerHTML = accounts ? table([
-    ["账号","身份","当前余额","累计到账","打卡次数","成功","成功率","最近打卡","最近结果"],
+  const notObserved = bound.accounts
+    ? bound.accounts.filter(a => !sum.some(s => s.alias === a.alias))
+        .map(a => ["<b>" + esc(a.alias) + "</b>", esc(a.identity), '<span class="muted">从未采集</span>',
+                   '<span class="muted">—</span>', '<span class="muted">$0.00</span>',
+                   0, 0, "—", "—", '<span class="muted">先跑一次 snapshot / checkin</span>'])
+    : [];
+  document.getElementById("summary").innerHTML = (accounts || notObserved.length) ? table([
+    ["账号","身份","当前余额","余额观测","累计到账","打卡次数","成功","成功率","最近打卡","最近结果"],
     ...sum.map(s => [
-      "<b>" + esc(s.alias) + "</b>", esc(s.identity), money(s.currentBalance),
+      "<b>" + esc(s.alias) + "</b>", esc(s.identity), money(s.currentBalance), observedAt(s.balanceTime),
       s.totalGained ? '<span class="gain">+$' + s.totalGained.toFixed(2) + '</span>' : '<span class="muted">$0.00</span>',
       s.total, s.credited, (s.total ? Math.round(s.credited / s.total * 100) : 0) + "%",
       local(s.lastTime),
       s.lastOk === null ? "—" : s.lastOk
         ? '<span class="ok">成功</span>'
         : '<span class="bad">失败 ' + esc(s.lastErrorCode || "") + '</span>',
-    ])
+    ]),
+    ...notObserved,
   ]) : '<div class="empty">还没有签到记录，先运行一次 <code>zenx accounts checkin</code> 吧。</div>';
 
   document.getElementById("daily").innerHTML = drawDaily(daily);
@@ -280,7 +315,24 @@ export function rangeReport(dbFile?: string): { week: RangeComparison; month: Ra
   };
 }
 
-function handle(req: IncomingMessage, res: ServerResponse, dbFile?: string): void {
+/**
+ * 配置里已绑定的账号。报表用它来回答"账号数到底应该是多少"——账本只有观测点才产生
+ * 记录，新绑的账号如果跑之前没签到也没快照，就不会出现在账本里，但它是真实存在的账号。
+ */
+async function boundAccounts(home?: string): Promise<{ ok: boolean; accounts: { alias: string; identity: string }[] }> {
+  if (!home) return { ok: false, accounts: [] };
+  try {
+    const store = await readStore(home);
+    return {
+      ok: true,
+      accounts: store.accounts.map((account) => ({ alias: account.alias, identity: account.expectedIdentity })),
+    };
+  } catch {
+    return { ok: false, accounts: [] };
+  }
+}
+
+function handle(req: IncomingMessage, res: ServerResponse, dbFile?: string, home?: string): void {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   try {
     if (url.pathname === "/") {
@@ -289,6 +341,10 @@ function handle(req: IncomingMessage, res: ServerResponse, dbFile?: string): voi
       return;
     }
     if (url.pathname === "/api/summary") return json(res, 200, summarizeAccounts(dbFile));
+    if (url.pathname === "/api/accounts") {
+      boundAccounts(home).then((value) => json(res, 200, value), (error: unknown) => json(res, 500, { error: String(error) }));
+      return;
+    }
     if (url.pathname === "/api/ranges") return json(res, 200, rangeReport(dbFile));
     if (url.pathname === "/api/daily") return json(res, 200, dailyTotals({}, dbFile));
     if (url.pathname === "/api/series") return json(res, 200, balanceSeries(dbFile));
@@ -306,7 +362,7 @@ function handle(req: IncomingMessage, res: ServerResponse, dbFile?: string): voi
 /** 启动报表服务器。返回 server 实例，便于调用方关闭。 */
 export function startReportServer(options: ReportOptions = {}): Promise<Server> {
   const port = options.port ?? 8787;
-  const server = createServer((req, res) => handle(req, res, options.dbFile));
+  const server = createServer((req, res) => handle(req, res, options.dbFile, options.home));
   return new Promise((resolve, reject) => {
     server.once("error", (error: NodeJS.ErrnoException) => {
       options.onError?.(error);

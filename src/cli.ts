@@ -38,7 +38,7 @@ const help = `ZenX Browser — Windows Edge 多账号连接台
   zenx accounts login <别名> [--timeout 3m]
   zenx accounts checkin <别名> [--timeout 3m] [--force]
   zenx accounts checkin-all [--timeout 3m] [--wait 15m] [--retries 1] [--close-after] [--retry-codes CODES]
-  zenx accounts recheck <别名> [--timeout 45s]
+  zenx accounts recheck <别名> [--timeout 45s] [--record yes|no]
   zenx accounts snapshot <别名> [--timeout 45s]
   zenx accounts snapshot --all [--timeout 45s]
   zenx report [--port 8787] [--open]
@@ -76,6 +76,9 @@ snapshot 采集一次"当前余额 + 站点累计消耗"写入账本（只读：
   --all 依次采集全部已绑定账号，单个失败不中断；失败也留一条（ok=false + 错误码）。
 recheck 只读复查某账号"今日签到额度是否已到账"：开隔离窗口读一次控制台，结合账本给出结论；
   不退出、不重新登录、不消耗站点登录配额，可在签到失败或未确认后反复使用。
+  确认到账但账本今天没有记录时，默认补记一条到账记录（--record no 可关闭）：
+  额度未必由 checkin 发放（zenx accounts login 恢复登录态也会发放），钱领到了就不该
+  因为记录路径不同而从账本与报表里消失。
   退出码 0=已确认到账，1=未到账或异常；离线/非 Edge/协议不兼容只报告，不启动 Edge（先 ensure-online）；
   遇 GitHub 授权/验证页或登录身份不符时停止判断，不给出额度结论。
 --tab-id 仅供 open-site / inspect-site 使用，限 1–2147483647 的十进制整数。
@@ -139,6 +142,15 @@ function parseRetries(value?: string): number {
   return Number(value);
 }
 
+/** recheck 是否补记账本：`--record yes`（默认）/ `--record no`。 */
+function parseRecordFlag(value?: string): boolean {
+  if (value === undefined) return true;
+  const normalized = value.trim().toLowerCase();
+  if (["yes", "y", "true", "on", "1"].includes(normalized)) return true;
+  if (["no", "n", "false", "off", "0", "skip"].includes(normalized)) return false;
+  throw new ZenxError("INVALID_ARGUMENT", "--record 只接受 yes / no。");
+}
+
 function parseRetryCodes(value?: string): string[] | undefined {
   if (value === undefined) return undefined;
   const codes = value.split(",").map((item) => item.trim().toUpperCase()).filter((item) => item.length > 0);
@@ -172,6 +184,7 @@ async function runReport(
     server = await startReportServer({
       port,
       dbFile: dependencies.reportDbFile,
+      home: resolveHome(values.home, dependencies.home),
       onStart: (url) => output(`报表已启动：${url}（Ctrl+C 停止）`),
     });
   } catch (error) {
@@ -227,6 +240,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
         retries: { type: "string" },
         "retry-codes": { type: "string" },
         "close-after": { type: "boolean" },
+        record: { type: "string" },
         all: { type: "boolean" },
         "tab-id": { type: "string" },
         port: { type: "string" },
@@ -259,6 +273,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     if (binding) for (const key of ["instance-id", "expected-identity", "confirm"]) allowed.add(key);
     if (configuring) for (const key of ["edge-path", "user-data-dir", "profile-directory", "confirm"]) allowed.add(key);
     if (ensuring || opening || inspecting || relinking || closing || rechecking || snapshotting) allowed.add("timeout");
+    if (rechecking) allowed.add("record");
     if (snapshotting) allowed.add("all");
     if (loggingIn) allowed.add("timeout");
     if (checkingInAll) for (const key of ["timeout", "wait", "retries", "retry-codes", "close-after"]) allowed.add(key);
@@ -329,6 +344,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     } else if (rechecking && alias && positionals.length === 3) {
       report = await recheckAccount(home, run, alias, parseTimeout(values.timeout), {
         dbFile: dependencies.recheckDbFile,
+        record: parseRecordFlag(values.record),
       });
     } else if (snapshotting && values.all === true && positionals.length === 2) {
       report = await snapshotAll(home, run, parseTimeout(values.timeout), {

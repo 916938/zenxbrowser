@@ -156,22 +156,74 @@ test("每日总额：余额合计、消耗合计、到账合计与覆盖账号�
   insertSnapshot(snap(yesterday, "work", 100, 50), dbFile);
   insertSnapshot(snap(today, "work", 125, 70), dbFile);
   insertSnapshot(snap(yesterday, "second", 200, 10), dbFile);
-  insertSnapshot(snap(today, "second", 200, 30), dbFile);
+  insertSnapshot(snap(today, "second", 225, 30), dbFile);
   insertCheckin({ time: today, alias: "work", instanceId: "inst", identity: "id", ok: true, balanceBefore: 100, balanceAfter: 125, credited: true, errorCode: null }, dbFile);
+  insertCheckin({ time: today, alias: "second", instanceId: "inst", identity: "id", ok: true, balanceBefore: 200, balanceAfter: 225, credited: true, errorCode: null }, dbFile);
 
   const rows = dailyTotals({}, dbFile);
   assert.equal(rows.length, 2);
   const last = rows[rows.length - 1];
   const first = rows[rows.length - 2];
-  assert.equal(last.balanceSum, 325);
+  assert.equal(last.balanceSum, 350);
   assert.equal(last.balanceAccounts, 2);
+  assert.equal(last.balanceStaleAccounts, 0, "当天都有观测点");
   assert.equal(last.spentSum, 40);           // (70-50) + (30-10)
   assert.equal(last.spentAccounts, 2);
-  assert.equal(last.creditedSum, 25);
+  assert.equal(last.creditedSum, 50, "到账优先取签到记录里的余额真实增长");
+  assert.equal(last.creditedAccounts, 2);
   assert.equal(first.balanceSum, 300);
   assert.equal(first.spentSum, null);        // 没有更早的观测点，不臆造消耗
   assert.equal(first.spentAccounts, 0);
   assert.equal(dailyTotals({ days: 1 }, dbFile).length, 1);
+});
+
+// 昨天 5 个账号的真实场景：checkin 记录是 LOGIN_TIMEOUT（失败、余额为 NULL），
+// 但额度后来靠 zenx accounts login 登录发放并体现在快照里。账本不能因为它们
+// 没有走 checkin 路径就把领到的钱抹掉，所以用快照反推到账（到账 = Δ余额 + Δ消耗）。
+test("每日总额：签到记录失败但快照显示已发放时，按快照反推到账，不重复计数", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  const { insertSnapshot } = await import("../src/db.ts");
+  const day = 86_400_000;
+  const yesterday = new Date(Date.now() - day).toISOString();
+  const today = new Date().toISOString();
+  const snap = (time: string, alias: string, balance: number, spent: number) => ({
+    time, alias, instanceId: "inst", identity: "id", balance, totalSpent: spent, ok: true, errorCode: null,
+  });
+  insertSnapshot(snap(yesterday, "recovered", 1000, 100), dbFile);
+  insertSnapshot(snap(today, "recovered", 1025, 110), dbFile);       // Δ余额 25 + Δ消耗 10 = 到账 35
+  insertSnapshot(snap(today, "plain", 500, 20), dbFile);
+  insertSnapshot(snap(yesterday, "plain", 500, 20), dbFile);
+  insertCheckin({ time: today, alias: "recovered", instanceId: "inst", identity: "id", ok: false, balanceBefore: null, balanceAfter: null, credited: false, errorCode: "LOGIN_TIMEOUT" }, dbFile);
+  insertCheckin({ time: today, alias: "plain", instanceId: "inst", identity: "id", ok: true, balanceBefore: 500, balanceAfter: 525, credited: true, errorCode: null }, dbFile);
+
+  const [row] = dailyTotals({ days: 1 }, dbFile);
+  assert.equal(row.creditedSum, 60, "recovered 用快照反推（35），plain 用签到记录（25）");
+  assert.equal(row.creditedAccounts, 2);
+  assert.equal(row.balanceSum, 1525);
+  assert.equal(row.balanceAccounts, 2);
+  assert.equal(row.balanceStaleAccounts, 0);
+});
+
+// 窗口隐藏时页面渲染不出余额，站点会显示 0（实测）。把它当真值会让"当日到账"
+// 凭空多出一千多（0 → 1175 被算成到账）。
+test("每日总额：余额读到 0 视为缺失，不制造假到账", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  const { insertSnapshot } = await import("../src/db.ts");
+  const day = 86_400_000;
+  const earlier = new Date(Date.now() - 2 * day).toISOString();
+  const yesterday = new Date(Date.now() - day).toISOString();
+  const today = new Date().toISOString();
+  const snap = (time: string, balance: number) => ({
+    time, alias: account.alias, instanceId: "inst", identity: "id", balance, totalSpent: 0, ok: true, errorCode: null,
+  });
+  insertSnapshot(snap(earlier, 1175), dbFile);
+  insertSnapshot(snap(yesterday, 0), dbFile);      // 页面没渲染出来
+  insertSnapshot(snap(today, 1175), dbFile);
+  const rows = dailyTotals({}, dbFile);
+  const last = rows[rows.length - 1];
+  assert.equal(last.creditedSum, 0, "0 不能当成真余额");
+  assert.equal(last.balanceSum, 1175);
+  assert.equal(last.balanceAccounts, 1);
 });
 
 test("每日总额：同一天多次采集以最后一次为准", async (t) => {
