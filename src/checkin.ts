@@ -568,7 +568,12 @@ async function runCheckinSteps(
     let page = await observeSettled();
     if (!hasAnnouncement(page)) return page;
     for (let attempt = 1; attempt <= 2; attempt++) {
-      const closeRef = findRefByLabel(page, "关闭公告") ?? findRefByLabel(page, "今日关闭");
+      // 按钮文案随界面语言变化，先中文后英文（站点两套文案都实测出现过）。
+      const closeRef =
+        findRefByLabel(page, "关闭公告") ??
+        findRefByLabel(page, "今日关闭") ??
+        findRefByLabel(page, "Close Notice") ??
+        findRefByLabel(page, "Close Today");
       if (!closeRef) throw new ZenxError("ANNOUNCEMENT_CLOSE_FAILED", "公告弹窗存在但未找到关闭按钮 ref；停止，不重试。");
       await click(page, closeRef);
       await sleep(ANNOUNCEMENT_EXIT_SETTLE_MS);
@@ -694,7 +699,8 @@ async function runCheckinSteps(
   let logoutRef: string | undefined;
   while (true) {
     page = await observePage(run, sessionId, remaining);
-    logoutRef = findRefByLabel(page, "exit 退出");
+    // 退出项的可访问名是「图标名 + 文案」，中文界面 "exit 退出"、英文界面 "exit Quit"。
+    logoutRef = findRefByLabel(page, "exit 退出") ?? findRefByLabel(page, "exit Quit");
     if (logoutRef || now() >= menuDeadline) break;
     await sleep(MENU_OPEN_POLL_INTERVAL_MS);
   }
@@ -716,7 +722,12 @@ async function runCheckinSteps(
   // ⑦ 重新登录：GitHub OAuth 轮询。落地页不定（首页/控制台），公告可能重现；
   // 登录成功的标志是用户菜单按钮（G <身份> chevron）出现——余额已不在落地页，
   // 到账核对统一放在 ⑧ 的控制台余额对比。
-  const githubRef = findRefByLabel(page, "github_logo 使用 GitHub 继续");
+  // 登录按钮同理分中英文。findRefByLabel 按可访问名前缀匹配，而可访问名带图标名
+  //（"github_logo …"），所以英文要把图标名一起带上；末项是图标名缺失时的兜底。
+  const githubRef =
+    findRefByLabel(page, "github_logo 使用 GitHub 继续") ??
+    findRefByLabel(page, "github_logo Continue with GitHub") ??
+    findRefByLabel(page, "Continue with GitHub");
   if (!githubRef) throw new ZenxError("LOGIN_TIMEOUT", "登录页未找到 GitHub 登录按钮 ref；停止，不重试。", { alias: account.alias });
   await startGitHubLogin(page, githubRef);
 

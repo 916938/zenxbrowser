@@ -219,6 +219,7 @@ node src/cli.ts accounts recheck edge-1   # 用余额增量确认今天到账没
 | 账号一直 `offline`，`ensure-online` 也拉不回 | Edge 重启后扩展实例 ID 变了。用 `zenx accounts relink-account <别名> --confirm`（按账号锚点定位，不受 Profile 改名影响；本机多个 Profile 被改名过，Default 显示为 `3`、Profile 3 显示为 `916938 13`）。 |
 | `accounts.json` 损坏导致所有命令报 `INVALID_STORE` | `readStore` 要求 alias 与 instanceId 均唯一，重复就全挂。手工编辑后务必 `zenx accounts check` 验证。 |
 | 关闭浏览器后某账号第二天签到 `IDENTITY_MISMATCH` | 该账号的站点会话没持久化（实测 `edge-p3` 会这样，其它账号不会）。收尾前确认它是登录态，或次日补一次登录。 |
+| 账号明明是登录态，`checkin` 却依次报 `IDENTITY_MISMATCH` → `LOGOUT_FAILED` → `LOGIN_TIMEOUT` | 该号的站点界面是**英文版**，文案与中文完全不同：公告 `System Notice` / `Close Notice`、退出项 `exit Quit`、登录按钮 `Continue with GitHub`。英文公告会盖住控制台正文（身份与余额都读不到），于是第一步就误判成身份不符。代码已双语支持（2026-09-19）；遇到新文案先用 `accounts inspect-site <别名>` 看页面实际文本。 |
 
 ---
 

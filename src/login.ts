@@ -10,11 +10,14 @@ const PAGE_SETTLE_MS = 2_000;
 const LOGIN_POLL_INTERVAL_MS = 3_000;
 const LOGIN_POLL_BUDGET_MS = 120_000;
 const TEXT_MAX_LENGTH = 20_000;
-/** 登录按钮的可访问名（VOM 行形如 `@e12 button "github_logo 使用 GitHub 继续"`）。 */
-const GITHUB_LOGIN_LABEL = "github_logo 使用 GitHub 继续";
+/**
+ * 登录按钮文案：界面语言因账号而异，中文 "使用 GitHub 继续"、英文 "Continue with GitHub"。
+ * 匹配按序尝试——DOM 直调走子串命中，两套文案都能命中各自的元素。
+ */
+const GITHUB_LOGIN_LABELS = ["使用 GitHub 继续", "Continue with GitHub"];
 // GitHub 授权页与登录限流的文案特征改由站点适配器统一提供（src/sites/agentrouter.ts）。
 /** 站点登录页特征，用于确认"确实已登出"而不是别的异常页面。 */
-const LOGGED_OUT_PATTERNS = ["使用 GitHub 继续", "使用 LinuxDO 继续", "登 录", "登录"];
+const LOGGED_OUT_PATTERNS = ["使用 GitHub 继续", "使用 LinuxDO 继续", "登 录", "登录", "Continue with GitHub"];
 
 export type LoginDependencies = {
   now?: () => number;
@@ -64,7 +67,7 @@ function detectManualIntervention(text: string): string | null {
  * 页面会停在登录页永不跳转。
  */
 function domLoginClickExpression(label: string): string {
-  const target = JSON.stringify("使用 GitHub 继续");
+  const target = JSON.stringify(label);
   return `/* zenx-login:click */ (() => {
   const want = ${target};
   window.__zenxOpened = [];
@@ -211,13 +214,17 @@ export async function loginAccount(
         remaining();
         if (click.exitCode !== 0) throw new ZenxError("SESSION_CLICK_FAILED", `点击登录按钮失败（退出码 ${click.exitCode}）；停止，不重试。`);
       } else {
-        const dispatch = await call(["evaluate", domLoginClickExpression(GITHUB_LOGIN_LABEL), "--json"]);
-        remaining();
         let clicked = false;
-        try {
-          const value: unknown = JSON.parse(dispatch.stdout);
-          clicked = object(value) && value.ok === true && object(value.value) && value.value.clicked === true;
-        } catch { clicked = false; }
+        // 中英文两套文案依次尝试：DOM 直调按子串命中，先中文后英文。
+        for (const label of GITHUB_LOGIN_LABELS) {
+          const dispatch = await call(["evaluate", domLoginClickExpression(label), "--json"]);
+          remaining();
+          try {
+            const value: unknown = JSON.parse(dispatch.stdout);
+            clicked = object(value) && value.ok === true && object(value.value) && value.value.clicked === true;
+          } catch { clicked = false; }
+          if (clicked) break;
+        }
         if (!clicked) throw new ZenxError("LOGIN_BUTTON_NOT_FOUND", "未能在页面中找到 GitHub 登录按钮；停止，不点击。");
         await sleep(LOGIN_POLL_INTERVAL_MS);
         remaining();

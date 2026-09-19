@@ -55,11 +55,19 @@ test("loggedOut 需要两个特征同时成立", () => {
   assert.equal(agentRouter.classify.loggedOut("登 录 使用 GitHub 继续"), true);
   assert.equal(agentRouter.classify.loggedOut("登 录"), false);
   assert.equal(agentRouter.classify.loggedOut(CN), false);
+  // 英文界面的登录页没有"登 录 / 使用 GitHub 继续"，只有 Continue with GitHub。
+  assert.equal(agentRouter.classify.loggedOut("Continue with GitHub"), true);
 });
 
 test("hasAnnouncement 需要公告与关闭动作同时出现", () => {
   assert.equal(agentRouter.classify.hasAnnouncement("系统公告 今日关闭"), true);
   assert.equal(agentRouter.classify.hasAnnouncement("系统公告"), false);
+});
+
+test("hasAnnouncement 认英文公告：漏判会让弹窗遮住身份与余额", () => {
+  assert.equal(agentRouter.classify.hasAnnouncement('dialog "System Notice" button "Close Today"'), true);
+  assert.equal(agentRouter.classify.hasAnnouncement('dialog "System Notice" button "Close Notice"'), true);
+  assert.equal(agentRouter.classify.hasAnnouncement("System Notice"), false, "只有公告没有关闭动作不算");
 });
 
 test("适配器元数据可用于域名路由", () => {

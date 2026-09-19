@@ -41,6 +41,37 @@ const observeMenuOpen = vom([
   '    @e11 button "G github_16350 chevron_down [expanded]"',
   '    @e110 menuitem "exit 退出"',
 ].join("\n"));
+// 界面语言因账号而异：同一套流程在英文界面下的文案完全不同（公告 System Notice /
+// 退出项 exit Quit / 登录按钮 Continue with GitHub / 余额 Current balance）。
+// 只认中文会让这些账号卡在 IDENTITY_MISMATCH、LOGOUT_FAILED、LOGIN_TIMEOUT。
+const observeAnnouncementEn = vom([
+  'L1 modal cover=100%',
+  '  dialog "System Notice Notice System Notice"',
+  '    @e4 button "Close Today"',
+  '    @e5 button "Close Notice"',
+  'L2 page … occluded by L1',
+].join("\n"));
+const observeConsoleEn = vom([
+  'L1 page',
+  '  RootWebArea "Agent Router"',
+  '    @e11 button "G github_16350 chevron_down [has-submenu]"',
+  '    main "Account Data Current balance $555.18 Consumption $3104.82"',
+].join("\n"));
+const observeMenuOpenEn = vom([
+  'L1 page',
+  '    @e11 button "G github_16350 chevron_down [expanded]"',
+  '    @e110 menuitem "exit Quit"',
+].join("\n"));
+const observeLoggedOutEn = vom([
+  'L1 page',
+  '    @e12 button "github_logo Continue with GitHub"',
+  '    StaticText "Logged out successfully"',
+].join("\n"));
+const observeDashboardEn = vom([
+  'L1 page',
+  '    @e11 button "G github_16350 chevron_down [has-submenu]"',
+  '    @e22 button "Current balance $580.18"',
+].join("\n"));
 const observeLoggedOut = vom([
   'L1 page',
   '    @e12 button "github_logo 使用 GitHub 继续"',
@@ -348,6 +379,29 @@ test("checkin 快乐路径：控制台读余额→公告关闭→退出→重登
   assert.deepEqual(clicks, ["@e5", "@e110", "@e12"]);
   const hovers = script.calls.filter((args) => args[0] === "hover").map((args) => args[1]);
   assert.deepEqual(hovers, ["@e11"]);
+  assertStopped(script);
+});
+
+test("checkin 英文界面同样走通：System Notice / exit Quit / Continue with GitHub", async (t) => {
+  const home = await fixture(t);
+  const script = scriptRunner({
+    observes: [
+      reply(observeAnnouncementEn),
+      reply(observeConsoleEn),
+      reply(observeMenuOpenEn),
+      reply(observeLoggedOutEn),
+      reply(observeLanding),
+      reply(observeDashboardEn),
+    ],
+  });
+  const report = await checkinAccount(home, script.run, "work", 180_000, deps());
+  assert.equal(report.ok, true);
+  assert.equal(report.balanceBefore, 555.18);
+  assert.equal(report.balanceAfter, 580.18);
+  assert.equal(report.checkinCredited, true);
+  const clicks = script.calls.filter((args) => args[0] === "click").map((args) => args[1]);
+  // 与中文一致：优先点「关闭公告 / Close Notice」，其次才是「今日关闭 / Close Today」。
+  assert.deepEqual(clicks, ["@e5", "@e110", "@e12"], "英文公告关闭、退出项、登录按钮都要能定位");
   assertStopped(script);
 });
 

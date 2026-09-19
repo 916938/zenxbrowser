@@ -126,8 +126,12 @@ export const agentRouter: SiteAdapter = {
       return null;
     },
     loggedOut: (text) =>
-      text.includes("注销成功") || (text.includes("登 录") && text.includes("使用 GitHub 继续")),
+      text.includes("注销成功") || (text.includes("登 录") && text.includes("使用 GitHub 继续")) || text.includes("Continue with GitHub"),
+    // 公告弹窗会盖住控制台正文（身份与余额都读不到），必须能识别并关掉。
+    // 站点界面语言因账号而异，中英文两套文案都要认，否则英文号的签到会
+    // 卡在 IDENTITY_MISMATCH —— 弹窗遮住正文，身份自然不在文本里。
     hasAnnouncement: (text) =>
-      text.includes("系统公告") && (text.includes("今日关闭") || text.includes("关闭公告")),
+      (text.includes("系统公告") && (text.includes("今日关闭") || text.includes("关闭公告"))) ||
+      (text.includes("System Notice") && (text.includes("Close Today") || text.includes("Close Notice"))),
   },
 };
