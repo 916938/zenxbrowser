@@ -15,7 +15,7 @@
 |---|---|---|---|
 | 1. 统一命令注册表（单一定义源 → 多消费方） | browserskill-pro | 高（根治文档漂移） | 中 |
 | 2. `seq` 单调递增 + RingBuffer + `since: last_action` | browserskill-new | 中 | 低 |
-| 3. 错误按上下文合成 `hint` | 三个项目 | 中 | 低 |
+| 3. 错误按上下文合成 `hint` | zenxbrowser（bsk 已有，`§3` 已更正） | 中 | 低 |
 | 4. Site adapter（`@meta` + 按域找 tab + evaluate） | zenxbrowser | 高（解耦站点逻辑） | 中 |
 | 5. 观察/操作分层读取 | 已一致 | — | — |
 | 6. 反自动化：裸 CDP，别加 stealth | zenxbrowser | 中（避坑） | 无 |
@@ -78,7 +78,23 @@ bb-browser 的错误形状：`{"error": {"message": "...", "hint": "Run 'bb-brow
 - 判定为鉴权错误 → 追加登录提示
 - 追加可直接复制的 issue 上报命令
 
-bsk 已有 `error:` + `hint:` 输出，但基本是静态文案。可借鉴"按上下文合成"：例如 zenx 的 `ACCOUNT_ANCHOR_MISSING` 应提示"该 Profile 未登录 Edge，先人工登录一次"，`PROFILE_AMBIGUOUS` 提示"同一 Profile 开了多个 Edge，先关多余"。
+bsk 已有 `error:` + `hint:` 输出。~~但基本是静态文案~~——**这个判断是错的，实测后更正**：
+
+bsk 的上下文错误处理比 bb-browser 更完整，分三层：
+
+1. **reason 级覆盖**：`crates/bsk-cli/src/cli/render_error.rs` 的 `info_for_error(code, data)` 按 `(code, data.reason)` 覆盖 summary/hint，已有 30+ 条针对性文案（`fill_value_mismatch`、`cdp_extension_access_denied`、`borrow_conflict` …）。未知 reason 回落到通用文案。
+2. **结构化 extras**：`RenderExtras` 把 `error.data` 渲染成附加内容（如 `multiple_browsers_online` 直接打印在线浏览器表、歧义 label 打印候选 `instance_id` 列表）—— 比 bb-browser 的纯字符串 hint 信息量更大。
+3. **JSON 输出含 hint**：`--json` 的错误对象带 `code` / `message` / `hint` / `exit_code`，Agent 可直接消费。
+
+实测（`bsk session start --browser does-not-exist`）：
+
+```
+error: requested resource does not exist
+hint: the session, tab, or browser may have stopped; run `bsk session list` / `bsk browsers` to see current state
+details: requested browser is not connected
+```
+
+**结论：bsk 侧不需要为这一项改动。** 强行改等于在上游高冲突区（每次同步都要重放）制造无收益的 churn。真正缺这层的是 **zenx**，已在 zenx 侧实现（见第 3 项交付）。
 
 ---
 
@@ -171,7 +187,7 @@ for (let len = 4; len <= targetId.length; len++) {
 |---|---|---|---|---|
 | **1** | Pro 命令清单可生成/可校验 | browserskill-pro | registry + 生成器 + `--check` + 测试 | `unittest` 全绿；故意改文档能报错 |
 | 2 | zenx 站点适配器 | zenxbrowser | `src/sites/` + `@meta` + 加载器 | 现有 379 测试全绿，行为不变 |
-| 3 | 上下文合成的 hint | 三个项目 | 错误码 → hint 映射 | 关键错误码覆盖 |
+| 3 | 上下文合成 hint | zenxbrowser（bsk 已有） | `src/hints.ts` 错误码 → hint 映射 | ✅ 已完成（26 个错误码） |
 | 4 | `since: last_action` 相对游标 | browserskill-new | 协议 + CLI + 测试 | cargo test / vitest 全绿 |
 | 5 | 设计不变量清单 | browserskill-new | AGENTS.md 新增一节 | 评审通过 |
 
