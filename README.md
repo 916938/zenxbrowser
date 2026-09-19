@@ -25,6 +25,14 @@ node src/cli.ts --help    # 查看全部用法；也可 npm start -- --help
 - `bsk` 可执行文件（默认从 PATH 查找，可用环境变量 `ZENX_BSK_PATH` 指定绝对路径）
 - Edge 扩展已连接（`zenx doctor` 可一键检查 bsk/daemon/扩展状态）
 
+> ⚠️ **`bsk` 必须是 fork 构建**（[`916938/browserskill-new`](https://github.com/916938/browserskill-new) **0.4.0+**），
+> **不是**上游 [`Tencent/BrowserSkill`](https://github.com/Tencent/BrowserSkill) 的发布版 —— 上游跑不起来。
+> zenx 依赖的这些能力只在 fork 里有：`browsers close`（关掉整个 Edge 实例）、
+> `tab list|create|select --browser-id` 与 `tab observe`（多 Profile 定位）、
+> `browsers` 上报的 profile account id（账号锚点重绑依赖它）、instance smart labels。
+> fork 使用独立版本线，号码始终高于最后一次同步的上游版本（上游 0.3.0 → fork 0.4.0），单看版本号即可分辨。
+> 上游的 remote/server 模式 fork 虽携带但**不支持**，不要依赖。
+
 ### 常用命令
 
 | 命令 | 说明 |
