@@ -13,6 +13,8 @@ import { recheckAccount } from "./recheck.ts";
 import { snapshotAccount, snapshotAll } from "./snapshot.ts";
 import { startReportServer } from "./report.ts";
 import { isTabId } from "./site.ts";
+import { DEFAULT_BATCH_INHIBIT_TIMEOUT_MS, withSleepInhibit } from "./power-save.ts";
+import type { SleepInhibitOptions, SpawnLike } from "./power-save.ts";
 import type { LaunchDependencies } from "./launch.ts";
 import type { CheckinDependencies } from "./checkin.ts";
 
@@ -36,8 +38,8 @@ const help = `ZenX Browser — Windows Edge 多账号连接台
   zenx accounts open-site <别名> [--tab-id <N>] [--timeout 45s]
   zenx accounts inspect-site <别名> [--tab-id <N>] [--timeout 45s]
   zenx accounts login <别名> [--timeout 3m]
-  zenx accounts checkin <别名> [--timeout 3m] [--force]
-  zenx accounts checkin-all [--timeout 3m] [--wait 15m] [--retries 1] [--window 8] [--close-after] [--retry-codes CODES]
+  zenx accounts checkin <别名> [--timeout 3m] [--force] [--inhibit-sleep yes|no] [--inhibit-timeout 4m]
+  zenx accounts checkin-all [--timeout 3m] [--wait 15m] [--retries 1] [--window 8] [--close-after] [--retry-codes CODES] [--inhibit-sleep yes|no] [--inhibit-timeout 4h]
   zenx accounts recheck <别名> [--timeout 45s] [--record yes|no]
   zenx accounts snapshot <别名> [--timeout 45s]
   zenx accounts snapshot --all [--timeout 45s]
@@ -101,7 +103,11 @@ login 只补"登录"这一步（不退出、不签到）：用于 checkin 在重
 checkin-all 依次处理全部账号，并自动处理站点登录限流：命中限流/登录超时的账号记录等待起点，
   冷却 --wait（默认 15 分钟）后自动重试 --retries 次（默认 1）。--window（默认 8）限制同时在线
   的账号数：一组签完立刻关掉它们的 Edge 实例再拉下一组，把内存峰值压在窗口大小内（0=不分组）。
-  --close-after 即使不分组也逐个账号关闭；状态落在 .zenx/checkin-state.json，单个账号失败不中断后续。`;
+  --close-after 即使不分组也逐个账号关闭；状态落在 .zenx/checkin-state.json，单个账号失败不中断后续。
+  两个命令在开始前都会开启**防休眠**（进程级，不改电源计划）：跑几十分钟、中间还可能
+  等限流冷却，休眠一次就会整轮中断。--inhibit-sleep no 关闭；--inhibit-timeout 设上限
+  （默认单账号 签到预算+1m、批量 4h，最长 24h），到点自动释放。激活失败只是降级并记日志，
+  不会中断签到。`;
 
 type Dependencies = {
   run?: Runner;
@@ -115,6 +121,8 @@ type Dependencies = {
   recheckDbFile?: string;
   /** snapshot 使用的账本（测试注入用）。 */
   snapshotDbFile?: string;
+  /** 防休眠的系统调用替身（测试注入用）；不注入则用真实 spawn。 */
+  inhibitSpawn?: SpawnLike;
 };
 
 function parseTimeout(value = "45s"): number {
@@ -132,6 +140,31 @@ function parseDuration(value: string, invalidCode: string, label: string): numbe
   const amount = Number(match[1]) * (match[2] === "m" ? 60_000 : match[2] === "s" ? 1000 : 1);
   if (!Number.isSafeInteger(amount) || amount < 1 || amount > 3_600_000) {
     throw new ZenxError(invalidCode, `${label} 必须在 1ms 到 60m 之间。`);
+  }
+  return amount;
+}
+
+/** 防休眠开关：`--inhibit-sleep yes`（默认）/ `--inhibit-sleep no`。 */
+function parseInhibitFlag(value?: string): boolean {
+  if (value === undefined) return true;
+  const normalized = value.trim().toLowerCase();
+  if (["yes", "y", "true", "on", "1"].includes(normalized)) return true;
+  if (["no", "n", "false", "off", "0"].includes(normalized)) return false;
+  throw new ZenxError("INVALID_ARGUMENT", "--inhibit-sleep 只接受 yes / no。");
+}
+
+/**
+ * 防休眠时长。单独一套解析是因为它比 --wait 宽得多：批量签到连同限流冷却可能跑
+ * 几个小时，而 --wait 上限是 60m。上限 24h 是为了不让"忘记释放"变成永久阻止休眠。
+ */
+function parseInhibitTimeout(value?: string): number | undefined {
+  if (value === undefined) return undefined;
+  const match = /^(\d+)(ms|s|m|h)$/.exec(value);
+  if (!match) throw new ZenxError("INVALID_INHIBIT_TIMEOUT", "--inhibit-timeout 需要正整数和 ms/s/m/h 单位，例如 90m 或 3h。");
+  const unit = match[2];
+  const amount = Number(match[1]) * (unit === "h" ? 3_600_000 : unit === "m" ? 60_000 : unit === "s" ? 1000 : 1);
+  if (!Number.isSafeInteger(amount) || amount < 1000 || amount > 24 * 3_600_000) {
+    throw new ZenxError("INVALID_INHIBIT_TIMEOUT", "--inhibit-timeout 必须在 1s 到 24h 之间。");
   }
   return amount;
 }
@@ -255,6 +288,8 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
         "tab-id": { type: "string" },
         port: { type: "string" },
         open: { type: "boolean" },
+        "inhibit-sleep": { type: "string" },
+        "inhibit-timeout": { type: "string" },
       },
     });
     const { values, positionals, tokens } = parsed;
@@ -286,8 +321,8 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     if (rechecking) allowed.add("record");
     if (snapshotting) allowed.add("all");
     if (loggingIn) allowed.add("timeout");
-    if (checkingInAll) for (const key of ["timeout", "wait", "retries", "retry-codes", "close-after", "window"]) allowed.add(key);
-    if (checkingIn) for (const key of ["timeout", "force"]) allowed.add(key);
+    if (checkingInAll) for (const key of ["timeout", "wait", "retries", "retry-codes", "close-after", "window", "inhibit-sleep", "inhibit-timeout"]) allowed.add(key);
+    if (checkingIn) for (const key of ["timeout", "force", "inhibit-sleep", "inhibit-timeout"]) allowed.add(key);
     if (relinking || closing) allowed.add("confirm");
     if (opening || inspecting) allowed.add("tab-id");
     if (reporting) for (const key of ["port", "open"]) allowed.add(key);
@@ -298,6 +333,18 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     if (snapshotting && values.all === true && alias !== undefined) throw new ZenxError("INVALID_ARGUMENT", "--all 会采集全部账号，不能再指定别名。");
     const home = resolveHome(values.home, dependencies.home);
     const run = dependencies.run ?? createRunner(process.env.ZENX_BSK_PATH);
+    // 防休眠配置：返回 null 表示整段不启用。日志走与进度相同的出口，JSON 模式下不打印。
+    const inhibitOptions = (
+      defaultTimeoutMs: number,
+      log: (line: string) => void,
+    ): SleepInhibitOptions | null => {
+      if (!parseInhibitFlag(values["inhibit-sleep"] as string | undefined)) return null;
+      return {
+        timeoutMs: parseInhibitTimeout(values["inhibit-timeout"] as string | undefined) ?? defaultTimeoutMs,
+        log,
+        ...(dependencies.inhibitSpawn ? { spawn: dependencies.inhibitSpawn } : {}),
+      };
+    };
     let report: Record<string, unknown>;
     if (group === "doctor" && positionals.length === 1) {
       report = await doctor(run);
@@ -337,21 +384,31 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
         dbFile: dependencies.recheckDbFile,
       });
     } else if (checkingInAll && positionals.length === 2) {
-      report = await checkinAll(home, run, {
-        checkinTimeoutMs: parseTimeout(values.timeout ?? "3m"),
-        waitMs: values.wait === undefined ? undefined : parseDuration(values.wait, "INVALID_WAIT", "--wait"),
-        maxRetries: parseRetries(values.retries),
-        retryCodes: parseRetryCodes(values["retry-codes"]),
-        closeAfter: values["close-after"] === true,
-        windowSize: parseWindow(values.window),
-        dbFile: dependencies.snapshotDbFile,
-        onProgress: (line) => { if (!asJson) output(line); },
-      });
+      const progress = (line: string) => { if (!asJson) output(line); };
+      // 防休眠覆盖整轮批量：账号多、还可能撞上限流冷却，中途休眠会让后续账号全部中断。
+      report = await withSleepInhibit(
+        inhibitOptions(DEFAULT_BATCH_INHIBIT_TIMEOUT_MS, progress),
+        () => checkinAll(home, run, {
+          checkinTimeoutMs: parseTimeout(values.timeout ?? "3m"),
+          waitMs: values.wait === undefined ? undefined : parseDuration(values.wait, "INVALID_WAIT", "--wait"),
+          maxRetries: parseRetries(values.retries),
+          retryCodes: parseRetryCodes(values["retry-codes"]),
+          closeAfter: values["close-after"] === true,
+          windowSize: parseWindow(values.window),
+          dbFile: dependencies.snapshotDbFile,
+          onProgress: progress,
+        }),
+      );
     } else if (checkingIn && alias && positionals.length === 3) {
-      report = await checkinAccount(home, run, alias, parseTimeout(values.timeout ?? "3m"), {
-        ...dependencies.checkinDependencies,
-        force: values.force === true,
-      });
+      const timeoutMs = parseTimeout(values.timeout ?? "3m");
+      report = await withSleepInhibit(
+        // 单账号的防休眠只需覆盖这一次签到，留 1 分钟余量给收尾。
+        inhibitOptions(timeoutMs + 60_000, (line) => { if (!asJson) output(line); }),
+        () => checkinAccount(home, run, alias, timeoutMs, {
+          ...dependencies.checkinDependencies,
+          force: values.force === true,
+        }),
+      );
     } else if (rechecking && alias && positionals.length === 3) {
       report = await recheckAccount(home, run, alias, parseTimeout(values.timeout), {
         dbFile: dependencies.recheckDbFile,
