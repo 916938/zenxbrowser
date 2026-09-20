@@ -17,12 +17,29 @@ param(
 $repo    = "D:\916938\zenxbrowser"          # zenx repo path
 # edge-4 (linuxdo_25672) and edge-10 (linuxdo_27030) sign in through GitHub; the site keeps
 # the linuxdo_* identity, so they run through the same checkin flow as the github_* accounts.
-$aliases = @("edge-1", "edge-2", "edge-3", "edge-4", "edge-5", "edge-6", "edge-7", "edge-8", "edge-9", "edge-10",
+$bound   = @("edge-1", "edge-2", "edge-3", "edge-4", "edge-5", "edge-6", "edge-7", "edge-8", "edge-9", "edge-10",
              "edge-p3", "edge-p11", "edge-p12", "edge-p13", "edge-p14",
              "edge-p15", "edge-p16", "edge-p17", "edge-p18", "edge-p19")  # all bound accounts with a verified site identity
 $cli     = Join-Path $repo "src\cli.ts"
 $log     = Join-Path $repo ".zenx\logs\checkin-$(Get-Date -Format yyyyMMdd).log"
 New-Item (Split-Path $log) -ItemType Directory -Force | Out-Null
+
+# Pre-flight: ask the ledger who still needs a check-in today. Accounts already
+# credited are dropped BEFORE any Edge is launched - the site grants one credit
+# per day, so re-running them costs a login from the shared quota and keeps an
+# Edge process alive for nothing. This is what makes re-running an interrupted
+# batch cheap instead of starting over.
+$aliases = $bound
+try {
+  $pendingOut = & node $cli accounts pending --json 2>&1 | Out-String
+  $pending    = $pendingOut | ConvertFrom-Json
+  if ($pending.ok -and $null -ne $pending.pending) {
+    $aliases = @($pending.pending | Where-Object { $bound -contains $_ })
+    Add-Content -Path $log -Encoding UTF8 -Value "--- pre-check: $($aliases.Count) pending of $($bound.Count) bound (date=$($pending.date))"
+  }
+} catch {
+  Add-Content -Path $log -Encoding UTF8 -Value "--- pre-check unavailable: $($_.Exception.Message); running all $($bound.Count) bound accounts"
+}
 
 # Site rate limit: after ~10 logins in quick succession it starts refusing sign-in
 # ("cannot log in") for a while. Each checkin performs exactly one login, so pause
@@ -213,7 +230,11 @@ for ($i = 0; $i -lt $aliases.Count; $i++) {
     $checkinArgs = @("accounts", "checkin", $alias, "--close-after")
   }
   if (0 -ne (Invoke-Zenx $checkinArgs)) { $failed += $alias; Mark-Failed $alias }
-  $logins++
+  # Only a real sign-in consumes the site's shared login quota. A skipped account
+  # (already credited today) never reaches the site, so counting it pushes the run
+  # into a needless 11-minute cool-down - exactly what happens when re-running a
+  # batch that was interrupted half-way.
+  if (-not ($script:LastOutput -match '"skipped"\s*:')) { $logins++ }
 }
 
 # Daily snapshot: record each account's balance and cumulative site spend.

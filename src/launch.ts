@@ -263,6 +263,16 @@ export async function closeBrowser(
   );
   if (reply.exitCode !== 0) {
     const detail = reply.stdout.trim().slice(0, 200);
+    // 扩展不认识这个方法：要么是旧构建，要么是 daemon 还留着换构建之前的旧注册
+    // （此时 bsk browsers 的 EXT 列仍旧版本号，新方法一概被当成 unknown_method）。
+    // 分开报，别笼统说"bsk 失败"——两者的下一步完全不同。
+    if (/unknown_method|not implemented/i.test(reply.stdout)) {
+      throw new ZenxError(
+        "CLOSE_NOT_SUPPORTED",
+        "该实例的扩展未实现 browser.close；未关闭任何窗口。",
+        { alias: account.alias, ...(detail ? { detail } : {}) },
+      );
+    }
     throw new ZenxError("BSK_FAILED", "bsk 未能确认浏览器已关闭；关闭可能已生效，不会自动重试，请用 zenx accounts check 核对。", detail ? { detail } : undefined);
   }
   const result = parseCloseReply(reply.stdout, account.instanceId);

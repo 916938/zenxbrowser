@@ -74,6 +74,8 @@ node src/cli.ts accounts checkin-all                       # 全部账号，命�
 node src/cli.ts accounts checkin-all --wait 12m --retries 1
 node src/cli.ts accounts checkin-all --window 8            # 同时在线不超过 8 个（默认），一组签完即关再拉下一组
 node src/cli.ts accounts checkin-all --close-after         # 不分组也逐个账号关掉 Edge，释放内存
+node src/cli.ts accounts checkin-all --window 8 --close-after   # 两者可叠加：成功的账号签完即关，失败的由组结束时的释放兜底
+node src/cli.ts accounts pending                          # 签到前先预判：只读账本，列出今天还要签谁（不拉起任何 Edge）
 node src/cli.ts accounts checkin-all --retry-codes LOGIN_RATE_LIMITED,LOGIN_TIMEOUT
 node src/cli.ts accounts checkin-all --inhibit-sleep no         # 不阻止系统休眠
 node src/cli.ts accounts checkin-all --inhibit-timeout 2h       # 防休眠上限（默认 4h，最长 24h）
@@ -242,6 +244,7 @@ node src/cli.ts accounts recheck edge-1   # 用余额增量确认今天到账没
 - `checkin <别名> --close-after`：签到成功后立刻关掉整个实例（**不只是 session 窗口**）。只在成功时关——失败的账号常停在登出态，留着窗口便于人工处理。
 - `checkin-all --close-after`：不分组也逐个账号关；配合 `--window` 分组时，每组签完整组释放，内存峰值压在窗口大小内。
 - 每日脚本 `daily-checkin.ps1`：对本轮 `ensure-online` 拉起的账号自动加 `--close-after`（你自己开着的 Edge 不关，见第 1 节）。
+- **开跑前先预判**（`checkin-all` 与 `daily-checkin.ps1` 都内置）：`zenx accounts pending` 只读账本就知道今天还差谁，已到账的账号**连 Edge 都不拉起**。中断后续跑因此不会从头再花一遍实例和登录配额。`--force` 可跳过预判强行重跑。
 
 不想关时至少确认没有残留 session：`bsk session list` 应显示 `no active sessions`。
 
@@ -251,7 +254,8 @@ node src/cli.ts accounts recheck edge-1   # 用余额增量确认今天到账没
 
 1. **扩展产物**：`cd d:\916938\browserskill-new; pnpm ext:build`（约 5 秒；路径不变，所以扩展 ID 与 instance_id 都不变）。
 2. **daemon 二进制**：`cargo build --release -p bsk --locked`（约 4 分钟）→ `Stop-Process -Name bsk` → 覆盖 `D:\programs\Scoop\apps\rustup\current\.cargo\bin\bsk.exe`（先备份）。`bsk -v` 报 "daemon does not recognise this RPC method" 时多半就是这一步没做。
-3. **扩展重载**：在 `edge://extensions` 打开开发人员模式，对该扩展点 **Reload**。⚠️ **重启 Edge、重新 `ensure-online` 都不会重载 MV3 service worker**；Reload 一次对所有 Profile 生效。
+3. **daemon 重启（换了扩展构建后必做）**：`bsk daemon restart`。⚠️ **最容易漏的一步**——daemon 会一直持有换构建之前那次握手留下的实例注册，`bsk browsers` 的 `EXT` 列仍旧版本号，于是新方法一概被当成 `unknown_method`。**重开 Edge 不管用**（新 Edge 用新扩展握手，但 daemon 侧仍是旧记录）；只有重启 daemon 才会刷新。判断依据就是 `EXT` 列：显示旧版本 = 注册陈旧。
+4. **扩展重载**：在 `edge://extensions` 打开开发人员模式，对该扩展点 **Reload**。⚠️ **重启 Edge、重新 `ensure-online` 都不会重载 MV3 service worker**；Reload 一次对所有 Profile 生效。
 
 判断产物是否含该能力要用 node 读字符串——`Select-String` 在 500KB 单行 minify 文件上会误报 MISSING：
 

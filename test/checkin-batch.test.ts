@@ -4,7 +4,8 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { DEFAULT_RETRY_CODES, checkinAll, readState, writeState } from "../src/checkin-batch.ts";
+import { DEFAULT_RETRY_CODES, checkinAll, pendingCheckins, readState, writeState } from "../src/checkin-batch.ts";
+import { openDatabase } from "../src/db.ts";
 import type { Account, Browser, Result, Runner } from "../src/core.ts";
 import { ZenxError } from "../src/core.ts";
 
@@ -33,8 +34,8 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }, store: A
  * 预算极小的假时钟：每次读表前进 100ms，于是 600ms 预算内 checkin 必然抛
  * CHECKIN_TIMEOUT——用它稳定地模拟"任何需要冷却重试的失败"，不必搭完整页面流程。
  */
-function clock() {
-  let now = 0;
+function clock(start = 0) {
+  let now = start;
   const sleeps: number[] = [];
   return {
     now: () => (now += 100),
@@ -239,4 +240,98 @@ test("状态文件：可回读，损坏时退化为空状态而不抛错", async
   await writeState(file, { version: 1, updatedAt: "", accounts: { beta: { lastAttempt: "x", lastResult: "credited", lastCode: null, attempts: 1, balanceAfter: 100, credited: true } } });
   assert.equal((await readState(file)).accounts.beta.lastResult, "credited");
   await readFile(file, "utf8");
+});
+
+/** 往账本里塞一条"今天已到账"的记录，用于预判测试。 */
+function seedCredited(file: string, alias: string, instanceId: string, at: Date) {
+  const db = openDatabase(file);
+  try {
+    db.prepare(
+      "INSERT INTO checkins (time, alias, instance_id, identity, ok, balance_before, balance_after, credited) VALUES (?, ?, ?, ?, 1, 100, 125, 1)",
+    ).run(at.toISOString(), alias, instanceId, "github_1");
+  } finally {
+    db.close();
+  }
+}
+
+function tempDb(t: { after: (fn: () => Promise<void>) => void }) {
+  const file = join(tmpdir(), `zenx-batch-db-${randomUUID()}.db`);
+  t.after(() => rm(file, { force: true }));
+  return file;
+}
+
+// 签到前的预判：只读账本就知道还差谁，不必为已到账的账号拉起 Edge。
+test("pending: 今天已到账的账号不出现在待签名单里", async (t) => {
+  const home = await fixture(t);
+  const dbFile = tempDb(t);
+  seedCredited(dbFile, "alpha", "aaaa1111", new Date("2026-09-21T02:00:00+08:00"));
+  const report = await pendingCheckins(home, {
+    dbFile,
+    now: () => new Date("2026-09-21T10:00:00+08:00"),
+  });
+  assert.equal(report.date, "2026-09-21");
+  assert.deepEqual(report.pending, ["beta"]);
+  assert.deepEqual(report.done, ["alpha"]);
+});
+
+// 账本读不了时全部算待签：宁可多跑一次，也不能因为读不到记录就漏签。
+test("pending: 账本为空时全部账号都是待签", async (t) => {
+  const home = await fixture(t);
+  const report = await pendingCheckins(home, {
+    dbFile: tempDb(t),
+    now: () => new Date("2026-09-21T10:00:00+08:00"),
+  });
+  assert.deepEqual(report.pending, ["alpha", "beta"]);
+  assert.deepEqual(report.done, []);
+});
+
+test("checkin-all: 今天已到账的账号开跑前就跳过，不进分组也不关实例", async (t) => {
+  const home = await fixture(t);
+  const dbFile = tempDb(t);
+  const day = new Date("2026-09-21T10:00:00+08:00").getTime();
+  seedCredited(dbFile, "alpha", "aaaa1111", new Date(day));
+  const time = clock(day);
+  const closeCalls: string[] = [];
+  const spy: Runner = (args, options) => {
+    if (args[0] === "browsers" && args[1] === "close") {
+      closeCalls.push(args[3]);
+      return Promise.resolve({ stdout: JSON.stringify({ browser_id: args[3], closed: true, windows_closed: 1, sessions_stopped: 0, disconnected: true }), exitCode: 0 });
+    }
+    return runner(args, options);
+  };
+  const report = await checkinAll(home, spy, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    waitMs: 60_000,
+    maxRetries: 1,
+    ...time,
+    dbFile,
+  });
+  const byAlias = new Map(report.accounts.map((item) => [item.alias, item]));
+  assert.equal(report.skippedAlreadyCredited, 1);
+  assert.equal(byAlias.get("alpha")?.skipped, "already_credited_today");
+  assert.equal(byAlias.get("alpha")?.attempts, 0, "跳过的账号不该有尝试记录");
+  assert.equal(byAlias.get("alpha")?.credited, true, "已到账仍计入到账数，报表才不会少算");
+  assert.equal(closeCalls.includes("aaaa1111"), false, "跳过的账号没有实例可关");
+});
+
+test("checkin-all: --force 不做预判，已到账的账号也照样跑", async (t) => {
+  const home = await fixture(t);
+  const dbFile = tempDb(t);
+  const day = new Date("2026-09-21T10:00:00+08:00").getTime();
+  seedCredited(dbFile, "alpha", "aaaa1111", new Date(day));
+  const time = clock(day);
+  const report = await checkinAll(home, runner, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    waitMs: 60_000,
+    maxRetries: 1,
+    force: true,
+    ...time,
+    dbFile,
+  });
+  assert.equal(report.skippedAlreadyCredited, 0);
+  const alpha = report.accounts.find((item) => item.alias === "alpha");
+  assert.equal(alpha?.skipped, undefined);
+  assert.ok((alpha?.attempts ?? 0) >= 1, "--force 应真的跑一遍");
 });

@@ -140,6 +140,42 @@ export function hasCreditedBetween(
   }
 }
 
+/**
+ * 本地"今天"的 [start, end) 边界（ISO 字符串）。
+ *
+ * 名字沿用历史叫法，但算的是**本地零点**：`new Date(y, m, d)` 构造的是本地时间，
+ * 再转 ISO。报表分天用 `localDay()`（同为本地），两边口径必须一致——否则凌晨
+ * （UTC 日尚未翻页）跑的签到会被算进前一天。
+ */
+export function todayRange(now: Date): { start: string; end: string } {
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+
+/**
+ * 本地"今天"已确认到账（credited = 1）的账号集合。
+ *
+ * 供签到**开始前**的预判使用：一次查询拿到全部，避免逐账号查库。
+ * 账本读不了时返回空集——宁可多跑一次，也不要因为读不到记录就漏签。
+ */
+export function creditedTodayAliases(now: Date, file: string = DEFAULT_DB_FILE): Set<string> {
+  const { start, end } = todayRange(now);
+  try {
+    const db = openDatabase(file);
+    try {
+      const rows = db.prepare(
+        "SELECT DISTINCT alias AS alias FROM checkins WHERE credited = 1 AND time >= ? AND time < ?",
+      ).all(start, end) as Array<{ alias: string }>;
+      return new Set(rows.map((row) => row.alias));
+    } finally {
+      db.close();
+    }
+  } catch {
+    return new Set();
+  }
+}
+
 function toRow(row: Record<string, unknown>): CheckinRow {
   return {
     id: row.id as number,

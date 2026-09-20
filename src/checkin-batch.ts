@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { readStore, ZenxError } from "./core.ts";
 import type { Account, Runner } from "./core.ts";
+import { creditedTodayAliases } from "./db.ts";
 import { checkinAccount } from "./checkin.ts";
 import type { CheckinResult } from "./checkin.ts";
 import { closeBrowser, ensureOnline } from "./launch.ts";
@@ -67,9 +68,48 @@ export type CheckinBatchReport = {
   groups: number;
   /** 本轮实际释放（关闭）的实例数。 */
   released: number;
+  /** 开跑前就因"今天已到账"被跳过的账号数（这些账号没有拉起 Edge）。 */
+  skippedAlreadyCredited: number;
   accounts: AccountOutcome[];
   stateFile: string;
 };
+
+/**
+ * 签到前的预判结果：今天还要签哪些、哪些已经签过了。
+ *
+ * 只读账本，不碰 bsk、不拉起任何 Edge——这是它存在的意义：批量签到最贵的资源
+ * 是 Edge 实例（每个 Profile 一个常驻进程），能在拉起之前就排除掉的账号，
+ * 就不要为它花一个进程和一次登录配额。
+ */
+export type PendingCheckinsReport = {
+  ok: true;
+  /** 本地日期（YYYY-MM-DD），与报表分天口径一致。 */
+  date: string;
+  /** 今天还没有到账记录的账号。 */
+  pending: string[];
+  /** 今天已确认到账的账号。 */
+  done: string[];
+};
+
+/**
+ * 列出"今天还没到账"的账号，供签到总命令与日常脚本在执行前筛选。
+ * 账本读不了时全部算作待签到——宁可多跑，也不能漏跑。
+ */
+export async function pendingCheckins(
+  home: string,
+  options: { dbFile?: string; now?: () => Date } = {},
+): Promise<PendingCheckinsReport> {
+  const at = (options.now ?? (() => new Date()))();
+  const store = await readStore(home);
+  const credited = creditedTodayAliases(at, options.dbFile);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return {
+    ok: true,
+    date: `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}`,
+    pending: store.accounts.map((account) => account.alias).filter((alias) => !credited.has(alias)),
+    done: store.accounts.map((account) => account.alias).filter((alias) => credited.has(alias)),
+  };
+}
 
 export type CheckinBatchOptions = {
   /** 限定账号；缺省为 store 里的全部账号。 */
@@ -219,7 +259,33 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
     })
     : [...store.accounts];
 
-  const groups = windowSize > 0 ? chunkAccounts(wanted, windowSize) : [wanted];
+  // 开跑前先按账本预判：今天已到账的账号直接跳过，**连 Edge 都不拉起**。
+  // 站点每日只发一次额度，重复签到拿不到钱，却要白花一次登录配额和一个常驻
+  // Edge 进程——实例是这一轮最贵的资源。这也是续跑中断批次时不至于从头重来的原因。
+  const preCredited = options.force === true
+    ? new Set<string>()
+    : creditedTodayAliases(new Date(now()), options.dbFile);
+  const todo: Account[] = [];
+  for (const account of wanted) {
+    if (preCredited.has(account.alias)) {
+      outcomes.set(account.alias, {
+        alias: account.alias,
+        ok: true,
+        credited: true,
+        skipped: "already_credited_today",
+        attempts: 0,
+        rateLimited: false,
+        balanceBefore: null,
+        balanceAfter: null,
+        closed: false,
+      });
+      onProgress(`${account.alias}: 跳过（账本显示今天已到账，不拉起 Edge）`);
+      continue;
+    }
+    todo.push(account);
+  }
+
+  const groups = windowSize > 0 ? chunkAccounts(todo, windowSize) : [todo];
   let rounds = 0;
   let waited = 0;
   let released = 0;
@@ -342,6 +408,8 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
     groups: groups.length,
     /** 本轮实际关闭的实例数（释放内存）。 */
     released,
+    /** 开跑前就因"今天已到账"跳过、未拉起 Edge 的账号数。 */
+    skippedAlreadyCredited: accounts.filter((item) => item.skipped === "already_credited_today" && item.attempts === 0).length,
     accounts,
     stateFile: file,
   };

@@ -8,7 +8,7 @@ import type { Runner } from "./core.ts";
 import { closeBrowser, configureLaunch, ensureOnline, inspectSite, openSite, relinkAccount } from "./launch.ts";
 import { checkinAccount } from "./checkin.ts";
 import { loginAccount } from "./login.ts";
-import { checkinAll } from "./checkin-batch.ts";
+import { checkinAll, pendingCheckins } from "./checkin-batch.ts";
 import { recheckAccount } from "./recheck.ts";
 import { snapshotAccount, snapshotAll } from "./snapshot.ts";
 import { startReportServer } from "./report.ts";
@@ -124,6 +124,8 @@ type Dependencies = {
   recheckDbFile?: string;
   /** snapshot 使用的账本（测试注入用）。 */
   snapshotDbFile?: string;
+  /** 当前时间替身（测试注入用）；不注入则用真实时钟。 */
+  now?: () => Date;
   /** 防休眠的系统调用替身（测试注入用）；不注入则用真实 spawn。 */
   inhibitSpawn?: SpawnLike;
 };
@@ -313,6 +315,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     const closing = group === "accounts" && action === "close";
     const loggingIn = group === "accounts" && action === "login";
     const checkingInAll = group === "accounts" && action === "checkin-all";
+    const pendingList = group === "accounts" && action === "pending";
     const checkingIn = group === "accounts" && action === "checkin";
     const rechecking = group === "accounts" && action === "recheck";
     const snapshotting = group === "accounts" && action === "snapshot";
@@ -386,6 +389,9 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
       report = await loginAccount(home, run, alias, parseTimeout(values.timeout ?? "3m"), {
         dbFile: dependencies.recheckDbFile,
       });
+    } else if (pendingList && positionals.length === 2) {
+      // 只读账本，不调 bsk、不拉起 Edge：签到前先看今天还差谁。
+      report = await pendingCheckins(home, { dbFile: dependencies.snapshotDbFile, now: dependencies.now });
     } else if (checkingInAll && positionals.length === 2) {
       const progress = (line: string) => { if (!asJson) output(line); };
       // 防休眠覆盖整轮批量：账号多、还可能撞上限流冷却，中途休眠会让后续账号全部中断。

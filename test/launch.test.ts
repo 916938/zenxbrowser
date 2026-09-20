@@ -361,6 +361,26 @@ test("离线、非 Edge 或协议不兼容都不调用关闭", async (t) => {
   await assert.rejects(closeBrowser(home, async () => ({ stdout: JSON.stringify([{ ...edge, instance_id: "eeee1111", label: edge.instance_id }]), exitCode: 0 }), "work", 1000), { code: "INSTANCE_OFFLINE" });
 });
 
+// 换过扩展构建后 daemon 会留着旧注册，此时 bsk 仍按旧能力集回 unknown_method。
+// 必须和"bsk 未能确认"分开报：前者的下一步是 bsk daemon restart，后者是人工核对。
+test("扩展不认识 browser.close 时报 CLOSE_NOT_SUPPORTED，并给出可执行的下一步", async (t) => {
+  const { home } = await fixture(t);
+  const unknown = JSON.stringify({
+    code: "unknown_method",
+    message: "browser.close not implemented in extension",
+    exit_code: 5,
+  });
+  await assert.rejects(
+    closeBrowser(home, async (args) => {
+      if (args.includes("close")) return { stdout: unknown, exitCode: 5 };
+      return { stdout: JSON.stringify([edge]), exitCode: 0 };
+    }, "work", 1000),
+    (error: unknown) => error instanceof ZenxError && error.code === "CLOSE_NOT_SUPPORTED",
+  );
+  const error = new ZenxError("CLOSE_NOT_SUPPORTED", "x", { alias: "work" });
+  assert.match(error.hint ?? "", /bsk daemon restart/, "hint 必须给出能立刻执行的下一步");
+});
+
 test("关闭失败或不回显目标实例都不重试，报错交给人工核对", async (t) => {
   const { home } = await fixture(t);
   for (const [reply, code] of [

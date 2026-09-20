@@ -98,6 +98,9 @@ const HINTS: Record<string, HintTemplate> = {
   NOT_EDGE: {
     text: "目标实例不是 Microsoft Edge。确认 --instance-id 取自 Edge 实例（用 bsk browsers 核对）。",
   },
+  CLOSE_NOT_SUPPORTED: {
+    text: "该实例的扩展不认识 browser.close。先用 bsk browsers 看 EXT 列：若显示的还是旧版本号，说明 daemon 仍持有更新扩展之前的旧注册（换了扩展构建后必须重启 daemon，否则新方法一概被当成 unknown_method）——先把该实例的 Edge 关掉，再跑 bsk daemon restart，确认 EXT 变成新版本后重试。",
+  },
   CHECKIN_TIMEOUT: {
     text: "总预算（默认 3 分钟）耗尽。用 --timeout 放宽到 5 分钟；若卡顿在登录环节，多半是站点限流，见 LOGIN_RATE_LIMITED。",
   },
