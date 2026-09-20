@@ -15,7 +15,7 @@ $repo    = "D:\916938\zenxbrowser"          # zenx repo path
 # the linuxdo_* identity, so they run through the same checkin flow as the github_* accounts.
 $aliases = @("edge-1", "edge-2", "edge-3", "edge-4", "edge-5", "edge-6", "edge-7", "edge-8", "edge-9", "edge-10",
              "edge-p3", "edge-p11", "edge-p12", "edge-p13", "edge-p14",
-             "edge-p15", "edge-p16")  # all bound accounts with a verified site identity
+             "edge-p15", "edge-p16", "edge-p17", "edge-p18", "edge-p19")  # all bound accounts with a verified site identity
 $cli     = Join-Path $repo "src\cli.ts"
 $log     = Join-Path $repo ".zenx\logs\checkin-$(Get-Date -Format yyyyMMdd).log"
 New-Item (Split-Path $log) -ItemType Directory -Force | Out-Null
@@ -63,7 +63,7 @@ function Close-LeftoverSessions {
   return $ids.Count
 }
 
-# Closes the Edge windows of the given profile numbers (title "… - <n> - Microsoft Edge").
+# Closes the Edge windows of the given profile numbers (title "... - <n> - Microsoft Edge").
 # ensure-online starts an Edge profile when it is offline; those windows stay on the
 # desktop after checkin because bsk has no "close browser" command (session stop only
 # closes the Agent Window). Match on the profile number so the user's own windows
