@@ -72,11 +72,41 @@ node src/cli.ts accounts checkin-all --wait 12m --retries 1
 node src/cli.ts accounts checkin-all --window 8            # 同时在线不超过 8 个（默认），一组签完即关再拉下一组
 node src/cli.ts accounts checkin-all --close-after         # 不分组也逐个账号关掉 Edge，释放内存
 node src/cli.ts accounts checkin-all --retry-codes LOGIN_RATE_LIMITED,LOGIN_TIMEOUT
+node src/cli.ts accounts checkin-all --inhibit-sleep no         # 不阻止系统休眠
+node src/cli.ts accounts checkin-all --inhibit-timeout 2h       # 防休眠上限（默认 4h，最长 24h）
 ```
+
+### 防休眠（签到期间）
+
+一轮批量要跑几十分钟，中间还可能等 15 分钟级的限流冷却；中途休眠会让 CDP 连接断掉、页面停止渲染，剩下的账号全部中断（而且可能停在登出态）。因此 `checkin`、`checkin-all` 与 `daily-checkin.ps1` 都会在**开始前开启防休眠、结束后释放**。
+
+三条设计约束，改动时不要破坏：
+
+1. **进程级，不碰电源计划。** 不用 `powercfg /change standby-timeout` 这类全局修改——那影响机器上的一切，且异常退出后不会自动恢复。各平台都用"声明本进程需要系统保持运行"的接口，进程结束即失效（崩溃也一样）。
+2. **失败只降级，不阻塞签到。** 命令不存在（没有 `caffeinate` / `systemd-inhibit`）、PowerShell 被策略禁止、`Add-Type` 编译失败，都只是记一行日志继续跑，绝不抛错。
+3. **超时必须自动释放。** 子进程自带时长上限，Node 侧再挂定时器兜底，主进程退出时同步 kill——不留孤儿进程一直阻止休眠。
+
+| 平台 | 策略（日志里的 `strategy`） | 手段 |
+|---|---|---|
+| Windows | `windows-execution-state` | `SetThreadExecutionState(ES_CONTINUOUS \| ES_SYSTEM_REQUIRED)`，子进程每 5 秒确认父进程还在，父进程没了就自己退出 |
+| macOS | `macos-caffeinate` | `caffeinate -d -w <pid> -t <sec>`（跟随父进程 pid，双保险带时长） |
+| Linux | `linux-systemd-inhibit` | `systemd-inhibit --what=sleep:idle ... sleep <sec>` |
+| 降级 | `none` | 没有可用手段或激活失败；`note` 写明试过哪种、为什么失败 |
+
+日志里成对出现，可据此核对有没有按时释放：
+
+```
+防休眠已开启：策略=windows-execution-state，开始=2026-09-20T14:02:11.004Z，计划结束=...（上限 240 分钟）。
+防休眠已关闭：策略=windows-execution-state，开始=...，结束=...，持续约 21.3 分钟。
+```
+
+`--json` 模式下这两行不会打印（只输出报告）；`daily-checkin.ps1` 写进当天日志，形如 `--- sleep guard ON/OFF (strategy=...)`，加 `-NoSleepGuard` 可关闭。
 
 四条行为准则：
 
 - **命中限流立刻停手**：限流是站点侧的**共享配额**（同一出口 IP 连续登录若干次触发），此时任何账号都登录不上。本轮剩下的账号会被推迟到冷却后统一重试，而不是继续把更多账号退出成登出态。
+- **冷却要能看出"在等"而不是"卡住"**：命中限流、冷却开始、冷却结束三行都带时间戳，冷却开始那行同时给出**预计结束时间**，长冷却（超过 5 分钟）每 5 分钟补一行剩余时长。例：
+  `[2026-09-20T14:12:03.115Z] 冷却开始：15 分钟（2026-09-20T14:27:03.115Z 结束），随后重试 6 个账号：edge-p14, ...`
 - **窗口上限**（默认 8）：一次只让这么多账号在线，一组签完立刻关掉它们的 Edge 实例再拉下一组——十几个 Edge Profile 同时常驻是本机最大的内存开销，把峰值压在窗口大小内比"全部拉起再逐个关"稳得多。`--window 0` 关闭分组。
 - **每次尝试都记状态**：`.zenx\checkin-state.json` 记录每个账号的最后尝试时间、结果、错误码与重试次数，中断后可接着看。
 - **默认重试一次**（`--retries`），冷却默认 15 分钟（`--wait`）。重试后仍失败就以失败收尾，不再无限循环。

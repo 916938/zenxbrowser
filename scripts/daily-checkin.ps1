@@ -2,7 +2,11 @@ param(
   # Retry accounts that already failed today. Only do this after signing them in manually -
   # a failed checkin can leave the account logged out on the site, and re-running blind
   # keeps it stuck (IDENTITY_MISMATCH on every later attempt).
-  [switch]$Force
+  [switch]$Force,
+  # Skip the sleep guard. The guard is process-scoped (it only declares that this
+  # script needs the system awake) and is released when the process ends, so
+  # turning it off is a preference, not a safety measure.
+  [switch]$NoSleepGuard
 )
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8  # decode UTF-8 output from node
@@ -40,6 +44,43 @@ if (Test-Path $stateFile) {
 function Mark-Failed {
   param([string]$Alias)
   Add-Content -Path $stateFile -Encoding UTF8 -Value $Alias
+}
+
+# Keeps the machine awake for the whole run. Process-scoped on purpose:
+# SetThreadExecutionState only declares "this process needs the system", it does not
+# touch the power plan and it is dropped automatically when the process ends (even on
+# a crash). Never use powercfg here - that is a machine-wide change that survives an
+# abnormal exit. The node side (src/power-save.ts) does the same for the other
+# platforms; this copy covers the gaps between the per-account node calls, above all
+# the 11-minute rate-limit cool-down, during which nothing else is running.
+$sleepGuardReleased = $false
+function Enable-SleepGuard {
+  if ($NoSleepGuard) {
+    Add-Content -Path $log -Encoding UTF8 -Value "--- sleep guard OFF (strategy=none, disabled by -NoSleepGuard)"
+    return $false
+  }
+  try {
+    Add-Type -Namespace ZenxPower -Name Api -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);' -ErrorAction Stop
+    $null = [ZenxPower.Api]::SetThreadExecutionState([uint32]2147483649)  # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+    Add-Content -Path $log -Encoding UTF8 -Value "--- sleep guard ON (strategy=windows-execution-state, started=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))"
+    return $true
+  } catch {
+    # Degrade, never block: a machine that dozes off mid-run is bad, a run that
+    # refuses to start is worse.
+    Add-Content -Path $log -Encoding UTF8 -Value "--- sleep guard unavailable (strategy=none): $($_.Exception.Message); continuing without it"
+    return $false
+  }
+}
+
+function Disable-SleepGuard {
+  if ($sleepGuardReleased) { return }
+  $script:sleepGuardReleased = $true
+  try {
+    $null = [ZenxPower.Api]::SetThreadExecutionState([uint32]0)  # clear ES_CONTINUOUS
+    Add-Content -Path $log -Encoding UTF8 -Value "--- sleep guard OFF (released=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))"
+  } catch {
+    Add-Content -Path $log -Encoding UTF8 -Value "--- sleep guard release failed: $($_.Exception.Message)"
+  }
 }
 
 function Invoke-Zenx {
@@ -115,6 +156,7 @@ public class ZenxCloser {
 $failed = @()
 $logins = 0
 $launchedProfiles = @()   # profiles this run started, so we can close their windows at the end
+$null = Enable-SleepGuard   # keep the machine awake until the run finishes (see Disable-SleepGuard)
 for ($i = 0; $i -lt $aliases.Count; $i++) {
   $alias = $aliases[$i]
   Add-Content -Path $log -Encoding UTF8 -Value "`n===== $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $alias ====="
@@ -144,8 +186,12 @@ for ($i = 0; $i -lt $aliases.Count; $i++) {
       $remaining = @($aliases[($i + 1)..($aliases.Count - 1)] | Where-Object { -not $skip.ContainsKey($_) }).Count
     }
     if ($remaining -gt 0) {
-      Add-Content -Path $log -Encoding UTF8 -Value "--- login limit reached ($logins logins); cooling down $coolDownMin min ($remaining account(s) still to sign in)"
+      $coolStart = Get-Date
+      $coolEnd   = $coolStart.AddMinutes($coolDownMin)
+      $stamp = 'yyyy-MM-dd HH:mm:ss'
+      Add-Content -Path $log -Encoding UTF8 -Value "--- login limit reached ($logins logins) at $($coolStart.ToString($stamp)); cooling down $coolDownMin min until $($coolEnd.ToString($stamp)) ($remaining account(s) still to sign in)"
       Start-Sleep -Seconds ($coolDownMin * 60)
+      Add-Content -Path $log -Encoding UTF8 -Value "--- cool-down ended at $((Get-Date).ToString($stamp)) (waited $coolDownMin min)"
     } else {
       Add-Content -Path $log -Encoding UTF8 -Value "--- login limit reached ($logins logins) but no account after this one will log in; skipping cool-down"
     }
@@ -173,6 +219,7 @@ $leftover = Close-LeftoverSessions
 if ($leftover -gt 0) {
   Add-Content -Path $log -Encoding UTF8 -Value "--- closed $leftover leftover session(s)"
 }
+Disable-SleepGuard   # release before every exit path; a crash also releases it (process-scoped)
 Add-Content -Path $log -Encoding UTF8 -Value "===== failed: $($failed -join ', ') ====="
 if ($failed.Count -eq 0) { exit 0 }
 # 2 = only accounts that were already known-bad before this run; nothing new broke.

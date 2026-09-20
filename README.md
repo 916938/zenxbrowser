@@ -49,7 +49,7 @@ node src/cli.ts --help    # 查看全部用法；也可 npm start -- --help
 | `zenx accounts inspect-site <别名>` | 只读核对登录身份与签到信号 |
 | `zenx accounts checkin <别名>` | 执行完整退出重登签到流程（支持无人值守/计划任务） |
 | `zenx accounts login <别名>` | 只补“登录”这一步：把重登失败后停在登出态的账号拉回登录态（不退出、不签到） |
-| `zenx accounts checkin-all` | 批量签到：自动处理站点登录限流（冷却 `--wait` 后重试 `--retries` 次），`--window`（默认 8）限制同时在线账号数，`--close-after` 逐个释放实例内存 |
+| `zenx accounts checkin-all` | 批量签到：自动处理站点登录限流（冷却 `--wait` 后重试 `--retries` 次），`--window`（默认 8）限制同时在线账号数，`--close-after` 逐个释放实例内存；全程开启防休眠（`--inhibit-sleep no` 关闭，`--inhibit-timeout` 设上限） |
 | `zenx accounts recheck <别名>` | 只读复查该账号今日签到额度是否已到账（不退出、不重登） |
 | `zenx accounts snapshot <别名>` / `--all` | 采集余额与站点累计消耗，写入账本（周/月对比的观测点） |
 | `zenx report [--port 8787] [--open]` | 启动本地网页报表，查看签到统计与余额趋势 |
@@ -117,7 +117,7 @@ node src/cli.ts accounts checkin edge-1
   - GitHub 登录按钮用 `window.open(授权地址)`，隐藏时会被浏览器返回 `null` 导致卡在登录页。此时 zenx 会临时接管 `window.open` 捕获该地址，再改用 `location.href` 同 tab 跳转。
   - 窗口尺寸（哪怕 `outerWidth` 为 0，后台 Edge 常见）不影响判定，只要页面能求值就继续；只有求值本身失败才报 `WINDOW_NOT_INTERACTIVE`。
 - **遇验证页自动停止**：检测到 GitHub 授权页、两步验证、验证码等特征时报 `MANUAL_INTERVENTION_REQUIRED`，需人工完成登录后重新执行 `checkin`（这是无人值守唯一无法自动处理的情况：GitHub 会话过期需要人工重新登录一次）。
-- **登录频率限制（重要）**：站点对连续登录有限制——**连续登录约 10 次后会被临时拒绝登录**，需等待约 10 分钟才恢复。症状很隐蔽：点击 GitHub 按钮有响应但页面不跳转，最终报 `LOGIN_TIMEOUT`。因此不要短时间内反复手工退出重登同一批账号；批量脚本每完成 10 次签到会自动暂停 11 分钟（见下方脚本）。**当前脚本 15 个账号**：第 10 个签到结束后会插入一次 11 分钟冷却再继续（属预期行为，不是故障）。
+- **登录频率限制（重要）**：站点对连续登录有限制——**连续登录约 10 次后会被临时拒绝登录**，需等待约 10 分钟才恢复。症状很隐蔽：点击 GitHub 按钮有响应但页面不跳转，最终报 `LOGIN_TIMEOUT`。因此不要短时间内反复手工退出重登同一批账号；批量脚本每完成 10 次签到会自动暂停 11 分钟（见下方脚本）。**当前脚本 20 个账号**：每满 10 次登录插入一次 11 分钟冷却（20 个账号仍只在第 10 次后冷却一次，属预期行为，不是故障）。冷却前后都会把时间写进当天日志。
 - **总预算默认 3 分钟**：`--timeout` 可调（最大 5m），超时报 `CHECKIN_TIMEOUT`。
 - **隔离窗口必定回收**：签到成功或失败后，隔离窗口都会被关闭（`session stop`），不留标签页在桌面上。关闭失败时会在输出中报 `CLEANUP_INCOMPLETE`（同时也会打印到 stderr），此时请手动关掉那个 Edge 窗口；批量脚本在全部账号跑完后还会兜底清理一次残留 session。
 - **多账号**：不内置批量签到；在脚本中按别名循环调用即可，每个账号独立执行一次。
