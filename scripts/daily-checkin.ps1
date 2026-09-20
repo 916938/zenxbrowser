@@ -115,7 +115,8 @@ public class ZenxCloser {
 $failed = @()
 $logins = 0
 $launchedProfiles = @()   # profiles this run started, so we can close their windows at the end
-foreach ($alias in $aliases) {
+for ($i = 0; $i -lt $aliases.Count; $i++) {
+  $alias = $aliases[$i]
   Add-Content -Path $log -Encoding UTF8 -Value "`n===== $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $alias ====="
 
   if ($skip.ContainsKey($alias)) {
@@ -133,9 +134,21 @@ foreach ($alias in $aliases) {
   # in-page DOM calls when the window is hidden (locked screen / no interactive desktop).
 
   # Pause before the login that would exceed the site's burst limit.
+  # Skip the wait when no later account will log in anyway: the cool-down only
+  # protects the site's login quota, so waiting with nothing behind us is pointless
+  # (this is the normal case on the last account of the run, and also when every
+  # remaining account is being skipped as already-failed today).
   if ($logins -gt 0 -and $logins % $loginLimit -eq 0) {
-    Add-Content -Path $log -Encoding UTF8 -Value "--- login limit reached ($logins logins); cooling down $coolDownMin min"
-    Start-Sleep -Seconds ($coolDownMin * 60)
+    $remaining = 0
+    if ($i + 1 -lt $aliases.Count) {
+      $remaining = @($aliases[($i + 1)..($aliases.Count - 1)] | Where-Object { -not $skip.ContainsKey($_) }).Count
+    }
+    if ($remaining -gt 0) {
+      Add-Content -Path $log -Encoding UTF8 -Value "--- login limit reached ($logins logins); cooling down $coolDownMin min ($remaining account(s) still to sign in)"
+      Start-Sleep -Seconds ($coolDownMin * 60)
+    } else {
+      Add-Content -Path $log -Encoding UTF8 -Value "--- login limit reached ($logins logins) but no account after this one will log in; skipping cool-down"
+    }
   }
 
   # Not every failure means the account got logged out (e.g. CHECKIN_UNCONFIRMED completes
