@@ -176,6 +176,49 @@ test("checkin-all: --window 0 不分组、不自动关闭实例", async (t) => {
   assert.equal(closeCalls.length, 0);
 });
 
+const ISO = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/;
+
+test("checkin-all: 冷却日志带具体起止时间，长冷却中途报剩余", async (t) => {
+  const home = await fixture(t);
+  const time = clock();
+  const lines: string[] = [];
+  await checkinAll(home, runner, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    waitMs: 12 * 60_000,
+    maxRetries: 1,
+    onProgress: (line) => lines.push(line),
+    ...time,
+  });
+  const limited = lines.find((line) => line.includes("命中站点登录限流"));
+  assert.match(limited ?? "", ISO, "命中限流要带具体时间，不能只说'限流'");
+  assert.match(limited ?? "", /CHECKIN_TIMEOUT/, "要说清是哪个错误码触发的");
+  const start = lines.find((line) => line.includes("冷却开始"));
+  assert.match(start ?? "", ISO, "冷却开始时间");
+  assert.match(start ?? "", /12 分钟/);
+  const stamps = (start ?? "").match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/g) ?? [];
+  assert.equal(stamps.length, 2, "冷却开始这行要同时给出开始与预计结束时间");
+  assert.ok(lines.some((line) => line.includes("冷却结束")), "冷却结束也要记一笔");
+  assert.ok(lines.some((line) => line.includes("剩余") && line.includes("分钟")), "长冷却要报剩余时长");
+  assert.deepEqual(time.sleeps, [5 * 60_000, 5 * 60_000, 2 * 60_000], "12 分钟按 5 分钟分段等待");
+});
+
+test("checkin-all: 短冷却不分段，行为与原来一致", async (t) => {
+  const home = await fixture(t);
+  const time = clock();
+  const lines: string[] = [];
+  await checkinAll(home, runner, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    waitMs: 60_000,
+    maxRetries: 1,
+    onProgress: (line) => lines.push(line),
+    ...time,
+  });
+  assert.deepEqual(time.sleeps, [60_000], "不足一整段就是单次等待");
+  assert.equal(lines.filter((line) => line.includes("冷却中")).length, 0);
+});
+
 test("状态文件：可回读，损坏时退化为空状态而不抛错", async (t) => {
   const home = await fixture(t);
   const file = join(home, "checkin-state.json");

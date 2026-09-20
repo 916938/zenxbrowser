@@ -154,6 +154,33 @@ async function releaseInstance(
  */
 export const DEFAULT_WINDOW_SIZE = 8;
 
+/** 冷却进度输出间隔：长等待中途报一次剩余，免得看起来像卡死。 */
+const COOLDOWN_PROGRESS_STEP_MS = 5 * 60_000;
+
+function stamp(ms: number): string {
+  return new Date(ms).toISOString();
+}
+
+/**
+ * 分段等待，每段结束报告剩余时长。
+ * 分段而不是一次 sleep：15 分钟没有任何输出时无法区分"在等冷却"和"卡住了"。
+ * 不足一整段时就是单次 sleep，行为与原来一致。
+ */
+async function sleepWithProgress(
+  waitMs: number,
+  sleep: (ms: number) => Promise<void>,
+  onProgress: (line: string) => void,
+): Promise<void> {
+  let waited = 0;
+  while (waited < waitMs) {
+    const step = Math.min(COOLDOWN_PROGRESS_STEP_MS, waitMs - waited);
+    await sleep(step);
+    waited += step;
+    const leftMs = waitMs - waited;
+    if (leftMs > 0) onProgress(`冷却中：剩余 ${Math.ceil(leftMs / 60_000)} 分钟`);
+  }
+}
+
 function chunkAccounts(accounts: Account[], size: number): Account[][] {
   const groups: Account[][] = [];
   for (let index = 0; index < accounts.length; index += size) groups.push(accounts.slice(index, index + size));
@@ -237,14 +264,24 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
         if (outcome.rateLimited) {
           // 本轮剩下的账号同样会命中共享配额，一并推迟到冷却之后再试。
           deferred.push(...pending.slice(index));
-          onProgress(`命中站点登录限流：剩余 ${deferred.length} 个账号推迟到冷却后重试`);
+          // 带上时间戳与错误码：限流是整轮最耗时的一步，事后排查全靠这几行。
+          onProgress(
+            `[${stamp(now())}] 命中站点登录限流（${outcome.code ?? "UNKNOWN"}，账号 ${account.alias}）：` +
+              `剩余 ${deferred.length} 个账号推迟到冷却后重试`,
+          );
           break;
         }
       }
       if (deferred.length === 0 || round > maxRetries) break;
-      onProgress(`冷却 ${Math.round(waitMs / 60_000)} 分钟后重试 ${deferred.length} 个账号…`);
-      await sleep(waitMs);
+      const coolStart = now();
+      const coolEnd = coolStart + waitMs;
+      onProgress(
+        `[${stamp(coolStart)}] 冷却开始：${Math.round(waitMs / 60_000)} 分钟（${stamp(coolEnd)} 结束），` +
+          `随后重试 ${deferred.length} 个账号：${deferred.map((item) => item.alias).join(", ")}`,
+      );
+      await sleepWithProgress(waitMs, sleep, onProgress);
       waited += waitMs;
+      onProgress(`[${stamp(now())}] 冷却结束，开始重试 ${deferred.length} 个账号`);
       pending = deferred;
     }
 
