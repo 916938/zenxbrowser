@@ -155,7 +155,7 @@ public class ZenxCloser {
 
 $failed = @()
 $logins = 0
-$launchedProfiles = @()   # profiles this run started, so we can close their windows at the end
+$launchedProfiles = @()   # profiles this run started; only these get --close-after (see below)
 $null = Enable-SleepGuard   # keep the machine awake until the run finishes (see Disable-SleepGuard)
 for ($i = 0; $i -lt $aliases.Count; $i++) {
   $alias = $aliases[$i]
@@ -171,6 +171,12 @@ for ($i = 0; $i -lt $aliases.Count; $i++) {
   # Not marked failed: checkin never ran, so the account state is untouched and a
   # later retry is safe (an offline Edge profile is often just slow to start).
   if (0 -ne $ensure) { $failed += "${alias}(offline)"; continue }
+
+  # Only profiles THIS run started get closed afterwards. An Edge the user already
+  # had open shares the same profile, and --close-after would quit it - tabs and
+  # unsaved work included. Leaving those alone is the whole point of the check.
+  $launchedHere = $script:LastOutput -match '"launched":\s*true'
+  if ($launchedHere) { $launchedProfiles += $alias }
 
   # No window fiddling before checkin: zenx probes the page itself and switches to
   # in-page DOM calls when the window is hidden (locked screen / no interactive desktop).
@@ -200,7 +206,13 @@ for ($i = 0; $i -lt $aliases.Count; $i++) {
   # Not every failure means the account got logged out (e.g. CHECKIN_UNCONFIRMED completes
   # the whole flow). But every one of them still produced a login attempt, so be
   # conservative: mark it and require a manual sign-in before retrying the same day.
-  if (0 -ne (Invoke-Zenx @("accounts", "checkin", $alias))) { $failed += $alias; Mark-Failed $alias }
+  $checkinArgs = @("accounts", "checkin", $alias)
+  if ($launchedHere) {
+    # Quit the whole browser instance afterwards, not just the session window:
+    # a dozen lingering Edge processes is the biggest memory cost of the run.
+    $checkinArgs = @("accounts", "checkin", $alias, "--close-after")
+  }
+  if (0 -ne (Invoke-Zenx $checkinArgs)) { $failed += $alias; Mark-Failed $alias }
   $logins++
 }
 
