@@ -1282,3 +1282,56 @@ test("checkin 重登遇到站点限流 → 报 LOGIN_RATE_LIMITED 而非泛化 L
   );
   assertStopped(script);
 });
+
+/** 记录实例关闭调用，以及它与 session 回收的先后顺序。 */
+function closeSpy(script: ReturnType<typeof scriptRunner>) {
+  const closes: string[][] = [];
+  const order: string[] = [];
+  const run: Runner = async (args, options) => {
+    if (args[0] === "browsers" && args[1] === "close") {
+      closes.push(args);
+      order.push("close");
+      return {
+        stdout: JSON.stringify({ browser_id: edge.instance_id, closed: true, windows_closed: 2, sessions_stopped: 1, disconnected: true }),
+        exitCode: 0,
+      };
+    }
+    if (args[0] === "session" && args[1] === "stop") order.push("stop");
+    return script.run(args, options);
+  };
+  return { run, closes, order };
+}
+
+test("checkin --close-after：签到成功后关掉整个实例，且在 session 回收之后", async (t) => {
+  const home = await fixture(t);
+  const script = scriptRunner({ observes: happyObserves() });
+  const spy = closeSpy(script);
+  const report = await checkinAccount(home, spy.run, "work", 180_000, { ...deps(), closeAfter: true });
+  assert.equal(report.ok, true);
+  assert.equal(report.closed, true);
+  assert.deepEqual(spy.closes, [["browsers", "close", "--browser-id", edge.instance_id, "--confirm", "--json"]]);
+  assert.deepEqual(spy.order, ["stop", "close"], "先回收 session 再关实例：反过来会让 session stop 撞上已退出的进程，误报残留窗口");
+});
+
+test("checkin 不带 --close-after 时不动实例", async (t) => {
+  const home = await fixture(t);
+  const script = scriptRunner({ observes: happyObserves() });
+  const spy = closeSpy(script);
+  const report = await checkinAccount(home, spy.run, "work", 180_000, deps());
+  assert.equal(report.ok, true);
+  assert.equal(report.closed, undefined);
+  assert.equal(spy.closes.length, 0);
+});
+
+test("checkin 失败时即使 --close-after 也保留实例（账号可能停在登出态）", async (t) => {
+  const home = await fixture(t);
+  const script = scriptRunner({
+    observes: [reply(observeWithAnnouncement), reply(observeConsole.replace(/github_16350/g, "github_other"))],
+  });
+  const spy = closeSpy(script);
+  await assert.rejects(
+    checkinAccount(home, spy.run, "work", 180_000, { ...deps(), closeAfter: true }),
+    (error: unknown) => (error as { code?: string }).code === "IDENTITY_MISMATCH",
+  );
+  assert.equal(spy.closes.length, 0, "失败要留着窗口供人工处理");
+});

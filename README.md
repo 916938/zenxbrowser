@@ -47,7 +47,7 @@ node src/cli.ts --help    # 查看全部用法；也可 npm start -- --help
 | `zenx accounts close <别名> --confirm` | 关闭该账号绑定的 Edge 实例（与 `ensure-online` 成对） |
 | `zenx accounts open-site <别名>` | 打开（或切换到）AgentRouter 标签页 |
 | `zenx accounts inspect-site <别名>` | 只读核对登录身份与签到信号 |
-| `zenx accounts checkin <别名>` | 执行完整退出重登签到流程（支持无人值守/计划任务） |
+| `zenx accounts checkin <别名>` | 执行完整退出重登签到流程（支持无人值守/计划任务）；`--close-after` 在签到成功后连浏览器实例一起释放 |
 | `zenx accounts login <别名>` | 只补“登录”这一步：把重登失败后停在登出态的账号拉回登录态（不退出、不签到） |
 | `zenx accounts checkin-all` | 批量签到：自动处理站点登录限流（冷却 `--wait` 后重试 `--retries` 次），`--window`（默认 8）限制同时在线账号数，`--close-after` 逐个释放实例内存；全程开启防休眠（`--inhibit-sleep no` 关闭，`--inhibit-timeout` 设上限） |
 | `zenx accounts recheck <别名>` | 只读复查该账号今日签到额度是否已到账（不退出、不重登） |

@@ -38,7 +38,7 @@ const help = `ZenX Browser — Windows Edge 多账号连接台
   zenx accounts open-site <别名> [--tab-id <N>] [--timeout 45s]
   zenx accounts inspect-site <别名> [--tab-id <N>] [--timeout 45s]
   zenx accounts login <别名> [--timeout 3m]
-  zenx accounts checkin <别名> [--timeout 3m] [--force] [--inhibit-sleep yes|no] [--inhibit-timeout 4m]
+  zenx accounts checkin <别名> [--timeout 3m] [--force] [--close-after] [--inhibit-sleep yes|no] [--inhibit-timeout 4m]
   zenx accounts checkin-all [--timeout 3m] [--wait 15m] [--retries 1] [--window 8] [--close-after] [--retry-codes CODES] [--inhibit-sleep yes|no] [--inhibit-timeout 4h]
   zenx accounts recheck <别名> [--timeout 45s] [--record yes|no]
   zenx accounts snapshot <别名> [--timeout 45s]
@@ -98,6 +98,9 @@ checkin 执行完整退出重登签到流程（隔离 session、退出前核对�
   停止并报错，由人工处理后重试；其余命令保持只读。
 checkin 在当天账本已有"确认到账"记录、或站点显示"今日已签到"时直接跳过（不退出重登），
   避免白扣站点登录配额；确需重跑加 --force。
+checkin 默认只回收本次的隔离窗口，Edge 进程留着；加 --close-after 则在**签到成功后**
+  连带关掉整个浏览器实例（停其全部会话 + 关其所有窗口，含与本项目无关的窗口，未保存
+  内容会丢）。失败时不关——账号可能停在登出态，留着窗口便于人工处理。
 login 只补"登录"这一步（不退出、不签到）：用于 checkin 在重登阶段失败后账号停在登出态、
   因而连 checkin 都无法再启动的自救；已登录则原样返回，不动账号状态。
 checkin-all 依次处理全部账号，并自动处理站点登录限流：命中限流/登录超时的账号记录等待起点，
@@ -322,7 +325,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     if (snapshotting) allowed.add("all");
     if (loggingIn) allowed.add("timeout");
     if (checkingInAll) for (const key of ["timeout", "wait", "retries", "retry-codes", "close-after", "window", "inhibit-sleep", "inhibit-timeout"]) allowed.add(key);
-    if (checkingIn) for (const key of ["timeout", "force", "inhibit-sleep", "inhibit-timeout"]) allowed.add(key);
+    if (checkingIn) for (const key of ["timeout", "force", "inhibit-sleep", "inhibit-timeout", "close-after"]) allowed.add(key);
     if (relinking || closing) allowed.add("confirm");
     if (opening || inspecting) allowed.add("tab-id");
     if (reporting) for (const key of ["port", "open"]) allowed.add(key);
@@ -407,6 +410,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
         () => checkinAccount(home, run, alias, timeoutMs, {
           ...dependencies.checkinDependencies,
           force: values.force === true,
+          closeAfter: values["close-after"] === true,
         }),
       );
     } else if (rechecking && alias && positionals.length === 3) {

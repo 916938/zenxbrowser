@@ -57,6 +57,7 @@ Register-ScheduledTask -TaskName "ZenX 每日签到" -Action $action -Trigger $t
 ```powershell
 node src/cli.ts accounts ensure-online edge-1     # 离线时拉起对应 Edge Profile
 node src/cli.ts accounts checkin edge-1           # 签到（退出 → 重登 → 确认到账）
+node src/cli.ts accounts checkin edge-1 --close-after   # 签到成功后连 Edge 实例一起关掉（释放内存）
 node src/cli.ts accounts login edge-1             # 只补登录：把停在登出态的账号拉回登录态
 node src/cli.ts accounts recheck edge-1           # 只读复查：今天到底到账没有
 node src/cli.ts accounts snapshot edge-1          # 采集该账号的余额/消耗快照
@@ -113,6 +114,7 @@ node src/cli.ts accounts checkin-all --inhibit-timeout 2h       # 防休眠上�
 
 几点约定：
 
+- **`--close-after`（单账号也有）只在签到成功时生效**：先回收 session，再关掉整个 Edge 实例（含无关窗口，未保存内容会丢）。失败时不关——账号可能停在登出态，留着窗口方便人工处理。配合修好的扩展（见 5.5），这才是真正把进程退出，而不是只关掉一个页面。
 - **`recheck` 是"签到后核对"工具，不是第二次签到**：不退出、不重登、不消耗站点登录配额，可以反复跑。退出码 `0` = 已确认到账，`1` = 未到账或异常。
 - **`close` 会关掉该实例的所有窗口**（包括与本项目无关的窗口），未保存内容会丢；只用账号里绑定的精确实例 ID，失败不重试。
 - 签到成功后想立即收尾，就 `close` —— 与 `ensure-online` 成对。
@@ -238,14 +240,18 @@ node src/cli.ts accounts recheck edge-1   # 用余额增量确认今天到账没
 - `checkin-all --close-after`：每个账号签到成功（或确认已到账）后立即 `accounts close`，把该实例的窗口与进程一并退出；批量跑到中途遇限流冷却时，已完成账号也会保持关闭状态，不会白占 15 分钟内存。
 - 不想关时至少确认没有残留 session：`bsk session list` 应显示 `no active sessions`。
 
-注意 `close` 依赖 fork 构建的 `browser.close`；本机扩展仍是 0.2.3 时会报 `unknown_method: browser.close not implemented`，此时兜底用 `scripts\edge-window.ps1 -Marker <显示名> -Action Close`（见 5.1）。
+注意 `close` 依赖 fork 构建的 `browser.close`。**能不能用取决于该 Edge 进程加载的是哪份扩展构建**：所有 Profile 加载的都是同一个解压扩展（`D:\916938\browserskill-new\apps\extension\dist\chrome-mv3`），但已运行的 Edge 进程不会重新读盘，所以老进程一直在跑老代码。
+
+- 判断：`Select-String -Path "apps\extension\dist\chrome-mv3\background.js" -Pattern 'browser\.close' -SimpleMatch` 有命中，说明当前构建支持。
+- 更新：`cd d:\916938\browserskill-new; pnpm ext:build`（约 5 秒，路径不变所以 instance_id 不变），随后**新启动的 Edge 进程**才生效。
+- 仍然关不掉时，兜底 `scripts\edge-window.ps1 -Marker <显示名> -Action Close`（见 5.1）。
 
 ### 5.6 工具本身的问题
 
 | 症状 | 原因与处理 |
 |---|---|
 | `STORE_BUSY` | 账号锁 `.zenx\accounts.lock` 残留（进程被中断所致）。用 `node -e "require('fs').rmSync('.zenx/accounts.lock',{recursive:true,force:true})"` 清掉 —— **别用 PowerShell `Remove-Item`**，它会走环境的删除钩子、经常超时。 |
-| `zenx accounts close` 报 `BSK_FAILED: browser.close not implemented` | 本机扩展版本不支持 `browser.close`。用 `scripts\edge-window.ps1 -Action Close` 兜底（关窗后 Edge 进程会后台驻留十几秒才退出，稍等即可，不用杀进程）。 |
+| `zenx accounts close` 报 `BSK_FAILED: bsk 未能确认浏览器已关闭` | 该 Edge 进程加载的扩展构建里没有 `browser.close`（通常是构建后没重启 Edge）。按上一节重建扩展并重启；急着收尾就用 `scripts\edge-window.ps1 -Action Close` 兜底（关窗后 Edge 进程会后台驻留十几秒才退出，稍等即可，不用杀进程）。 |
 | 账号一直 `offline`，`ensure-online` 也拉不回 | Edge 重启后扩展实例 ID 变了。用 `zenx accounts relink-account <别名> --confirm`（按账号锚点定位，不受 Profile 改名影响；本机多个 Profile 被改名过，Default 显示为 `3`、Profile 3 显示为 `916938 13`）。 |
 | `accounts.json` 损坏导致所有命令报 `INVALID_STORE` | `readStore` 要求 alias 与 instanceId 均唯一，重复就全挂。手工编辑后务必 `zenx accounts check` 验证。 |
 | 关闭浏览器后某账号第二天签到 `IDENTITY_MISMATCH` | 该账号的站点会话没持久化（实测 `edge-p3` 会这样，其它账号不会）。收尾前确认它是登录态，或次日补一次登录。 |

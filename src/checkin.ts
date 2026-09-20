@@ -3,7 +3,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { isEdge, listBrowsers, protocolSupported, readStore, withStoreLock, ZenxError } from "./core.ts";
 import type { Account, Runner } from "./core.ts";
 import { DEFAULT_DB_FILE, hasCreditedBetween, insertCheckin } from "./db.ts";
-import { findAccount } from "./launch.ts";
+import { closeBrowser, findAccount } from "./launch.ts";
+import type { LaunchDependencies } from "./launch.ts";
 import { agentRouter } from "./sites/agentrouter.ts";
 
 export type CheckinDependencies = {
@@ -15,9 +16,18 @@ export type CheckinDependencies = {
   dbFile?: string;
   /** 忽略"今天已到账"的短路判断，强制执行一次退出重登（人工重试用）。 */
   force?: boolean;
+  /**
+   * 签到成功后连浏览器实例一起释放（停其全部会话 + 关其所有窗口）。
+   * 默认关闭：只回收本次的隔离窗口，Edge 进程留着。
+   */
+  closeAfter?: boolean;
+  /** closeAfter 用的依赖注入（测试替身）。 */
+  closeDependencies?: LaunchDependencies;
 };
 
 const siteUrl = agentRouter.consoleUrl;
+/** 签到后关闭实例的固定预算：不占签到总预算，避免总预算耗尽时关不掉。 */
+const CLOSE_AFTER_TIMEOUT_MS = 45_000;
 const SESSION_OBSERVE_MAX_LENGTH = 100_000;
 const LOGIN_POLL_INTERVAL_MS = 2_000;
 const LOGIN_POLL_BUDGET_MS = 60_000;
@@ -438,6 +448,10 @@ export type CheckinResult = {
   code?: string;
   /** 当天已到账/已签到而跳过退出重登；跳过不入账（不是一次签到）。 */
   skipped?: "already_credited_today" | "already_checked_in";
+  /** --close-after 是否真的关掉了浏览器实例（未开该选项时为 undefined）。 */
+  closed?: boolean;
+  /** 关闭失败的原因；结果里保留，便于人工收尾。 */
+  closureError?: string;
 };
 
 export async function checkinAccount(
@@ -514,14 +528,14 @@ export async function checkinAccount(
 
     // 清理问题不打断签到结果，但必须让用户知道窗口可能残留。
     const report = dependencies.report ?? ((error: ZenxError) => console.error(`${error.code}: ${error.message}`));
+    let result: CheckinResult;
     try {
-      const result = await runCheckinSteps(
+      result = await runCheckinSteps(
         run, sessionId, account, remaining, sleep,
         dependencies.now ?? (() => performance.now()), dependencies.force === true,
       );
       // 跳过不入账：它不构成一次签到，记进账本只会虚增打卡次数与成功率。
       if (result.skipped === undefined) await recordCheckin(account, result, null, dependencies.dbFile);
-      return result;
     } catch (error) {
       await recordCheckin(account, null, error, dependencies.dbFile);
       throw error;
@@ -538,7 +552,34 @@ export async function checkinAccount(
         report(new ZenxError("CLEANUP_INCOMPLETE", "签到隔离窗口可能未关闭（session stop 调用失败）；请手动关闭该 Edge 窗口。"));
       }
     }
+
+    // --close-after：走到这里说明签到成功，回收 session 之后再把整个实例关掉。
+    // 只放在成功路径：失败的账号常停在登出态，留着窗口便于人工处理；
+    // 且 session stop 已经先跑完，不会因为实例先退出而误报 CLEANUP_INCOMPLETE。
+    if (dependencies.closeAfter !== true) return result;
+    const closure = await closeInstanceAfterCheckin(home, run, alias, dependencies);
+    return { ...result, closed: closure.closed, closureError: closure.error };
   });
+}
+
+/**
+ * 释放签到用的浏览器实例。关闭结果只写进报告，不改变签到结论——
+ * 关不掉也只是资源没释放，钱已经领到了。
+ */
+async function closeInstanceAfterCheckin(
+  home: string,
+  run: Runner,
+  alias: string,
+  dependencies: CheckinDependencies,
+): Promise<{ closed: boolean; error?: string }> {
+  try {
+    const reply = await closeBrowser(home, run, alias, CLOSE_AFTER_TIMEOUT_MS, dependencies.closeDependencies);
+    if (reply.disconnected || reply.closed) return { closed: true };
+    return { closed: false, error: "实例仍处于连接状态；未关闭。" };
+  } catch (error) {
+    const message = error instanceof ZenxError ? `${error.code}: ${error.message}` : error instanceof Error ? error.message : "关闭失败。";
+    return { closed: false, error: message };
+  }
 }
 
 async function runCheckinSteps(
