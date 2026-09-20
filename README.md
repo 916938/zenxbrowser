@@ -355,6 +355,8 @@ Register-ScheduledTask -TaskName "ZenX 每日签到" -Action $action -Trigger $t
 
 - 首次配置后手动运行一次验证全链路：`powershell -ExecutionPolicy Bypass -File scripts\daily-checkin.ps1`（前提：`zenx doctor` 通过、各账号已绑定且配置了启动参数）。
 - 账号串行执行、互不阻塞；单账号失败不中断后续账号。
+- **签完释放实例**：脚本对本轮 `ensure-online` 拉起的账号自动加 `--close-after`，整个 Edge 进程退出；你自己本来就开着的 Edge 不会被关（同一 Profile，关了会丢你的标签页与未保存内容）。
+- **全程开启防休眠**（进程级，不改电源计划）：跑几十分钟、中间还有 11 分钟冷却，休眠会让后续账号全部中断。`-NoSleepGuard` 关闭。
 - 退出码：`0` 全部成功；`1` 本次有新失败，需要关注；`2` 本次无新失败，只是跳过了当天早前已失败的账号。“任务计划程序 → 上次运行结果”非 0 即有失败。
 - 日志按天追加在 `.zenx\logs\checkin-日期.log`（`.zenx` 已被 git 忽略）。
 - **失败账号当天不再自动重试**：签到失败可能让账号停留在“已登出”状态，盲目重跑只会反复报 `IDENTITY_MISMATCH`、越跑越糟。失败的别名会记入 `.zenx\logs\failed-日期.txt`，当天后续运行直接跳过（日志里标 `skipped`）。人工完成一次 GitHub 登录后，用 `daily-checkin.ps1 -Force` 清掉该文件再跑；不处理的话次日自动恢复（文件名按日期变化）。

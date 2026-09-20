@@ -26,6 +26,7 @@ powershell -ExecutionPolicy Bypass -File scripts\daily-checkin.ps1
 ```
 
 它会依次完成：`ensure-online`（离线才拉起 Edge）→ 每个账号 `checkin` → 每满 10 次登录冷却 11 分钟 → `snapshot --all` 采集当日余额与消耗 → 清理残留 session。
+另外：签到期间开启防休眠（覆盖 11 分钟冷却这段没人跑命令的空档，`-NoSleepGuard` 可关闭）。
 
 | 退出码 | 含义 |
 |---|---|
@@ -37,6 +38,7 @@ powershell -ExecutionPolicy Bypass -File scripts\daily-checkin.ps1
 - 失败名单：`.zenx\logs\failed-YYYYMMDD.txt`
 - **失败的账号当天不再自动重试**：签到失败可能让账号停留在"已登出"状态，盲目重跑会反复 `IDENTITY_MISMATCH`、越跑越糟。人工完成一次 GitHub 登录后，用 `daily-checkin.ps1 -Force` 清掉名单再跑。
 - 离线（`offline`）不计入失败名单 —— 签到根本没执行，账号状态没被碰过，重试是安全的。
+- **签完会释放自己拉起的实例**：脚本给本轮 `ensure-online` 拉起的账号自动加 `--close-after`，签完就退出整个 Edge 进程。**你自己本来就开着的 Edge 不会被关**——它与账号共用同一个 Profile，关掉会连你的标签页和未保存内容一起退掉。判据是 `ensure-online` 返回的 `launched=true`。
 
 ### 注册为计划任务（每日 09:05，错过自动补跑）
 
@@ -235,16 +237,29 @@ node src/cli.ts accounts recheck edge-1   # 用余额增量确认今天到账没
 
 ### 5.5 内存：签到完就释放
 
-十几个 Edge Profile 同时常驻是本机最大的内存开销。两条约定：
+十几个 Edge Profile 同时常驻是本机最大的内存开销。三条约定：
 
-- `checkin-all --close-after`：每个账号签到成功（或确认已到账）后立即 `accounts close`，把该实例的窗口与进程一并退出；批量跑到中途遇限流冷却时，已完成账号也会保持关闭状态，不会白占 15 分钟内存。
-- 不想关时至少确认没有残留 session：`bsk session list` 应显示 `no active sessions`。
+- `checkin <别名> --close-after`：签到成功后立刻关掉整个实例（**不只是 session 窗口**）。只在成功时关——失败的账号常停在登出态，留着窗口便于人工处理。
+- `checkin-all --close-after`：不分组也逐个账号关；配合 `--window` 分组时，每组签完整组释放，内存峰值压在窗口大小内。
+- 每日脚本 `daily-checkin.ps1`：对本轮 `ensure-online` 拉起的账号自动加 `--close-after`（你自己开着的 Edge 不关，见第 1 节）。
 
-注意 `close` 依赖 fork 构建的 `browser.close`。**能不能用取决于该 Edge 进程加载的是哪份扩展构建**：所有 Profile 加载的都是同一个解压扩展（`D:\916938\browserskill-new\apps\extension\dist\chrome-mv3`），但已运行的 Edge 进程不会重新读盘，所以老进程一直在跑老代码。
+不想关时至少确认没有残留 session：`bsk session list` 应显示 `no active sessions`。
 
-- 判断：`Select-String -Path "apps\extension\dist\chrome-mv3\background.js" -Pattern 'browser\.close' -SimpleMatch` 有命中，说明当前构建支持。
-- 更新：`cd d:\916938\browserskill-new; pnpm ext:build`（约 5 秒，路径不变所以 instance_id 不变），随后**新启动的 Edge 进程**才生效。
-- 仍然关不掉时，兜底 `scripts\edge-window.ps1 -Marker <显示名> -Action Close`（见 5.1）。
+#### `browser.close` 关不掉时的排查（三件事互相独立，少做一件仍然失败）
+
+`close` 与 `--close-after` 依赖 fork 的 `browser.close`。报 `unknown_method: browser.close not implemented in extension` 或 `BSK_FAILED: bsk 未能确认浏览器已关闭` 时逐一确认：
+
+1. **扩展产物**：`cd d:\916938\browserskill-new; pnpm ext:build`（约 5 秒；路径不变，所以扩展 ID 与 instance_id 都不变）。
+2. **daemon 二进制**：`cargo build --release -p bsk --locked`（约 4 分钟）→ `Stop-Process -Name bsk` → 覆盖 `D:\programs\Scoop\apps\rustup\current\.cargo\bin\bsk.exe`（先备份）。`bsk -v` 报 "daemon does not recognise this RPC method" 时多半就是这一步没做。
+3. **扩展重载**：在 `edge://extensions` 打开开发人员模式，对该扩展点 **Reload**。⚠️ **重启 Edge、重新 `ensure-online` 都不会重载 MV3 service worker**；Reload 一次对所有 Profile 生效。
+
+判断产物是否含该能力要用 node 读字符串——`Select-String` 在 500KB 单行 minify 文件上会误报 MISSING：
+
+```powershell
+node -e "console.log(require('fs').readFileSync('D:/916938/browserskill-new/apps/extension/dist/chrome-mv3/background.js','utf8').includes('browser.close'))"
+```
+
+仍然关不掉时，兜底 `scripts\edge-window.ps1 -Marker <显示名> -Action Close`（见 5.1）。
 
 ### 5.6 工具本身的问题
 
