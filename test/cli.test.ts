@@ -7,6 +7,30 @@ import { main } from "../src/cli.ts";
 import { bindAccount, checkAccounts, createRunner, doctor, parseBrowsers, readStore } from "../src/core.ts";
 import type { Account, Browser, Runner } from "../src/core.ts";
 import type { LaunchConfig } from "../src/launch.ts";
+import type { ChildLike, SpawnLike } from "../src/power-save.ts";
+
+/** 防休眠的系统调用替身：记录拉起过什么、被 kill 了几次。 */
+function fakeInhibit(): { spawn: SpawnLike; started: string[][]; killed: () => number } {
+  const started: string[][] = [];
+  let kills = 0;
+  const spawn: SpawnLike = (command, args) => {
+    started.push([command, ...args]);
+    const listeners = new Map<string, (arg?: unknown) => void>();
+    const child: ChildLike = {
+      exitCode: null,
+      kill: () => {
+        kills += 1;
+        return true;
+      },
+      on: (event, listener) => {
+        listeners.set(event, listener);
+        return child;
+      },
+    };
+    return child;
+  };
+  return { spawn, started, killed: () => kills };
+}
 
 const edge: Browser = {
   instance_id: "1234abcd", browser_name: "Edge", browser_version: "140.0",
@@ -456,4 +480,57 @@ test("CLI accounts check 即使离线且有启动配置仍只读，不自动启�
   assert.equal(report.accounts[0].connection, "offline");
   assert.equal(report.accounts[0].identity, "not_verified");
   assert.equal(await readFile(join(home, "accounts.json"), "utf8"), before);
+});
+
+// 防休眠接在 CLI 层：批量签到内部再调单账号签到时不会重复激活。
+// 账号离线即可让 checkin 在前置检查处早退，不必搭完整页面流程。
+async function offlineCheckin(t: { after: (fn: () => Promise<void>) => void }, args: string[]) {
+  const home = await temporary(t);
+  await writeFile(join(home, "accounts.json"), JSON.stringify({ version: 1, accounts: [binding] }));
+  const lines: string[] = [];
+  const inhibit = fakeInhibit();
+  const code = await main(["accounts", "checkin", binding.alias, ...args], {
+    home,
+    output: (line) => lines.push(line),
+    run: async () => ({ stdout: "[]", exitCode: 0 }),
+    inhibitSpawn: inhibit.spawn,
+  });
+  return { code, lines, inhibit };
+}
+
+test("CLI checkin 默认开启防休眠并在结束后释放", async (t) => {
+  const { inhibit } = await offlineCheckin(t, ["--json"]);
+  assert.equal(inhibit.started.length, 1, "签到前激活一次");
+  assert.equal(inhibit.killed(), 1, "签到后必定释放");
+});
+
+test("CLI checkin --inhibit-sleep no 完全不拉起防休眠", async (t) => {
+  const { inhibit, lines } = await offlineCheckin(t, ["--json", "--inhibit-sleep", "no"]);
+  assert.equal(inhibit.started.length, 0);
+  assert.equal(inhibit.killed(), 0);
+  assert.doesNotMatch(lines.join("\n"), /防休眠/);
+});
+
+test("CLI checkin 人类输出记录防休眠，--json 不污染报告", async (t) => {
+  const plain = await offlineCheckin(t, []);
+  assert.ok(plain.lines.some((line) => line.includes("防休眠已开启")), "要能看到开启与所用策略");
+  assert.ok(plain.lines.some((line) => line.includes("防休眠已关闭")));
+  const asJson = await offlineCheckin(t, ["--json"]);
+  assert.equal(asJson.lines.filter((line) => line.includes("防休眠")).length, 0, "--json 只输出报告");
+});
+
+test("CLI checkin --inhibit-timeout 非法值被拒绝且不拉起子进程", async (t) => {
+  const home = await temporary(t);
+  await writeFile(join(home, "accounts.json"), JSON.stringify({ version: 1, accounts: [binding] }));
+  const lines: string[] = [];
+  const inhibit = fakeInhibit();
+  const code = await main(["accounts", "checkin", binding.alias, "--inhibit-timeout", "25h", "--json"], {
+    home,
+    output: (line) => lines.push(line),
+    run: async () => ({ stdout: "[]", exitCode: 0 }),
+    inhibitSpawn: inhibit.spawn,
+  });
+  assert.equal(code, 1);
+  assert.equal(JSON.parse(lines[0]).error.code, "INVALID_INHIBIT_TIMEOUT");
+  assert.equal(inhibit.started.length, 0, "参数不合法就不该动系统状态");
 });
