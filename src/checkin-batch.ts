@@ -84,7 +84,7 @@ export type CheckinBatchOptions = {
   retryCodes?: string[];
   /** 签到成功后立即关闭该 Edge 实例，释放内存。 */
   closeAfter?: boolean;
-  /** 同时在线的账号上限（默认 6）：一组签完就关掉再拉下一组，压住内存峰值；0 表示不分组。 */
+  /** 同时在线的账号上限（默认 8）：一组签完就关掉再拉下一组，压住内存峰值；0 表示不分组。 */
   windowSize?: number;
   force?: boolean;
   now?: () => number;
@@ -148,11 +148,11 @@ async function releaseInstance(
 }
 
 /**
- * 同时在线（同时占用 Edge 实例）的账号上限。默认 6：十几个 Edge Profile 一起常驻
+ * 同时在线（同时占用 Edge 实例）的账号上限。默认 8：二十个 Edge Profile 一起常驻
  * 是本机最大的内存开销，签完一批就关一批比"全部拉起再逐个关"稳得多。
  * 设为 0 表示不分组（一次性跑完再统一收尾）。
  */
-export const DEFAULT_WINDOW_SIZE = 6;
+export const DEFAULT_WINDOW_SIZE = 8;
 
 function chunkAccounts(accounts: Account[], size: number): Account[][] {
   const groups: Account[][] = [];
@@ -166,8 +166,8 @@ function chunkAccounts(accounts: Account[], size: number): Account[][] {
  * 三个关键点区别于"for 循环 + 每个账号重试"：
  * 1. 限流是站点侧的共享配额，一旦命中就**停止本轮剩余账号**（否则会把更多账号退出成登出态，
  *    而登出态连 checkin 都无法再启动，只能靠 zenx accounts login 恢复）；
- * 2. **窗口上限**（默认 6）：一次只让这么多账号在线，一组签完立刻关掉它们的 Edge 实例，
- *    再拉起下一组——内存占用的峰值因此被压在 6 个实例上；
+ * 2. **窗口上限**（默认 8）：一次只让这么多账号在线，一组签完立刻关掉它们的 Edge 实例，
+ *    再拉起下一组——内存占用的峰值因此被压在窗口大小的实例数上；
  * 3. 冷却等待期间已完成账号保持关闭状态，不会白占 15 分钟内存。
  */
 export async function checkinAll(home: string, run: Runner, options: CheckinBatchOptions = {}): Promise<CheckinBatchReport> {

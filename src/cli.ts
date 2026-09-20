@@ -37,7 +37,7 @@ const help = `ZenX Browser — Windows Edge 多账号连接台
   zenx accounts inspect-site <别名> [--tab-id <N>] [--timeout 45s]
   zenx accounts login <别名> [--timeout 3m]
   zenx accounts checkin <别名> [--timeout 3m] [--force]
-  zenx accounts checkin-all [--timeout 3m] [--wait 15m] [--retries 1] [--window 6] [--close-after] [--retry-codes CODES]
+  zenx accounts checkin-all [--timeout 3m] [--wait 15m] [--retries 1] [--window 8] [--close-after] [--retry-codes CODES]
   zenx accounts recheck <别名> [--timeout 45s] [--record yes|no]
   zenx accounts snapshot <别名> [--timeout 45s]
   zenx accounts snapshot --all [--timeout 45s]
@@ -99,7 +99,7 @@ checkin 在当天账本已有"确认到账"记录、或站点显示"今日已签
 login 只补"登录"这一步（不退出、不签到）：用于 checkin 在重登阶段失败后账号停在登出态、
   因而连 checkin 都无法再启动的自救；已登录则原样返回，不动账号状态。
 checkin-all 依次处理全部账号，并自动处理站点登录限流：命中限流/登录超时的账号记录等待起点，
-  冷却 --wait（默认 15 分钟）后自动重试 --retries 次（默认 1）。--window（默认 6）限制同时在线
+  冷却 --wait（默认 15 分钟）后自动重试 --retries 次（默认 1）。--window（默认 8）限制同时在线
   的账号数：一组签完立刻关掉它们的 Edge 实例再拉下一组，把内存峰值压在窗口大小内（0=不分组）。
   --close-after 即使不分组也逐个账号关闭；状态落在 .zenx/checkin-state.json，单个账号失败不中断后续。`;
 
@@ -142,7 +142,7 @@ function parseRetries(value?: string): number {
   return Number(value);
 }
 
-/** 同时在线账号上限：缺省=默认 6，0=不分组，1–64 为窗口大小。 */
+/** 同时在线账号上限：缺省=默认 8，0=不分组，1–64 为窗口大小。 */
 function parseWindow(value?: string): number | undefined {
   if (value === undefined) return undefined;
   if (!/^\d{1,2}$/.test(value)) throw new ZenxError("INVALID_WINDOW", "--window 必须是 0 到 64 的整数（0 表示不分组）。");
