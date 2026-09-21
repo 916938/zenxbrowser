@@ -242,7 +242,8 @@ node src/cli.ts accounts recheck edge-1   # 用余额增量确认今天到账没
 十几个 Edge Profile 同时常驻是本机最大的内存开销。三条约定：
 
 - `checkin <别名> --close-after`：签到成功后立刻关掉整个实例（**不只是 session 窗口**）。只在成功时关——失败的账号常停在登出态，留着窗口便于人工处理。
-- `checkin-all --close-after`：不分组也逐个账号关；配合 `--window` 分组时，每组签完整组释放，内存峰值压在窗口大小内。
+- `checkin-all --close-after`：本轮拉起的实例签到成功后立刻关（内存峰值降到 ≈1）。两条路径都**只关本轮由 zenx 拉起的实例**，你自己开着的 Edge 一律保留。
+- `checkin-all --window N`：分组在线上限（默认 8），每组结束时释放该组**本轮拉起的**实例，内存峰值压在窗口大小内。
 - 每日脚本 `daily-checkin.ps1`：对本轮 `ensure-online` 拉起的账号自动加 `--close-after`（你自己开着的 Edge 不关，见第 1 节）。
 - **开跑前先预判**（`checkin-all` 与 `daily-checkin.ps1` 都内置）：`zenx accounts pending` 只读账本就知道今天还差谁，已到账的账号**连 Edge 都不拉起**。中断后续跑因此不会从头再花一遍实例和登录配额。`--force` 可跳过预判强行重跑。
 

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -152,9 +152,10 @@ test("checkin-all: --window 把账号分组，每组结束就释放实例", asyn
   });
   assert.equal(report.groups, 2, "4 个账号按 2 分组应分成 2 组");
   assert.equal(report.windowSize, 2);
-  assert.equal(report.released, 4, "每组结束都应关闭其中账号的实例");
-  assert.equal(closeCalls.length, 4);
-  assert.deepEqual(closeCalls.sort(), ["i1", "i2", "i3", "i4"]);
+  // 这四个账号本来就在跑（fake runner 直接报在线），本轮没有拉起任何一个，
+  // 所以一个都不关——"只关自己拉起的实例"是硬约束，见下一个用例。
+  assert.equal(report.released, 0);
+  assert.equal(closeCalls.length, 0);
 });
 
 test("checkin-all: --window 0 不分组、不自动关闭实例", async (t) => {
@@ -313,6 +314,83 @@ test("checkin-all: 今天已到账的账号开跑前就跳过，不进分组也�
   assert.equal(byAlias.get("alpha")?.attempts, 0, "跳过的账号不该有尝试记录");
   assert.equal(byAlias.get("alpha")?.credited, true, "已到账仍计入到账数，报表才不会少算");
   assert.equal(closeCalls.includes("aaaa1111"), false, "跳过的账号没有实例可关");
+});
+
+/**
+ * 给账号配一套"存在且可启动"的假 Edge 路径，让 ensure-online 真的走进启动分支
+ * （因此 launched = true）。不这么做的话 fake runner 永远报在线，永远走不到
+ * "本轮拉起"这条路径，也就测不出关闭的守卫。
+ */
+async function launchable(home: string, alias: string) {
+  const userDataDir = join(home, "User Data");
+  const profile = join(userDataDir, `Profile-${alias}`);
+  await mkdir(profile, { recursive: true });
+  const edgePath = join(home, "msedge.exe");
+  await writeFile(edgePath, "fake");
+  await writeFile(join(profile, "Preferences"), "{}");
+  return { edgePath, userDataDir, profileDirectory: `Profile-${alias}` };
+}
+
+// 只关本轮拉起的实例：用户自己开着的 Edge 共用同一个 Profile，
+// 关掉它会连标签页和未保存内容一起带走——省内存不值得冒这个险。
+test("checkin-all: --close-after 不关闭本来就在跑的 Edge（用户自己的实例）", async (t) => {
+  const home = await fixture(t);
+  const time = clock();
+  const closeCalls: string[] = [];
+  const spy: Runner = (args, options) => {
+    if (args[0] === "browsers" && args[1] === "close") {
+      closeCalls.push(args[3]);
+      return Promise.resolve({ stdout: JSON.stringify({ browser_id: args[3], closed: true, windows_closed: 1, sessions_stopped: 0, disconnected: true }), exitCode: 0 });
+    }
+    return runner(args, options);
+  };
+  const report = await checkinAll(home, spy, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    maxRetries: 0,
+    closeAfter: true,
+    windowSize: 0,
+    ...time,
+    dbFile: tempDb(t),
+  });
+  assert.equal(report.accounts.every((item) => item.launched === false), true, "两个账号都本来就在跑");
+  assert.equal(report.released, 0);
+  assert.deepEqual(closeCalls, [], "一次都不该关：那是用户自己的 Edge");
+});
+
+// 守卫靠 launched 判定，所以这个字段必须对：本轮拉起的为 true，本来就在线的为 false。
+test("checkin-all: launched 如实记录哪些实例是本轮拉起的", async (t) => {
+  const home = await fixture(t);
+  const launch = await launchable(home, "alpha");
+  await writeFile(
+    join(home, "accounts.json"),
+    JSON.stringify({ version: 1, accounts: [{ ...accounts[0], launch }, accounts[1]] }),
+  );
+  let alphaUp = false;
+  const spy: Runner = (args, options) => {
+    // alpha 要等"启动"之后才上线；beta 一直在线（= 用户自己开着的）。
+    if (args[0] === "browsers") {
+      const list = [browser("bbbb2222")];
+      if (alphaUp) list.unshift(browser("aaaa1111"));
+      return Promise.resolve({ stdout: JSON.stringify(list), exitCode: 0 });
+    }
+    return runner(args, options);
+  };
+  const time = clock();
+  const report = await checkinAll(home, spy, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    // 关掉重试：重试那一轮的 ensure-online 会看到 alpha 已在线（launched=false），
+    // 把第一次的真实结果覆盖掉。
+    maxRetries: 0,
+    windowSize: 0,
+    launchDependencies: { launch: async () => { alphaUp = true; }, platform: "win32", sleep: async () => {} },
+    ...time,
+    dbFile: tempDb(t),
+  });
+  const byAlias = new Map(report.accounts.map((item) => [item.alias, item]));
+  assert.equal(byAlias.get("alpha")?.launched, true, "alpha 的 Edge 是本轮拉起的");
+  assert.equal(byAlias.get("beta")?.launched, false, "beta 的 Edge 本来就在跑");
 });
 
 test("checkin-all: --force 不做预判，已到账的账号也照样跑", async (t) => {

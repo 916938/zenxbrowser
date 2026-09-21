@@ -5,6 +5,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { readStore, ZenxError } from "./core.ts";
 import type { Account, Runner } from "./core.ts";
 import { creditedTodayAliases } from "./db.ts";
+import type { LaunchDependencies } from "./launch.ts";
 import { checkinAccount } from "./checkin.ts";
 import type { CheckinResult } from "./checkin.ts";
 import { closeBrowser, ensureOnline } from "./launch.ts";
@@ -52,6 +53,8 @@ export type AccountOutcome = {
   /** 签到成功后是否已关闭该实例释放内存（未开 --close-after 时为 false）。 */
   closed: boolean;
   closureError?: string;
+  /** 该账号的 Edge 是否由本轮拉起；false 表示它本来就在跑（用户自己的）。 */
+  launched?: boolean;
 };
 
 export type CheckinBatchReport = {
@@ -122,8 +125,15 @@ export type CheckinBatchOptions = {
   maxRetries?: number;
   /** 哪些错误码算限流；默认 LOGIN_RATE_LIMITED 与 LOGIN_TIMEOUT。 */
   retryCodes?: string[];
-  /** 签到成功后立即关闭该 Edge 实例，释放内存。 */
+  /**
+   * 签到成功后立即关闭该 Edge 实例，释放内存。
+   *
+   * 只关**本轮由 zenx 拉起**的实例：你自己开着的 Edge 共用同一个 Profile，
+   * 关掉它会连标签页和未保存内容一起带走。
+   */
   closeAfter?: boolean;
+  /** ensure-online 的依赖注入（测试替身）。 */
+  launchDependencies?: LaunchDependencies;
   /** 同时在线的账号上限（默认 8）：一组签完就关掉再拉下一组，压住内存峰值；0 表示不分组。 */
   windowSize?: number;
   force?: boolean;
@@ -352,11 +362,17 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
     }
 
     // 这一组结束就释放它们的 Edge 实例：内存峰值 = 窗口大小，而不是账号总数。
-    // 失败也要关——失败的账号同样占着一个 Edge 进程。
+    // 在窗口内失败也要关——失败的账号同样占着一个 Edge 进程（它停在哪一步都不影响这一点）。
     if (closeAfter || windowSize > 0) {
       for (const account of group) {
         const current = outcomes.get(account.alias);
         if (current?.closed) continue;
+        // 只关本轮拉起的实例。本来就在跑的那个 Edge 是用户自己的（共用同一 Profile），
+        // 关掉会连标签页和未保存内容一起带走——省内存远不值得冒这个险。
+        if (current?.launched === false) {
+          onProgress(`${account.alias}: 实例非本轮拉起（用户自己的 Edge），保留不关`);
+          continue;
+        }
         const release = await releaseInstance(home, run, account.alias, onProgress);
         if (release.closed) released += 1;
         await remember(account.alias, {
@@ -431,6 +447,7 @@ async function runOne(
     retryCodes?: string[];
     maxRetries?: number;
     dbFile?: string;
+    launchDependencies?: LaunchDependencies;
   },
 ): Promise<AccountOutcome> {
   const retryCodes = new Set(context.retryCodes ?? DEFAULT_RETRY_CODES);
@@ -443,9 +460,12 @@ async function runOne(
     balanceAfter: null,
     closed: false,
     credited: false,
+    launched: false,
   };
+  let launched = false;
   try {
-    await ensureOnline(home, run, account.alias, context.ensureTimeoutMs ?? 60_000);
+    const online = await ensureOnline(home, run, account.alias, context.ensureTimeoutMs ?? 60_000, context.launchDependencies);
+    launched = online.launched === true;
   } catch (error) {
     return {
       ...base,
@@ -460,9 +480,13 @@ async function runOne(
       dbFile: context.dbFile,
       now: context.now,
       sleep: context.sleep,
+      // 只关本轮拉起的实例：账号本来就在线时，那个 Edge 是用户自己的，
+      // 共用同一个 Profile —— 关掉会连标签页与未保存内容一起带走。
+      closeAfter: context.closeAfter && launched === true,
     });
     return {
       ...base,
+      launched,
       ok: result.ok,
       credited: result.checkinCredited === true && result.skipped === undefined,
       skipped: result.skipped,
@@ -475,6 +499,6 @@ async function runOne(
     const code = error instanceof ZenxError ? error.code : "COMMAND_FAILED";
     const message = error instanceof Error ? error.message : "签到失败。";
     const rateLimited = retryCodes.has(code) && context.attempt <= maxRetries;
-    return { ...base, ok: false, code, message, rateLimited };
+    return { ...base, launched, ok: false, code, message, rateLimited };
   }
 }

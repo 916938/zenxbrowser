@@ -404,6 +404,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
           retryCodes: parseRetryCodes(values["retry-codes"]),
           closeAfter: values["close-after"] === true,
           windowSize: parseWindow(values.window),
+          launchDependencies: dependencies.launchDependencies,
           dbFile: dependencies.snapshotDbFile,
           onProgress: progress,
         }),
