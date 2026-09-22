@@ -936,6 +936,100 @@ test("checkin 身份不匹配 → IDENTITY_MISMATCH 且无后续点击", async (
   assertStopped(script);
 });
 
+// ---------------------------------------------------------------------------
+// 站点会话掉线（页面是登录页）不是"身份不符"：GitHub 会话通常还在，点一次
+// "使用 GitHub 继续"就能回到登录态，而登录事件本身就发放当日额度。
+// 过去一律报 IDENTITY_MISMATCH 让人去手工登录——那一步恰好是自动登录能做的。
+// ---------------------------------------------------------------------------
+
+/** 登录后控制台：站点自己显示"今日已签到"。 */
+const observeConsoleCheckedIn = vom([
+  'L1 page',
+  '    @e11 button "G github_16350 chevron_down [has-submenu]"',
+  '    main "账户数据 当前余额 $580.18 历史消耗 $3129.82"',
+  '    StaticText "今日已签到"',
+].join("\n"));
+
+/** 在账本里种一条"昨天"的余额，作为今天开始前的基准。 */
+const seedBaseline = (dbFile: string, balance: number) => {
+  insertCheckin({
+    time: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+    alias: account.alias,
+    instanceId: edge.instance_id,
+    identity: account.expectedIdentity,
+    ok: true,
+    balanceBefore: balance,
+    balanceAfter: balance,
+    credited: false,
+    errorCode: null,
+  }, dbFile);
+};
+
+test("checkin 站点停在登录页 → 自动点“使用 GitHub 继续”登录，不报 IDENTITY_MISMATCH", async (t) => {
+  const home = await fixture(t);
+  const script = scriptRunner({
+    observes: [reply(observeLoggedOut), reply(observeConsole), reply(observeConsoleCheckedIn)],
+  });
+  const report = await checkinAccount(home, script.run, "work", 180_000, deps());
+  assert.equal(report.ok, true);
+  assert.equal(report.checkinCredited, true);
+  assert.equal(report.skipped, undefined, "本次真的登录了，不能记成“跳过”");
+  assert.deepEqual(
+    script.calls.filter((args) => args[0] === "click").map((args) => args[1]),
+    ["@e12"],
+    "只点 GitHub 登录按钮；站点已签到时不该再退出重登",
+  );
+  assertStopped(script);
+});
+
+test("checkin 登出态自救：登录后余额相对账本基线增长 → 确认到账且不再退出重登", async (t) => {
+  const home = await fixture(t);
+  const d = deps();
+  seedBaseline(d.dbFile, 555.18);
+  const script = scriptRunner({
+    observes: [reply(observeLoggedOut), reply(observeConsole), reply(observeDashboard("$580.18"))],
+  });
+  const report = await checkinAccount(home, script.run, "work", 180_000, d);
+  assert.equal(report.ok, true);
+  assert.equal(report.checkinCredited, true);
+  assert.equal(report.balanceBefore, 555.18, "登出态没有“退出前余额”，基准取账本");
+  assert.equal(report.balanceAfter, 580.18);
+  assert.deepEqual(
+    script.calls.filter((args) => args[0] === "click").map((args) => args[1]),
+    ["@e12"],
+    "额度已到账就不再消耗一次登录配额",
+  );
+  assertStopped(script);
+});
+
+test("checkin 登出态自救后无到账证据 → 继续走退出重登（不漏跑）", async (t) => {
+  const home = await fixture(t);
+  const d = deps();
+  seedBaseline(d.dbFile, 555.18);
+  const script = scriptRunner({
+    observes: [
+      reply(observeLoggedOut),   // ④ 页面是登录页 → 自动登录
+      reply(observeConsole),     // 登录完成（菜单出现）
+      reply(observeConsole),     // 回控制台：余额未增长、站点也未显示已签到
+      reply(observeMenuOpen),
+      reply(observeLoggedOut),
+      reply(observeLanding),
+      reply(observeDashboard("$580.18")),
+    ],
+  });
+  const report = await checkinAccount(home, script.run, "work", 180_000, d);
+  assert.equal(report.ok, true);
+  assert.equal(report.checkinCredited, true);
+  assert.equal(report.balanceBefore, 555.18);
+  assert.equal(report.balanceAfter, 580.18);
+  assert.deepEqual(
+    script.calls.filter((args) => args[0] === "click").map((args) => args[1]),
+    ["@e12", "@e110", "@e12"],
+    "自动登录 → 退出 → 重新登录；额度由任一次登录发放都能认出来",
+  );
+  assertStopped(script);
+});
+
 test("checkin 菜单懒渲染时轮询等待退出项，hover 后不立即判定失败", async (t) => {
   const home = await fixture(t);
   // 首次 observe 仍停在未展开的控制台（下拉尚未挂载），第二次才出现退出项。

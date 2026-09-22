@@ -33,6 +33,28 @@ node src/cli.ts --help    # 查看全部用法；也可 npm start -- --help
 > fork 使用独立版本线，号码始终高于最后一次同步的上游版本（上游 0.3.0 → fork 0.4.0），单看版本号即可分辨。
 > 上游的 remote/server 模式 fork 虽携带但**不支持**，不要依赖。
 
+### 让 `zenx` 命令能直接敲
+
+`zenx` 不是安装出来的二进制——仓库里没有编译产物，它只是个启动器，实际跑的是 `src/cli.ts`。所以裸敲 `zenx` 报 “不是 cmdlet/可执行文件” 是**没装启动器**，不是命令不存在。两种跑法：
+
+1. **不装，直接跑**（任何目录都行，记得先 `cd` 到仓库根）：
+
+   ```powershell
+   node src/cli.ts accounts checkin-all
+   ```
+
+2. **装成命令**（推荐）：仓库根目录的 [`zenx.cmd`](zenx.cmd) 就是启动器，它按 `ZENX_NODE` → PATH 里的 `node` → 常见安装目录（含 nvm）的顺序找 Node，找不到就报 `cannot find node.exe` 并以 127 退出。把仓库根加入 PATH，或在 PATH 里已有的目录放一个转发器：
+
+   ```powershell
+   # 目标目录必须在 PATH 中（这里用 %USERPROFILE%\.local\bin，按实际路径改仓库路径）
+   Set-Content -Encoding ASCII "$env:USERPROFILE\.local\bin\zenx.cmd" `
+     -Value '@echo off', 'call "D:\916938\zenxbrowser\zenx.cmd" %*', 'exit /b %ERRORLEVEL%'
+   ```
+
+   之后任意目录都能 `zenx accounts checkin-all`。
+
+> 只复制 `zenx.cmd` 本身到别处不管用：它按自身所在目录定位 `src/cli.ts`，必须配上面的转发器（或把仓库根加进 PATH）。
+
 ### 常用命令
 
 | 命令 | 说明 |
@@ -88,7 +110,7 @@ node src/cli.ts accounts checkin edge-1
 1. 前置检查：浏览器在线、为 Edge、协议受支持，否则直接返回，不启动任何窗口
 2. 创建隔离 session（显式 1280×800 尺寸），打开 <https://agentrouter.org/console> 仪表盘
 3. 窗口输入可用性预检 → 通过 evaluate 收敛页面动画后，自动关闭系统公告弹窗
-4. 核对页面登录身份与绑定身份（`--expected-identity`）一致；不一致立即停止，不执行退出
+4. 核对页面登录身份与绑定身份（`--expected-identity`）一致；不一致立即停止，不执行退出。**例外**：页面是**登录页**（站点会话掉线）不算身份不符——GitHub 会话通常还在，zenx 会直接点「使用 GitHub 继续」登录；登录事件本身即发放当日额度，登录后确认到账即可，不再多走一次退出重登
 5. 记录当前余额 → 悬停用户菜单退出账号 → 点击“使用 GitHub 继续”重新登录
 6. 重新登录完成后回到控制台仪表盘读新余额确认到账（余额增加或出现“签到成功”提示），输出结果并自动回收 session
 
@@ -117,6 +139,7 @@ node src/cli.ts accounts checkin edge-1
   - GitHub 登录按钮用 `window.open(授权地址)`，隐藏时会被浏览器返回 `null` 导致卡在登录页。此时 zenx 会临时接管 `window.open` 捕获该地址，再改用 `location.href` 同 tab 跳转。
   - 窗口尺寸（哪怕 `outerWidth` 为 0，后台 Edge 常见）不影响判定，只要页面能求值就继续；只有求值本身失败才报 `WINDOW_NOT_INTERACTIVE`。
 - **遇验证页自动停止**：检测到 GitHub 授权页、两步验证、验证码等特征时报 `MANUAL_INTERVENTION_REQUIRED`，需人工完成登录后重新执行 `checkin`（这是无人值守唯一无法自动处理的情况：GitHub 会话过期需要人工重新登录一次）。
+- **站点已登出不用人工登录**：页面停在站点登录页（站点会话掉线）时，checkin 会自己点「使用 GitHub 继续」登录——GitHub 会话通常还在，这一步不需要人。登录事件本身就发放当日额度，登录后能确认到账就不再退出重登，省一次登录配额；确认不了才继续走退出重登。旧版在这里一律报 `IDENTITY_MISMATCH` 并提示"请先人工登录"，那是误报。
 - **登录频率限制（重要）**：站点对连续登录有限制——**连续登录约 10 次后会被临时拒绝登录**，需等待约 10 分钟才恢复。症状很隐蔽：点击 GitHub 按钮有响应但页面不跳转，最终报 `LOGIN_TIMEOUT`。因此不要短时间内反复手工退出重登同一批账号；批量脚本每完成 10 次签到会自动暂停 11 分钟（见下方脚本）。**当前脚本 20 个账号**：每满 10 次登录插入一次 11 分钟冷却（20 个账号仍只在第 10 次后冷却一次，属预期行为，不是故障）。冷却前后都会把时间写进当天日志。
 - **总预算默认 3 分钟**：`--timeout` 可调（最大 5m），超时报 `CHECKIN_TIMEOUT`。
 - **隔离窗口必定回收**：签到成功或失败后，隔离窗口都会被关闭（`session stop`），不留标签页在桌面上。关闭失败时会在输出中报 `CLEANUP_INCOMPLETE`（同时也会打印到 stderr），此时请手动关掉那个 Edge 窗口；批量脚本在全部账号跑完后还会兜底清理一次残留 session。
@@ -367,7 +390,7 @@ Register-ScheduledTask -TaskName "ZenX 每日签到" -Action $action -Trigger $t
 
 | 错误码 | 含义 |
 |---|---|
-| `IDENTITY_MISMATCH` | 页面身份与绑定身份不符；未执行退出 |
+| `IDENTITY_MISMATCH` | 页面身份与绑定身份不符（且页面不是登录页）；未执行退出。登录页由 checkin 自动点「使用 GitHub 继续」登录，不会走到这里 |
 | `WINDOW_NOT_INTERACTIVE` | 无法探测页面状态（evaluate 失败或响应非法）；未执行点击 |
 | `SITE_TIMEOUT` | 导航控制台连续失败（已重试 3 次，每次间隔 2s）；未执行点击 |
 | `DOM_INTERACT_FAILED` | DOM 直调未能在页面中找到目标元素；未继续 |

@@ -2,7 +2,7 @@ import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 import { isEdge, listBrowsers, protocolSupported, readStore, withStoreLock, ZenxError } from "./core.ts";
 import type { Account, Runner } from "./core.ts";
-import { DEFAULT_DB_FILE, hasCreditedBetween, insertCheckin } from "./db.ts";
+import { DEFAULT_DB_FILE, hasCreditedBetween, insertCheckin, lastBalanceBefore } from "./db.ts";
 import { closeBrowser, findAccount } from "./launch.ts";
 import type { LaunchDependencies } from "./launch.ts";
 import { agentRouter } from "./sites/agentrouter.ts";
@@ -45,6 +45,8 @@ const MENU_OPEN_BUDGET_MS = 5_000;
  */
 const NAVIGATE_ATTEMPTS = 3;
 const NAVIGATE_RETRY_MS = 2_000;
+/** 站点每日签到发放的额度：登出态自救后用它判断"本次登录是否已发放"（与 recheck 同源）。 */
+const DAILY_CREDIT = 25;
 
 /** 用于从 bsk 调用序列中识别"DOM 直调"表达式（测试与排障用）。 */
 const DOM_INTERACT_MARKER = "zenx-dom-interact";
@@ -532,7 +534,7 @@ export async function checkinAccount(
     try {
       result = await runCheckinSteps(
         run, sessionId, account, remaining, sleep,
-        dependencies.now ?? (() => performance.now()), dependencies.force === true,
+        dependencies.now ?? (() => performance.now()), dependencies.force === true, dependencies.dbFile,
       );
       // 跳过不入账：它不构成一次签到，记进账本只会虚增打卡次数与成功率。
       if (result.skipped === undefined) await recordCheckin(account, result, null, dependencies.dbFile);
@@ -590,6 +592,8 @@ async function runCheckinSteps(
   sleep: (ms: number) => Promise<void>,
   now: () => number,
   force: boolean,
+  /** 账本路径：登出态自救时用它取"今天开始前"的余额基准。 */
+  dbFile?: string,
 ): Promise<CheckinResult> {
   // 用户菜单按钮形如 `@e11 button "G github_16350 chevron_down [has-submenu]"`。
   // 首字母是登录来源标识（G=GitHub、L=LinuxDO 等），同一个站点账号可能通过多种方式登录，
@@ -703,18 +707,94 @@ async function runCheckinSteps(
     await evaluateJson(run, sessionId, oauthNavigateExpression(url), remaining);
   };
 
+  /**
+   * GitHub OAuth 登录并轮询到"用户菜单"出现（菜单按钮里带身份，出现即登录完成）。
+   * 退出重登与登出态自救两条路径共用：两者都是同一个"点 GitHub 继续 → 等落地"的动作。
+   */
+  const loginWithGitHub = async (from: SessionPage): Promise<{ page: SessionPage; sawCheckinSuccess: boolean }> => {
+    const githubRef =
+      findRefByLabel(from, "github_logo 使用 GitHub 继续") ??
+      findRefByLabel(from, "github_logo Continue with GitHub") ??
+      findRefByLabel(from, "Continue with GitHub");
+    if (!githubRef) throw new ZenxError("LOGIN_TIMEOUT", "登录页未找到 GitHub 登录按钮 ref；停止，不重试。", { alias: account.alias });
+    await startGitHubLogin(from, githubRef);
+
+    const loginDeadline = now() + LOGIN_POLL_BUDGET_MS;
+    let sawSuccess = false;
+    let current = from;
+    while (true) {
+      await sleep(LOGIN_POLL_INTERVAL_MS);
+      current = await preparePage(clickTarget);
+      if (current.text.includes("签到成功")) sawSuccess = true;
+      const limited = loginRateLimited(current);
+      if (limited) {
+        throw new ZenxError("LOGIN_RATE_LIMITED", `站点登录限流（${limited}）；停止本次重登，等待冷却后由 checkin-all 自动重试。`, { pageFeature: limited });
+      }
+      const manual = needsManualIntervention(current);
+      if (manual) {
+        throw new ZenxError("MANUAL_INTERVENTION_REQUIRED", `检测到需要人工处理的页面特征（${manual}）；停止，请人工完成登录后重试。`, { pageFeature: manual });
+      }
+      if (menuPattern.test(current.text)) return { page: current, sawCheckinSuccess: sawSuccess };
+      if (now() >= loginDeadline) {
+        throw new ZenxError("LOGIN_TIMEOUT", "重新登录轮询超时（60s）；停止，不重试。", { alias: account.alias });
+      }
+    }
+  };
+
+  /** 账本里"今天开始前"的最后一次余额：登出态自救时作为"发放前"基准（读不到就退化）。 */
+  const readBaselineBalance = (): number | null => {
+    try {
+      const { start } = todayUtcRange(new Date());
+      return lastBalanceBefore(account.alias, start, dbFile);
+    } catch {
+      return null;
+    }
+  };
+
   let page = await preparePage(clickTarget);
 
   // ④ 身份验证（红线：不匹配立即停止）。
+  // 例外：页面是**登录页**时不是"身份不对"，而是站点会话掉线——GitHub 会话通常还在，
+  // 点一次"使用 GitHub 继续"即可回到登录态（登录事件本身就会发放当日额度，与"退出后
+  // 重新登录才到账"同源）。过去一律报 IDENTITY_MISMATCH 让人去手工登录，是误报：
+  // 那一步恰好就是自动登录能做的。
+  let restoredByLogin = false;
+  let sawCheckinSuccess = false;
   if (!page.text.includes(account.expectedIdentity)) {
-    throw new ZenxError("IDENTITY_MISMATCH", `控制台正文未包含预期身份 ${account.expectedIdentity}；立即停止，不执行退出。若该账号当前未登录，请先人工登录后再执行签到。`, { alias: account.alias });
+    if (!isLoggedOut(page)) {
+      throw new ZenxError("IDENTITY_MISMATCH", `控制台正文未包含预期身份 ${account.expectedIdentity}，且页面不是登录页；立即停止，不执行退出（避免退错账号）。请核对绑定身份或该 Profile 当前登录的站点账号。`, { alias: account.alias });
+    }
+    const restored = await loginWithGitHub(page);
+    page = restored.page;
+    sawCheckinSuccess = restored.sawCheckinSuccess;
+    restoredByLogin = true;
+    await navigateConsole();
+    page = await preparePage(clickTarget);
+    if (!page.text.includes(account.expectedIdentity)) {
+      throw new ZenxError("IDENTITY_MISMATCH", `自动登录成功后控制台正文仍未包含预期身份 ${account.expectedIdentity}；立即停止，不执行退出。`, { alias: account.alias });
+    }
   }
 
-  // ⑤ 记录退出前余额。
-  const balanceBefore = extractBalance(page);
+  // ⑤ 记录退出前余额。登出态自救的账号没有"退出前"这一说——本次登录就是发放动作，
+  // 对照组只能取账本里今天开始前的余额。
+  const baselineBalance = restoredByLogin ? readBaselineBalance() : null;
+  const balanceBefore = restoredByLogin ? baselineBalance : extractBalance(page);
 
   // ⑤b 站点自己显示"今日已签到" → 不必再退出重登，直接跳过（--force 可强制）。
   if (force !== true && alreadyCheckedIn(page)) {
+    // 登出态自救走到这里：站点显示已签到，说明本次登录已发放——是一次真实签到，
+    // 不是"跳过"（跳过的语义是这次什么都没做，不该入账）。
+    if (restoredByLogin) {
+      return {
+        ok: true,
+        alias: account.alias,
+        instanceId: account.instanceId,
+        identity: account.expectedIdentity,
+        balanceBefore,
+        balanceAfter: extractBalance(page),
+        checkinCredited: true,
+      };
+    }
     return {
       ok: true,
       alias: account.alias,
@@ -725,6 +805,23 @@ async function runCheckinSteps(
       checkinCredited: true,
       skipped: "already_checked_in" as const,
     };
+  }
+
+  // ⑤c 登出态自救已能确认额度到账（余额相对"今天开始前"增长 ≥ 每日额度）→ 收工。
+  // 不再走退出重登：那会多消耗一次站点登录配额（约 10 次连续登录就触发限流）。
+  if (restoredByLogin) {
+    const afterRestore = extractBalance(page);
+    if (baselineBalance !== null && afterRestore !== null && afterRestore - baselineBalance >= DAILY_CREDIT) {
+      return {
+        ok: true,
+        alias: account.alias,
+        instanceId: account.instanceId,
+        identity: account.expectedIdentity,
+        balanceBefore: baselineBalance,
+        balanceAfter: afterRestore,
+        checkinCredited: true,
+      };
+    }
   }
 
   // ⑥ 退出：hover 用户菜单 → click 退出。
@@ -762,34 +859,10 @@ async function runCheckinSteps(
 
   // ⑦ 重新登录：GitHub OAuth 轮询。落地页不定（首页/控制台），公告可能重现；
   // 登录成功的标志是用户菜单按钮（G <身份> chevron）出现——余额已不在落地页，
-  // 到账核对统一放在 ⑧ 的控制台余额对比。
-  // 登录按钮同理分中英文。findRefByLabel 按可访问名前缀匹配，而可访问名带图标名
-  //（"github_logo …"），所以英文要把图标名一起带上；末项是图标名缺失时的兜底。
-  const githubRef =
-    findRefByLabel(page, "github_logo 使用 GitHub 继续") ??
-    findRefByLabel(page, "github_logo Continue with GitHub") ??
-    findRefByLabel(page, "Continue with GitHub");
-  if (!githubRef) throw new ZenxError("LOGIN_TIMEOUT", "登录页未找到 GitHub 登录按钮 ref；停止，不重试。", { alias: account.alias });
-  await startGitHubLogin(page, githubRef);
-
-  const loginDeadline = now() + LOGIN_POLL_BUDGET_MS;
-  let loggedIn = false;
-  let sawCheckinSuccess = false;
-  while (now() < loginDeadline) {
-    await sleep(LOGIN_POLL_INTERVAL_MS);
-    page = await preparePage(clickTarget);
-    sawCheckinSuccess = sawCheckinSuccess || page.text.includes("签到成功");
-    const limited = loginRateLimited(page);
-    if (limited) {
-      throw new ZenxError("LOGIN_RATE_LIMITED", `站点登录限流（${limited}）；停止本次重登，等待冷却后由 checkin-all 自动重试。`, { pageFeature: limited });
-    }
-    const manual = needsManualIntervention(page);
-    if (manual) {
-      throw new ZenxError("MANUAL_INTERVENTION_REQUIRED", `检测到需要人工处理的页面特征（${manual}）；停止，请人工完成登录后重试。`, { pageFeature: manual });
-    }
-    if (menuPattern.test(page.text)) { loggedIn = true; break; }
-  }
-  if (!loggedIn) throw new ZenxError("LOGIN_TIMEOUT", "重新登录轮询超时（60s）；停止，不重试。", { alias: account.alias });
+  // 到账核对统一放在 ⑧ 的控制台余额对比。（登录按钮的中英文与落地轮询见 loginWithGitHub。）
+  const relogin = await loginWithGitHub(page);
+  page = relogin.page;
+  sawCheckinSuccess = sawCheckinSuccess || relogin.sawCheckinSuccess;
 
   // ⑧ 签到确认：回控制台仪表盘读新余额。
   await navigateConsole();

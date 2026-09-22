@@ -53,7 +53,7 @@ const HINTS: Record<string, HintTemplate> = {
     vars: ["alias"],
   },
   IDENTITY_MISMATCH: {
-    text: "页面身份与绑定身份不符，未执行退出。确认该账号在站点上仍处于登录态；若已登出，人工登录或用 zenx accounts login {alias} 恢复。",
+    text: "页面身份与绑定身份不符（且页面不是登录页），未执行退出。站点停在登录页时 checkin 会自动点“使用 GitHub 继续”登录，走到这里说明站点上登录的是别的账号：核对绑定身份或该 Profile 登录的站点账号。",
     vars: ["alias"],
   },
   LOGOUT_FAILED: {
