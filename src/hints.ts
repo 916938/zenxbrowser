@@ -92,6 +92,9 @@ const HINTS: Record<string, HintTemplate> = {
   BSK_UNAVAILABLE: {
     text: "找不到 bsk 可执行文件。检查 ZENX_BSK_PATH 是否指向 bsk 本体（不是带参数的命令），或先跑 zenx doctor。",
   },
+  BSK_TIMEOUT: {
+    text: "单次 bsk 调用超过 60 秒被终止。同一账号反复出现多半是扩展或 daemon 卡死：先 zenx accounts check 看实例状态；实例在线却操作超时，关掉该 Profile 的 Edge 窗口（遗留实例可批量用 zenx accounts close-leftover --confirm）并 bsk daemon restart 后重试。",
+  },
   UNSUPPORTED_PROTOCOL: {
     text: "扩展协议版本不兼容。把 bsk CLI、daemon 和浏览器扩展一起升级到匹配版本，再跑 zenx doctor 确认。",
   },

@@ -534,3 +534,86 @@ test("CLI checkin --inhibit-timeout 非法值被拒绝且不拉起子进程", as
   assert.equal(JSON.parse(lines[0]).error.code, "INVALID_INHIBIT_TIMEOUT");
   assert.equal(inhibit.started.length, 0, "参数不合法就不该动系统状态");
 });
+
+// --- close-all / close-leftover ---
+
+test("CLI close-all 与 close-leftover 都需要 --confirm", async (t) => {
+  const home = await temporary(t);
+  const lines: string[] = [];
+  const run: Runner = () => Promise.reject(new Error("未确认就不该调用 bsk"));
+  assert.equal(await main(["accounts", "close-all", "--json"], { home, run, output: (line) => lines.push(line) }), 1);
+  assert.equal(JSON.parse(lines[0]).error.code, "CONFIRM_REQUIRED");
+  assert.equal(await main(["accounts", "close-leftover", "--json"], { home, run, output: (line) => lines.push(line) }), 1);
+  assert.equal(JSON.parse(lines[1]).error.code, "CONFIRM_REQUIRED");
+});
+
+test("CLI close-all 逐个关闭并汇总，失败不中断", async (t) => {
+  const home = await temporary(t);
+  await writeFile(join(home, "accounts.json"), JSON.stringify({
+    version: 1,
+    accounts: [
+      { alias: "one", instanceId: "aaaa1111", expectedIdentity: "g1", boundAt: "2026-09-13T00:00:00Z" },
+      { alias: "two", instanceId: "bbbb2222", expectedIdentity: "g2", boundAt: "2026-09-13T00:00:00Z" },
+    ],
+  }));
+  const lines: string[] = [];
+  const code = await main(["accounts", "close-all", "--confirm", "--json"], {
+    home,
+    output: (line) => lines.push(line),
+    run: async (args) => {
+      if (args[0] === "browsers" && args[1] === "close") {
+        if (args[3] === "bbbb2222") return { stdout: "unknown_method: browser.close", exitCode: 1 };
+        return { stdout: JSON.stringify({ browser_id: args[3], closed: true, windows_closed: 2, sessions_stopped: 1, disconnected: true }), exitCode: 0 };
+      }
+      return { stdout: JSON.stringify([{ ...edge, instance_id: "aaaa1111" }, { ...edge, instance_id: "bbbb2222" }]), exitCode: 0 };
+    },
+  });
+  assert.equal(code, 1, "有失败就返回 1");
+  const report = JSON.parse(lines[0]);
+  assert.equal(report.closed, 1);
+  assert.equal(report.failed, 1);
+  assert.equal(report.accounts[1].code, "CLOSE_NOT_SUPPORTED");
+});
+
+test("CLI close-leftover 只关追踪里的遗留实例并清除记录", async (t) => {
+  const home = await temporary(t);
+  await writeFile(join(home, "accounts.json"), JSON.stringify({ version: 1, accounts: [{ ...binding, boundAt: "2026-09-13T00:00:00Z" }] }));
+  await writeFile(join(home, "leftover-instances.json"), JSON.stringify({
+    version: 1,
+    updatedAt: "",
+    instances: [{ alias: "work", instanceId: "1234abcd", launchedAt: "2026-09-24T00:00:00Z" }],
+  }));
+  const lines: string[] = [];
+  const code = await main(["accounts", "close-leftover", "--confirm", "--json"], {
+    home,
+    output: (line) => lines.push(line),
+    run: async (args) => {
+      if (args[0] === "browsers" && args[1] === "close") {
+        return { stdout: JSON.stringify({ browser_id: args[3], closed: true, windows_closed: 1, sessions_stopped: 0, disconnected: true }), exitCode: 0 };
+      }
+      return { stdout: JSON.stringify([edge]), exitCode: 0 };
+    },
+  });
+  assert.equal(code, 0);
+  const report = JSON.parse(lines[0]);
+  assert.equal(report.tracked, 1);
+  assert.equal(report.closed, 1);
+  const state = JSON.parse(await readFile(join(home, "leftover-instances.json"), "utf8"));
+  assert.deepEqual(state.instances, [], "关闭确认后记录应清除");
+});
+
+test("CLI checkin-all 接受 --close-leftover 并在报告里汇总", async (t) => {
+  const home = await temporary(t);
+  await writeFile(join(home, "accounts.json"), JSON.stringify({ version: 1, accounts: [] }));
+  const lines: string[] = [];
+  const inhibit = fakeInhibit();
+  const code = await main(["accounts", "checkin-all", "--close-leftover", "--json"], {
+    home,
+    output: (line) => lines.push(line),
+    run: async () => ({ stdout: "[]", exitCode: 0 }),
+    inhibitSpawn: inhibit.spawn,
+  });
+  assert.equal(code, 0);
+  const report = JSON.parse(lines[0]);
+  assert.deepEqual(report.leftoverCleanup, { tracked: 0, closed: 0, dropped: 0, failed: 0 });
+});

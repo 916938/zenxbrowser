@@ -45,7 +45,8 @@ test("hint 里出现的命令都真实存在", () => {
   // 与 src/cli.ts 帮助文本里列出的子命令保持一致（改命令名时这里也要改）。
   const known = new Set([
     "zenx accounts bind", "zenx accounts check", "zenx accounts checkin", "zenx accounts checkin-all",
-    "zenx accounts close", "zenx accounts configure-launch", "zenx accounts ensure-online",
+    "zenx accounts close", "zenx accounts close-all", "zenx accounts close-leftover",
+    "zenx accounts configure-launch", "zenx accounts ensure-online",
     "zenx accounts inspect-site", "zenx accounts login", "zenx accounts open-site",
     "zenx accounts recheck", "zenx accounts relink-account", "zenx accounts snapshot", "zenx doctor",
   ]);

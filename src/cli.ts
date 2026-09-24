@@ -5,7 +5,8 @@ import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { bindAccount, checkAccounts, createRunner, doctor, isEdge, listBrowsers, ZenxError } from "./core.ts";
 import type { Runner } from "./core.ts";
-import { closeBrowser, configureLaunch, ensureOnline, inspectSite, openSite, relinkAccount } from "./launch.ts";
+import { closeAllBrowsers, closeBrowser, closeLeftoverInstances, configureLaunch, ensureOnline, inspectSite, openSite, relinkAccount } from "./launch.ts";
+import { enrichBskTimeout } from "./diagnose.ts";
 import { checkinAccount } from "./checkin.ts";
 import { loginAccount } from "./login.ts";
 import { checkinAll, pendingCheckins } from "./checkin-batch.ts";
@@ -35,11 +36,13 @@ const help = `ZenX Browser — Windows Edge 多账号连接台
   zenx accounts ensure-online <别名> [--timeout 45s]
   zenx accounts relink-account <别名> --confirm [--timeout 2m]
   zenx accounts close <别名> --confirm [--timeout 45s]
+  zenx accounts close-all --confirm [--timeout 45s]
+  zenx accounts close-leftover --confirm [--timeout 45s]
   zenx accounts open-site <别名> [--tab-id <N>] [--timeout 45s]
   zenx accounts inspect-site <别名> [--tab-id <N>] [--timeout 45s]
   zenx accounts login <别名> [--timeout 3m]
   zenx accounts checkin <别名> [--timeout 3m] [--force] [--close-after] [--inhibit-sleep yes|no] [--inhibit-timeout 4m]
-  zenx accounts checkin-all [--timeout 3m] [--wait 15m] [--retries 1] [--window 8] [--close-after] [--retry-codes CODES] [--inhibit-sleep yes|no] [--inhibit-timeout 4h]
+  zenx accounts checkin-all [--timeout 3m] [--wait 15m] [--retries 1] [--window 8] [--close-after] [--close-leftover] [--retry-codes CODES] [--inhibit-sleep yes|no] [--inhibit-timeout 4h]
   zenx accounts recheck <别名> [--timeout 45s] [--record yes|no]
   zenx accounts snapshot <别名> [--timeout 45s]
   zenx accounts snapshot --all [--timeout 45s]
@@ -67,6 +70,11 @@ close 与 ensure-online 成对：关闭账号绑定的那个 Edge 实例（停�
   浏览器进程随之退出）；只用已绑定的精确实例 ID，离线、非 Edge 或协议不兼容都直接报错，
   不按标签匹配也不改选；必须 --confirm；失败不重试（可能已关闭），用 zenx accounts check 核对。
   会关闭该实例的所有窗口，包括与本项目无关的窗口，未保存内容会丢失。
+close-all 逐个关闭全部绑定账号的 Edge 实例：离线的跳过，单个失败（如旧扩展未实现
+  browser.close）不中断后续账号，最后统一汇总；同样需要 --confirm。
+close-leftover 只清理由 zenx 拉起但没关掉的遗留实例（记录在 .zenx/leftover-instances.json）：
+  实例已离线、或实例 ID 已改绑给其他账号的记录直接移除，绝不误关；关闭失败的保留记录并
+  写明原因，下次重跑还会再试。checkin-all 加 --close-leftover 可在开跑前自动做这次清理。
 不显式打开空白窗口；Edge 自身启动设置仍可能恢复窗口或新标签，无法保证消除。
 open-site 本期仅支持 https://agentrouter.org/；先查找并切换用户已有标签，无匹配才新建。
 多个候选仅在唯一 active 匹配时自动选择，否则用 --tab-id 明确选择；错误候选不新建。
@@ -287,6 +295,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
         retries: { type: "string" },
         "retry-codes": { type: "string" },
         "close-after": { type: "boolean" },
+        "close-leftover": { type: "boolean" },
         record: { type: "string" },
         window: { type: "string" },
         all: { type: "boolean" },
@@ -313,6 +322,8 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     const opening = group === "accounts" && action === "open-site";
     const inspecting = group === "accounts" && action === "inspect-site";
     const closing = group === "accounts" && action === "close";
+    const closingAll = group === "accounts" && action === "close-all";
+    const closingLeftover = group === "accounts" && action === "close-leftover";
     const loggingIn = group === "accounts" && action === "login";
     const checkingInAll = group === "accounts" && action === "checkin-all";
     const pendingList = group === "accounts" && action === "pending";
@@ -327,9 +338,10 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     if (rechecking) allowed.add("record");
     if (snapshotting) allowed.add("all");
     if (loggingIn) allowed.add("timeout");
-    if (checkingInAll) for (const key of ["timeout", "wait", "retries", "retry-codes", "close-after", "window", "inhibit-sleep", "inhibit-timeout"]) allowed.add(key);
+    if (checkingInAll) for (const key of ["timeout", "wait", "retries", "retry-codes", "close-after", "close-leftover", "window", "inhibit-sleep", "inhibit-timeout"]) allowed.add(key);
     if (checkingIn) for (const key of ["timeout", "force", "inhibit-sleep", "inhibit-timeout", "close-after"]) allowed.add(key);
     if (relinking || closing) allowed.add("confirm");
+    if (closingAll || closingLeftover) for (const key of ["confirm", "timeout"]) allowed.add(key);
     if (opening || inspecting) allowed.add("tab-id");
     if (reporting) for (const key of ["port", "open"]) allowed.add(key);
     for (const key of Object.keys(values)) {
@@ -385,6 +397,14 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     } else if (closing && alias && positionals.length === 3) {
       if (values.confirm !== true) throw new ZenxError("CONFIRM_REQUIRED", "关闭会退出该实例的全部 Edge 窗口（含无关窗口，未保存内容会丢失），需要 --confirm。");
       report = await closeBrowser(home, run, alias, parseTimeout(values.timeout), dependencies.launchDependencies);
+    } else if (closingAll && positionals.length === 2) {
+      if (values.confirm !== true) throw new ZenxError("CONFIRM_REQUIRED", "将逐个关闭全部绑定账号的 Edge 实例（含无关窗口，未保存内容会丢失），需要 --confirm。");
+      const progress = (line: string) => { if (!asJson) output(line); };
+      report = await closeAllBrowsers(home, run, parseTimeout(values.timeout), dependencies.launchDependencies, progress);
+    } else if (closingLeftover && positionals.length === 2) {
+      if (values.confirm !== true) throw new ZenxError("CONFIRM_REQUIRED", "将关闭追踪记录中所有 zenx 拉起但未关闭的遗留实例（含无关窗口，未保存内容会丢失），需要 --confirm。");
+      const progress = (line: string) => { if (!asJson) output(line); };
+      report = await closeLeftoverInstances(home, run, parseTimeout(values.timeout), dependencies.launchDependencies, progress);
     } else if (loggingIn && alias && positionals.length === 3) {
       report = await loginAccount(home, run, alias, parseTimeout(values.timeout ?? "3m"), {
         dbFile: dependencies.recheckDbFile,
@@ -403,6 +423,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
           maxRetries: parseRetries(values.retries),
           retryCodes: parseRetryCodes(values["retry-codes"]),
           closeAfter: values["close-after"] === true,
+          closeLeftover: values["close-leftover"] === true,
           windowSize: parseWindow(values.window),
           launchDependencies: dependencies.launchDependencies,
           dbFile: dependencies.snapshotDbFile,
@@ -418,6 +439,9 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
           ...dependencies.checkinDependencies,
           force: values.force === true,
           closeAfter: values["close-after"] === true,
+        }).catch(async (error: unknown) => {
+          // BSK_TIMEOUT 追加卡死诊断（实例卡死 vs daemon 卡死的下一步完全不同）。
+          throw await enrichBskTimeout(error, run, { home, alias });
         }),
       );
     } else if (rechecking && alias && positionals.length === 3) {
@@ -438,7 +462,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     } else {
       throw new ZenxError("INVALID_ARGUMENT", "命令或参数不正确；运行 zenx --help 查看用法。");
     }
-    if (!asJson && !checkingIn && !checkingInAll && !closing && !rechecking && !snapshotting && !loggingIn) output("连接在线或打开站点不等于登录身份验证；未执行签到。");
+    if (!asJson && !checkingIn && !checkingInAll && !closing && !closingAll && !closingLeftover && !rechecking && !snapshotting && !loggingIn) output("连接在线或打开站点不等于登录身份验证；未执行签到。");
     output(JSON.stringify(report, null, 2));
     return report.ok === false ? 1 : 0;
   } catch (error) {

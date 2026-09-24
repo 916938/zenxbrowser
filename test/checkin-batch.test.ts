@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { DEFAULT_RETRY_CODES, checkinAll, pendingCheckins, readState, writeState } from "../src/checkin-batch.ts";
 import { openDatabase } from "../src/db.ts";
+import { readLeftovers, recordLaunchedInstance } from "../src/leftover.ts";
 import type { Account, Browser, Result, Runner } from "../src/core.ts";
 import { ZenxError } from "../src/core.ts";
 
@@ -412,4 +413,104 @@ test("checkin-all: --force 不做预判，已到账的账号也照样跑", async
   const alpha = report.accounts.find((item) => item.alias === "alpha");
   assert.equal(alpha?.skipped, undefined);
   assert.ok((alpha?.attempts ?? 0) >= 1, "--force 应真的跑一遍");
+});
+
+// --- 遗留实例追踪：zenx 拉起的实例落盘，close-leftover 才有据可查 ---
+
+/** alpha 等"启动"后才上线；关闭行为由 closeReply 决定。 */
+function launchSpy(alphaUpRef: { up: boolean }, closeReply: (id: string) => Result): Runner {
+  return (args, options) => {
+    if (args[0] === "browsers" && args[1] === "close") return Promise.resolve(closeReply(args[3]));
+    if (args[0] === "browsers") {
+      const list = [browser("bbbb2222")];
+      if (alphaUpRef.up) list.unshift(browser("aaaa1111"));
+      return Promise.resolve({ stdout: JSON.stringify(list), exitCode: 0 });
+    }
+    return runner(args, options);
+  };
+}
+
+test("checkin-all: 本轮拉起但关不掉的实例记入 leftover，用户自己的实例不入账", async (t) => {
+  const home = await fixture(t);
+  const launch = await launchable(home, "alpha");
+  await writeFile(
+    join(home, "accounts.json"),
+    JSON.stringify({ version: 1, accounts: [{ ...accounts[0], launch }, accounts[1]] }),
+  );
+  const alphaUp = { up: false };
+  const spy = launchSpy(alphaUp, () => ({ stdout: "unknown_method: browser.close", exitCode: 1 }));
+  const time = clock();
+  const report = await checkinAll(home, spy, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    maxRetries: 0,
+    closeAfter: true,
+    launchDependencies: { launch: async () => { alphaUp.up = true; }, platform: "win32", sleep: async () => {} },
+    ...time,
+    dbFile: tempDb(t),
+  });
+  assert.match(report.accounts.find((item) => item.alias === "alpha")?.closureError ?? "", /CLOSE_NOT_SUPPORTED/);
+  const leftovers = await readLeftovers(home);
+  assert.deepEqual(leftovers.instances.map((item) => item.alias), ["alpha"], "只有 zenx 拉起且没关掉的实例才入追踪");
+  assert.match(leftovers.instances[0]?.lastCloseError ?? "", /CLOSE_NOT_SUPPORTED/, "失败原因要留下，便于排查");
+});
+
+test("checkin-all: 本轮拉起且成功关闭的实例不留 leftover 记录", async (t) => {
+  const home = await fixture(t);
+  const launch = await launchable(home, "alpha");
+  await writeFile(
+    join(home, "accounts.json"),
+    JSON.stringify({ version: 1, accounts: [{ ...accounts[0], launch }, accounts[1]] }),
+  );
+  const alphaUp = { up: false };
+  const spy = launchSpy(alphaUp, (id) => ({
+    stdout: JSON.stringify({ browser_id: id, closed: true, windows_closed: 1, sessions_stopped: 0, disconnected: true }),
+    exitCode: 0,
+  }));
+  const time = clock();
+  const report = await checkinAll(home, spy, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    maxRetries: 0,
+    closeAfter: true,
+    launchDependencies: { launch: async () => { alphaUp.up = true; }, platform: "win32", sleep: async () => {} },
+    ...time,
+    dbFile: tempDb(t),
+  });
+  assert.equal(report.released, 1, "alpha 的实例应被释放");
+  assert.deepEqual((await readLeftovers(home)).instances, [], "确认关闭后记录应清除");
+});
+
+test("checkin-all: --close-leftover 开跑前清理遗留实例，不碰账号自己的实例", async (t) => {
+  const home = await fixture(t);
+  await recordLaunchedInstance(home, "ghost", "zzzz9999");
+  await recordLaunchedInstance(home, "gone", "yyyy9999");
+  const closed: string[] = [];
+  const spy: Runner = (args, options) => {
+    if (args[0] === "browsers" && args[1] === "close") {
+      closed.push(args[3]);
+      return Promise.resolve({
+        stdout: JSON.stringify({ browser_id: args[3], closed: true, windows_closed: 1, sessions_stopped: 0, disconnected: true }),
+        exitCode: 0,
+      });
+    }
+    if (args[0] === "browsers") {
+      // zzzz9999 在线（无主遗留，应被关闭）；yyyy9999 不在线（记录应被移除）。
+      return Promise.resolve({ stdout: JSON.stringify([browser("aaaa1111"), browser("bbbb2222"), browser("zzzz9999")]), exitCode: 0 });
+    }
+    return runner(args, options);
+  };
+  const time = clock();
+  const report = await checkinAll(home, spy, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    maxRetries: 0,
+    closeLeftover: true,
+    windowSize: 0,
+    ...time,
+    dbFile: tempDb(t),
+  });
+  assert.deepEqual(closed, ["zzzz9999"], "只清追踪里的遗留实例，账号自己的实例一下都不碰");
+  assert.deepEqual(report.leftoverCleanup, { tracked: 2, closed: 1, dropped: 1, failed: 0 });
+  assert.deepEqual((await readLeftovers(home)).instances, [], "两条记录都应有归宿");
 });

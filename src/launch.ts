@@ -6,6 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { isEdge, listBrowsers, protocolSupported, readStore, updateStore, withStoreLock, ZenxError } from "./core.ts";
 import type { Account, Runner, Store } from "./core.ts";
 import { isLaunchConfig } from "./launch-config.ts";
+import { clearLaunchedInstance, markLeftoverCloseError, readLeftovers } from "./leftover.ts";
 import { isTabId, inspectAgentRouter, openAgentRouter } from "./site.ts";
 import { readProfileAccount } from "./profile-account.ts";
 import { detectProfile, listEdgeWindowTitles } from "./window-titles.ts";
@@ -247,18 +248,46 @@ export async function closeBrowser(
   const remaining = deadlineBudget(timeoutMs, dependencies);
   const store = await readStore(home);
   const account = findAccount(store, alias);
+  let result: CloseReply;
+  try {
+    result = await closeOnlineInstance(run, account.instanceId, remaining, account.alias);
+  } catch (error) {
+    // 失败也要如实回写追踪：离线 = 无可关，记录清除；其他失败 = 留下原因，close-leftover 还会再试。
+    if (error instanceof ZenxError && error.code === "INSTANCE_OFFLINE") {
+      await clearLaunchedInstance(home, account.alias, account.instanceId);
+    } else {
+      const message = error instanceof ZenxError ? `${error.code}: ${error.message}` : error instanceof Error ? error.message : "关闭失败。";
+      await markLeftoverCloseError(home, account.alias, account.instanceId, message);
+    }
+    throw error;
+  }
+  // 关闭确认后顺带清掉遗留追踪（若这个实例是 zenx 之前拉起的）。
+  await clearLaunchedInstance(home, account.alias, account.instanceId);
+  return { ok: true, alias: account.alias, instanceId: account.instanceId, ...result, identity: "not_verified" };
+}
+
+type CloseReply = {
+  browser_id: string;
+  closed: boolean;
+  windows_closed: number;
+  sessions_stopped: number;
+  disconnected: boolean;
+};
+
+/** closeBrowser 与 closeInstanceById 共用的关闭体：在线与兼容性检查 + 一次 close 调用。 */
+async function closeOnlineInstance(run: Runner, instanceId: string, remaining: () => number, alias?: string): Promise<CloseReply> {
   const browsers = await listBrowsers(run, {
     timeoutMs: Math.min(60_000, remaining()),
     env: { BSK_BROWSER_WAIT_MS: "0" },
   });
   remaining();
-  const browser = browsers.find((item) => item.instance_id === account.instanceId);
-  if (!browser) throw new ZenxError("INSTANCE_OFFLINE", "目标实例未在线：没有可关闭的 Edge；未调用关闭，也不会改选其他实例。", { alias: account.alias });
+  const browser = browsers.find((item) => item.instance_id === instanceId);
+  if (!browser) throw new ZenxError("INSTANCE_OFFLINE", "目标实例未在线：没有可关闭的 Edge；未调用关闭，也不会改选其他实例。", alias ? { alias } : undefined);
   if (!isEdge(browser)) throw new ZenxError("NOT_EDGE", "目标实例不是 Microsoft Edge；不会关闭。");
   if (!protocolSupported(browser)) throw new ZenxError("UNSUPPORTED_PROTOCOL", "目标扩展协议不兼容；当前仅支持 1.0 / 1.1 / 1.3，不会关闭。");
   remaining();
   const reply = await run(
-    ["browsers", "close", "--browser-id", account.instanceId, "--confirm", "--json"],
+    ["browsers", "close", "--browser-id", instanceId, "--confirm", "--json"],
     { timeoutMs: Math.min(60_000, remaining()) },
   );
   if (reply.exitCode !== 0) {
@@ -270,13 +299,148 @@ export async function closeBrowser(
       throw new ZenxError(
         "CLOSE_NOT_SUPPORTED",
         "该实例的扩展未实现 browser.close；未关闭任何窗口。",
-        { alias: account.alias, ...(detail ? { detail } : {}) },
+        { ...(alias ? { alias } : {}), ...(detail ? { detail } : {}) },
       );
     }
     throw new ZenxError("BSK_FAILED", "bsk 未能确认浏览器已关闭；关闭可能已生效，不会自动重试，请用 zenx accounts check 核对。", detail ? { detail } : undefined);
   }
-  const result = parseCloseReply(reply.stdout, account.instanceId);
-  return { ok: true, alias: account.alias, instanceId: account.instanceId, ...result, identity: "not_verified" };
+  return parseCloseReply(reply.stdout, instanceId);
+}
+
+/**
+ * 按精确实例 ID 关闭（不要求它绑定在任何账号上）。供 close-leftover 使用：
+ * 遗留记录里的实例可能已不在绑定关系里，但它确实是 zenx 拉起的。
+ * 安全措施与 closeBrowser 相同：只认精确 ID，离线/非 Edge/协议不符直接报错，不改选。
+ */
+export async function closeInstanceById(
+  run: Runner,
+  instanceId: string,
+  timeoutMs: number = 45_000,
+  dependencies: LaunchDependencies = {},
+): Promise<CloseReply & { ok: true }> {
+  const remaining = deadlineBudget(timeoutMs, dependencies);
+  const result = await closeOnlineInstance(run, instanceId, remaining);
+  return { ok: true, ...result };
+}
+
+export type CloseAllOutcome = {
+  alias: string;
+  instanceId: string;
+  status: "closed" | "offline" | "failed";
+  windowsClosed?: number;
+  sessionsStopped?: number;
+  code?: string;
+  message?: string;
+};
+
+/**
+ * 逐个关闭全部绑定账号的 Edge 实例（zenx accounts close-all）。
+ *
+ * 与批量签到末尾的释放不同，这是用户显式发起的清仓：不管实例是不是本轮拉起的。
+ * 单个失败（旧扩展不认识 browser.close、bsk 未确认等）不中断后续账号，
+ * 全部如实汇总；离线的跳过并顺带清掉它的遗留追踪记录。
+ */
+export async function closeAllBrowsers(
+  home: string,
+  run: Runner,
+  timeoutMs: number = 45_000,
+  dependencies: LaunchDependencies = {},
+  onProgress: (line: string) => void = () => undefined,
+): Promise<{ ok: boolean; total: number; closed: number; offline: number; failed: number; accounts: CloseAllOutcome[] }> {
+  const store = await readStore(home);
+  const accounts: CloseAllOutcome[] = [];
+  for (const account of store.accounts) {
+    try {
+      const reply = await closeBrowser(home, run, account.alias, timeoutMs, dependencies);
+      if (reply.disconnected) {
+        accounts.push({ alias: account.alias, instanceId: account.instanceId, status: "closed", windowsClosed: reply.windows_closed, sessionsStopped: reply.sessions_stopped });
+        onProgress(`${account.alias}: 已关闭（窗口 ${reply.windows_closed}，会话 ${reply.sessions_stopped}）`);
+      } else {
+        accounts.push({ alias: account.alias, instanceId: account.instanceId, status: "failed", code: "STILL_CONNECTED", message: "实例仍处于连接状态；未关闭。" });
+        onProgress(`${account.alias}: 关闭未确认（实例仍在线）`);
+      }
+    } catch (error) {
+      // 离线/失败的追踪回写已在 closeBrowser 内完成，这里只汇总。
+      if (error instanceof ZenxError && error.code === "INSTANCE_OFFLINE") {
+        accounts.push({ alias: account.alias, instanceId: account.instanceId, status: "offline" });
+        onProgress(`${account.alias}: 实例不在线，无需关闭`);
+        continue;
+      }
+      const code = error instanceof ZenxError ? error.code : "COMMAND_FAILED";
+      const message = error instanceof Error ? error.message : "关闭失败。";
+      accounts.push({ alias: account.alias, instanceId: account.instanceId, status: "failed", code, message });
+      onProgress(`${account.alias}: 关闭失败（${code}: ${message}）`);
+    }
+  }
+  const closed = accounts.filter((item) => item.status === "closed").length;
+  const offline = accounts.filter((item) => item.status === "offline").length;
+  const failed = accounts.filter((item) => item.status === "failed").length;
+  return { ok: failed === 0, total: accounts.length, closed, offline, failed, accounts };
+}
+
+export type LeftoverOutcome = {
+  alias: string;
+  instanceId: string;
+  status: "closed" | "offline" | "rebound" | "failed";
+  code?: string;
+  message?: string;
+};
+
+/**
+ * 关闭遗留追踪里"zenx 拉起但没关掉"的实例（zenx accounts close-leftover）。
+ *
+ * 每条记录三种归宿：
+ * - 实例还在线 → 按记录里的精确 ID 关闭，确认后移除记录；
+ * - 实例已离线 → 没什么可关的，直接移除记录（dropped）；
+ * - 实例 ID 已改绑给其他账号 → 它不再是无主遗留，绝不动它，只移除记录（rebound）。
+ * 关闭失败（如旧扩展不认识 browser.close）保留记录并写上原因，下次还会再试。
+ */
+export async function closeLeftoverInstances(
+  home: string,
+  run: Runner,
+  timeoutMs: number = 45_000,
+  dependencies: LaunchDependencies = {},
+  onProgress: (line: string) => void = () => undefined,
+): Promise<{ ok: boolean; tracked: number; closed: number; dropped: number; failed: number; instances: LeftoverOutcome[] }> {
+  const state = await readLeftovers(home);
+  const store = await readStore(home);
+  const instances: LeftoverOutcome[] = [];
+  for (const entry of state.instances) {
+    const bound = store.accounts.find((account) => account.instanceId === entry.instanceId);
+    if (bound && bound.alias !== entry.alias) {
+      await clearLaunchedInstance(home, entry.alias, entry.instanceId);
+      instances.push({ alias: entry.alias, instanceId: entry.instanceId, status: "rebound" });
+      onProgress(`${entry.alias}: 实例已改绑给 ${bound.alias}，跳过并移除记录`);
+      continue;
+    }
+    try {
+      const reply = await closeInstanceById(run, entry.instanceId, timeoutMs, dependencies);
+      if (reply.disconnected) {
+        await clearLaunchedInstance(home, entry.alias, entry.instanceId);
+        instances.push({ alias: entry.alias, instanceId: entry.instanceId, status: "closed" });
+        onProgress(`${entry.alias}: 遗留实例已关闭（窗口 ${reply.windows_closed}，会话 ${reply.sessions_stopped}）`);
+      } else {
+        await markLeftoverCloseError(home, entry.alias, entry.instanceId, "实例仍处于连接状态；未关闭。");
+        instances.push({ alias: entry.alias, instanceId: entry.instanceId, status: "failed", code: "STILL_CONNECTED", message: "实例仍处于连接状态；未关闭。" });
+        onProgress(`${entry.alias}: 遗留实例关闭未确认（仍在线）`);
+      }
+    } catch (error) {
+      if (error instanceof ZenxError && error.code === "INSTANCE_OFFLINE") {
+        await clearLaunchedInstance(home, entry.alias, entry.instanceId);
+        instances.push({ alias: entry.alias, instanceId: entry.instanceId, status: "offline" });
+        onProgress(`${entry.alias}: 遗留实例已不在线，移除记录`);
+        continue;
+      }
+      const code = error instanceof ZenxError ? error.code : "COMMAND_FAILED";
+      const message = error instanceof Error ? error.message : "关闭失败。";
+      await markLeftoverCloseError(home, entry.alias, entry.instanceId, `${code}: ${message}`);
+      instances.push({ alias: entry.alias, instanceId: entry.instanceId, status: "failed", code, message });
+      onProgress(`${entry.alias}: 遗留实例关闭失败（${code}: ${message}）`);
+    }
+  }
+  const closed = instances.filter((item) => item.status === "closed").length;
+  const failed = instances.filter((item) => item.status === "failed").length;
+  return { ok: failed === 0, tracked: state.instances.length, closed, dropped: instances.length - closed - failed, failed, instances };
 }
 
 export async function openSite(

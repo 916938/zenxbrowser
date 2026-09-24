@@ -8,7 +8,9 @@ import { creditedTodayAliases } from "./db.ts";
 import type { LaunchDependencies } from "./launch.ts";
 import { checkinAccount } from "./checkin.ts";
 import type { CheckinResult } from "./checkin.ts";
-import { closeBrowser, ensureOnline } from "./launch.ts";
+import { closeBrowser, closeLeftoverInstances, ensureOnline } from "./launch.ts";
+import { recordLaunchedInstance } from "./leftover.ts";
+import { enrichBskTimeout } from "./diagnose.ts";
 
 /**
  * 站点登录限流后的默认冷却时间。站点约 10 分钟恢复，脚本取 15 分钟留余量。
@@ -75,6 +77,8 @@ export type CheckinBatchReport = {
   skippedAlreadyCredited: number;
   accounts: AccountOutcome[];
   stateFile: string;
+  /** 开跑前的遗留实例清理汇总（仅 --close-leftover 时存在）。 */
+  leftoverCleanup?: { tracked: number; closed: number; dropped: number; failed: number };
 };
 
 /**
@@ -132,6 +136,12 @@ export type CheckinBatchOptions = {
    * 关掉它会连标签页和未保存内容一起带走。
    */
   closeAfter?: boolean;
+  /**
+   * 开跑前先清理遗留实例：上一轮 zenx 拉起但没关掉的 Edge（记录在
+   * leftover-instances.json），本轮只会被当成"用户自己的 Edge"永远保留。
+   * 显式开启才会动它们——这些窗口现在可能有用户内容。
+   */
+  closeLeftover?: boolean;
   /** ensure-online 的依赖注入（测试替身）。 */
   launchDependencies?: LaunchDependencies;
   /** 同时在线的账号上限（默认 8）：一组签完就关掉再拉下一组，压住内存峰值；0 表示不分组。 */
@@ -192,7 +202,7 @@ async function releaseInstance(
     return { closed: false, error: "实例仍处于连接状态；未关闭。" };
   } catch (error) {
     const message = error instanceof ZenxError ? `${error.code}: ${error.message}` : error instanceof Error ? error.message : "关闭失败。";
-    onProgress(`${alias}: 释放实例失败（${message}）；可稍后用 zenx accounts close 处理。`);
+    onProgress(`${alias}: 释放实例失败（${message}）；可稍后用 zenx accounts close 或 close-leftover 处理。`);
     return { closed: false, error: message };
   }
 }
@@ -293,6 +303,17 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
       continue;
     }
     todo.push(account);
+  }
+
+  // 开跑前先清上一轮遗留：那些实例是 zenx 拉起的，只是上次没关掉——不清的话，
+  // 本轮它们会被认成"用户自己的 Edge"而继续占着内存（还可能是卡死超时的根源）。
+  let leftoverCleanup: CheckinBatchReport["leftoverCleanup"];
+  if (options.closeLeftover === true) {
+    const cleanup = await closeLeftoverInstances(home, run, DEFAULT_CLOSE_TIMEOUT_MS, options.launchDependencies, onProgress);
+    leftoverCleanup = { tracked: cleanup.tracked, closed: cleanup.closed, dropped: cleanup.dropped, failed: cleanup.failed };
+    if (cleanup.tracked > 0) {
+      onProgress(`遗留实例清理：追踪 ${cleanup.tracked} 个，关闭 ${cleanup.closed} 个，移除记录 ${cleanup.dropped} 个，失败 ${cleanup.failed} 个`);
+    }
   }
 
   const groups = windowSize > 0 ? chunkAccounts(todo, windowSize) : [todo];
@@ -428,6 +449,7 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
     skippedAlreadyCredited: accounts.filter((item) => item.skipped === "already_credited_today" && item.attempts === 0).length,
     accounts,
     stateFile: file,
+    ...(leftoverCleanup ? { leftoverCleanup } : {}),
   };
 }
 
@@ -466,12 +488,16 @@ async function runOne(
   try {
     const online = await ensureOnline(home, run, account.alias, context.ensureTimeoutMs ?? 60_000, context.launchDependencies);
     launched = online.launched === true;
+    // zenx 拉起的实例立刻落盘：这一步之后无论签到成败、关闭成败，
+    // close-leftover 都能在事后识别出"这是 zenx 该负责的窗口"。
+    if (launched) await recordLaunchedInstance(home, account.alias, online.instanceId);
   } catch (error) {
+    const enriched = await enrichBskTimeout(error, run, { instanceId: account.instanceId });
     return {
       ...base,
       ok: false,
-      code: error instanceof ZenxError ? error.code : "COMMAND_FAILED",
-      message: error instanceof Error ? error.message : "无法拉起 Edge。",
+      code: enriched instanceof ZenxError ? enriched.code : "COMMAND_FAILED",
+      message: enriched instanceof Error ? enriched.message : "无法拉起 Edge。",
     };
   }
   try {
@@ -496,8 +522,9 @@ async function runOne(
       message: result.code === "CHECKIN_UNCONFIRMED" ? "流程跑完但未确认到账；用 zenx accounts recheck 核对。" : undefined,
     };
   } catch (error) {
-    const code = error instanceof ZenxError ? error.code : "COMMAND_FAILED";
-    const message = error instanceof Error ? error.message : "签到失败。";
+    const enriched = await enrichBskTimeout(error, run, { instanceId: account.instanceId });
+    const code = enriched instanceof ZenxError ? enriched.code : "COMMAND_FAILED";
+    const message = enriched instanceof Error ? enriched.message : "签到失败。";
     const rateLimited = retryCodes.has(code) && context.attempt <= maxRetries;
     return { ...base, launched, ok: false, code, message, rateLimited };
   }
