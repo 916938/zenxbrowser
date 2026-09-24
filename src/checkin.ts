@@ -777,8 +777,28 @@ async function runCheckinSteps(
 
   // ⑤ 记录退出前余额。登出态自救的账号没有"退出前"这一说——本次登录就是发放动作，
   // 对照组只能取账本里今天开始前的余额。
-  const baselineBalance = restoredByLogin ? readBaselineBalance() : null;
+  const baselineBalance = readBaselineBalance();
   const balanceBefore = restoredByLogin ? baselineBalance : extractBalance(page);
+
+  // ⑤d 今日额度在本次运行之前就已发放（当前余额相对"今天开始前"的基线已增长 ≥ 每日额度）
+  // → 收工：不退出重登，也不判 CHECKIN_UNCONFIRMED。
+  // 站点是"登录即发放"：当天早些时候任何一次登录（哪怕是半途失败的 LOGIN_TIMEOUT /
+  // LOGOUT_FAILED）都会把额度发掉。等 zenx 再跑"退出→重登"，重登不会二次发放，本次
+  // 运行内余额必然纹丝不动——只认"本次运行期间增长"的话，这类账号会永远
+  // CHECKIN_UNCONFIRMED、pending 永远清不掉，还要白白再耗一次站点登录配额
+  // （连续约 10 次就触发共享限流）。判据与 recheck 一致，误判上限是"当天有人充过值"。
+  if (force !== true && !restoredByLogin && baselineBalance !== null && balanceBefore !== null &&
+      balanceBefore - baselineBalance >= DAILY_CREDIT) {
+    return {
+      ok: true,
+      alias: account.alias,
+      instanceId: account.instanceId,
+      identity: account.expectedIdentity,
+      balanceBefore: baselineBalance,
+      balanceAfter: balanceBefore,
+      checkinCredited: true,
+    };
+  }
 
   // ⑤b 站点自己显示"今日已签到" → 不必再退出重登，直接跳过（--force 可强制）。
   if (force !== true && alreadyCheckedIn(page)) {

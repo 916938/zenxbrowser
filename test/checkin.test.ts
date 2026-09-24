@@ -1429,3 +1429,57 @@ test("checkin 失败时即使 --close-after 也保留实例（账号可能停在
   );
   assert.equal(spy.closes.length, 0, "失败要留着窗口供人工处理");
 });
+
+// ---------------------------------------------------------------------------
+// 站点是"登录即发放"：当天的额度可能在 zenx 这次运行之前就被某次登录发掉了。
+// 只认"本次运行期间余额必须增长"的话，这类账号会永远 CHECKIN_UNCONFIRMED、
+// pending 永远清不掉，还要再白耗一次登录配额。
+// ---------------------------------------------------------------------------
+
+test("checkin 今日额度已在本次运行前发放 → 确认到账，不再退出重登", async (t) => {
+  const home = await fixture(t);
+  const d = deps();
+  seedBaseline(d.dbFile, 555.18); // 今天开始前的余额
+  const script = scriptRunner({ observes: [reply(observeDashboard("$580.18"))] });
+  const report = await checkinAccount(home, script.run, "work", 180_000, d);
+  assert.equal(report.ok, true);
+  assert.equal(report.checkinCredited, true, "钱已经到账了，不该报未确认");
+  assert.equal(report.balanceBefore, 555.18);
+  assert.equal(report.balanceAfter, 580.18);
+  assert.equal((report as { skipped?: string }).skipped, undefined, "要入账，pending 才会清掉");
+  assert.ok(!script.calls.some((args) => args[0] === "hover"), "不得再展开用户菜单");
+  assert.ok(!script.calls.some((args) => args[0] === "click"), "不得点击退出");
+  assertStopped(script);
+  const saved = listCheckins({}, d.dbFile);
+  const creditedRows = saved.filter((row) => row.credited);
+  assert.equal(creditedRows.length, 1, "只有今天这条是到账记录（基线那条是 credited=false）");
+  assert.equal(creditedRows[0].balanceBefore, 555.18);
+  assert.equal(creditedRows[0].balanceAfter, 580.18);
+  assert.equal(creditedRows[0].errorCode, null);
+});
+
+test("checkin 余额与基线持平 → 不走该判定，照常退出重登（不漏跑）", async (t) => {
+  const home = await fixture(t);
+  const d = deps();
+  seedBaseline(d.dbFile, 555.18);
+  const script = scriptRunner({ observes: happyObserves() });
+  const report = await checkinAccount(home, script.run, "work", 180_000, d);
+  assert.equal(report.ok, true);
+  assert.equal(report.checkinCredited, true);
+  assert.equal(report.balanceAfter, 580.18);
+  assert.ok(script.calls.some((args) => args[0] === "hover"), "没涨就该照常走完整流程");
+  assertStopped(script);
+});
+
+test("checkin --force 时不做“今日已到账”判定（确需重跑就不拦）", async (t) => {
+  const home = await fixture(t);
+  const d = deps();
+  seedBaseline(d.dbFile, 555.18);
+  const script = scriptRunner({
+    observes: [reply(observeDashboard("$580.18")), reply(observeMenuOpen), reply(observeLoggedOut), reply(observeLanding), reply(observeDashboard("$580.18"))],
+  });
+  const report = await checkinAccount(home, script.run, "work", 180_000, { ...d, force: true });
+  assert.ok(script.calls.some((args) => args[0] === "hover"), "--force 必须真的走退出重登");
+  assert.equal((report as { code?: string }).code, "CHECKIN_UNCONFIRMED", "重登不会二次发放，如实报未确认");
+  assertStopped(script);
+});
