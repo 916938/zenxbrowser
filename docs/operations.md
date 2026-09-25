@@ -270,7 +270,7 @@ node -e "console.log(require('fs').readFileSync('D:/916938/browserskill-new/apps
 
 | 症状 | 原因与处理 |
 |---|---|
-| `STORE_BUSY` | 账号锁 `.zenx\accounts.lock` 残留（进程被中断所致）。用 `node -e "require('fs').rmSync('.zenx/accounts.lock',{recursive:true,force:true})"` 清掉 —— **别用 PowerShell `Remove-Item`**，它会走环境的删除钩子、经常超时。 |
+| `STORE_BUSY` | 另一个 zenx 进程正持有账号锁（锁里 `owner.json` 记录的 PID 仍存活）——等它结束再重试。**崩溃残留的锁从 2026-09-26 起会被自动回收**，看到这条说明真有 zenx 在跑；若确认没有却仍反复出现，说明 PID 被无关进程复用，用 `node -e "require('fs').rmSync('.zenx/accounts.lock',{recursive:true,force:true})"` 人工清一次 —— **别用 PowerShell `Remove-Item`**，它会走环境的删除钩子、经常超时。 |
 | `zenx accounts close` 报 `BSK_FAILED: bsk 未能确认浏览器已关闭` | 该 Edge 进程加载的扩展构建里没有 `browser.close`（通常是构建后没重启 Edge）。按上一节重建扩展并重启；急着收尾就用 `scripts\edge-window.ps1 -Action Close` 兜底（关窗后 Edge 进程会后台驻留十几秒才退出，稍等即可，不用杀进程）。 |
 | 账号一直 `offline`，`ensure-online` 也拉不回 | Edge 重启后扩展实例 ID 变了。用 `zenx accounts relink-account <别名> --confirm`（按账号锚点定位，不受 Profile 改名影响；本机多个 Profile 被改名过，Default 显示为 `3`、Profile 3 显示为 `916938 13`）。 |
 | `accounts.json` 损坏导致所有命令报 `INVALID_STORE` | `readStore` 要求 alias 与 instanceId 均唯一，重复就全挂。手工编辑后务必 `zenx accounts check` 验证。 |

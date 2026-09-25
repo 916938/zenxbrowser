@@ -8,7 +8,7 @@ import { EventEmitter } from "node:events";
 import { syncBuiltinESMExports } from "node:module";
 import { checkAccounts, createRunner, readStore, withStoreLock, ZenxError } from "../src/core.ts";
 import type { Account, Browser, Runner } from "../src/core.ts";
-import { closeBrowser, configureLaunch, ensureOnline } from "../src/launch.ts";
+import { closeBrowser, configureLaunch, ensureOnline, MIN_FREE_MEMORY_BYTES } from "../src/launch.ts";
 import type { LaunchConfig } from "../src/launch.ts";
 
 const edge: Browser = {
@@ -188,6 +188,32 @@ test("离线只启动一次，准确传配置、查询预算和零等待环境",
   assert.deepEqual(time.sleeps, [500]);
 });
 
+// 内存见底时再拉起一个 Edge，结果是浏览器和 zenx 一起被拖死：V8 致命错误无法被
+// try/catch 拦住，整轮签到剩下的账号全丢。宁可让这一个账号失败，批次继续跑。
+test("可用内存低于门槛时不拉起 Edge，水位够了照常拉起", windows, async (t) => {
+  const { home, config } = await fixture(t);
+  await configureLaunch(home, "work", config, true);
+  await assert.rejects(
+    ensureOnline(home, offline, "work", 2000, {
+      now: () => 0,
+      freeMemory: () => MIN_FREE_MEMORY_BYTES - 1,
+      launch: async () => { assert.fail("内存不足时不应启动"); },
+    }),
+    (error: unknown) => error instanceof ZenxError && error.code === "LOW_MEMORY",
+  );
+  const error = new ZenxError("LOW_MEMORY", "x", { alias: "work" });
+  assert.match(error.hint ?? "", /close-all/, "hint 必须给出能立刻执行的下一步");
+
+  let calls = 0;
+  const run: Runner = async () => ({ stdout: JSON.stringify(++calls === 2 ? [edge] : []), exitCode: 0 });
+  await ensureOnline(home, run, "work", 2000, {
+    now: () => 0,
+    freeMemory: () => MIN_FREE_MEMORY_BYTES,
+    launch: async () => undefined,
+  });
+  assert.equal(calls, 2, "阈值是低于才拦，等于不拦");
+});
+
 test("同名标签或其他实例在线仍超时，保留浏览器且不重复启动", windows, async (t) => {
   const { home, config } = await fixture(t);
   await configureLaunch(home, "work", config, true);
@@ -234,7 +260,7 @@ test("启动失败明确报错且释放锁，非 Windows 不启动", windows, as
   assert.equal((await ensureOnline(home, online, "work")).launched, false);
 });
 
-test("启动中配置与第二次启动互斥，旧锁不自动删除", windows, async (t) => {
+test("启动中配置与第二次启动互斥，活锁不回收、死锁自动回收", windows, async (t) => {
   const { home, config } = await fixture(t);
   await configureLaunch(home, "work", config, true);
   const entered = Promise.withResolvers<void>();
@@ -254,9 +280,27 @@ test("启动中配置与第二次启动互斥，旧锁不自动删除", windows,
   await withStoreLock(home, async () => {
     await assert.rejects(ensureOnline(home, online, "work"), { code: "STORE_BUSY" });
   });
+
+  // 崩溃残留的锁（没有持有者信息）会被自动回收，不再挡住后续命令。
   await mkdir(join(home, "accounts.lock"));
+  await configureLaunch(home, "work", config, true);
+  assert.ok(!(await readdir(home)).includes("accounts.lock"));
+
+  // 持有者已死（PID 不存在）的锁同样被自动回收。
+  const dead = childProcess.spawn(process.execPath, ["-e", ""]);
+  const deadPid = dead.pid!;
+  await new Promise((resolve) => dead.once("exit", resolve));
+  await mkdir(join(home, "accounts.lock"));
+  await writeFile(join(home, "accounts.lock", "owner.json"), JSON.stringify({ pid: deadPid, at: "2026-09-26T01:19:05.000Z" }));
+  await configureLaunch(home, "work", config, true);
+  assert.ok(!(await readdir(home)).includes("accounts.lock"));
+
+  // 持有者还活着的锁照旧报忙，绝不动它。
+  await mkdir(join(home, "accounts.lock"));
+  await writeFile(join(home, "accounts.lock", "owner.json"), JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
   await assert.rejects(configureLaunch(home, "work", config, true), { code: "STORE_BUSY" });
   assert.ok((await readdir(home)).includes("accounts.lock"));
+  await rm(join(home, "accounts.lock"), { recursive: true, force: true });
 });
 
 test("实际启动函数使用精确无 shell 参数，零退出交接不等于连接成功", windows, async (t) => {

@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { realpath, stat } from "node:fs/promises";
+import { freemem } from "node:os";
 import { win32 } from "node:path";
 import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
@@ -23,7 +24,19 @@ export type LaunchDependencies = {
   listWindowTitles?: () => Promise<string[]>;
   /** 读取 Profile 账号锚点的钩子；默认读 `Preferences` 的 account_id。 */
   readProfileAccount?: (userDataDir: string, profileDirectory: string) => Promise<{ accountId: string; profileName: string }>;
+  /** 可用物理内存（字节）的读取钩子；默认 `os.freemem()`，测试据此注入。 */
+  freeMemory?: () => number;
 };
+
+/**
+ * 拉起新 Edge 前要求的最低可用物理内存。
+ *
+ * 一个 Edge Profile 起步就是几百 MB（浏览器进程 + 渲染进程 + GPU 进程），批量签到
+ * 又是一次在线好几个。内存见底时再拉起一个，结果是浏览器和 zenx 一起被拖死：
+ * zenx 这边表现为 V8 致命错误（进程直接消失，try/catch 拦不住），整轮剩余账号全丢。
+ * 因此在"拉起"之前先量一次水位，不够就报 LOW_MEMORY 让该账号失败、批次继续跑。
+ */
+export const MIN_FREE_MEMORY_BYTES = 1024 ** 3;
 
 export function findAccount(store: Store, alias: string): Account {
   const account = store.accounts.find((item) => item.alias === alias);
@@ -35,9 +48,24 @@ function normalizePath(path: string): string {
   return win32.normalize(path).replace(/[\\/]+$/, "").toLowerCase();
 }
 
+/** 包含判定的规范化：统一分隔符、去掉末尾分隔符、折叠大小写。 */
+function canonical(path: string): string {
+  return path.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+}
+
+/**
+ * child 是否为 root 的直接或间接子项（root 自身不算）。
+ *
+ * 刻意不用 `win32.relative`：它内部会走 `win32.resolve`，为两条普通路径造出一串
+ * 临时字符串。批量签到跑到十几个 Edge 实例时内存本就吃紧，实测进程正是在这一行
+ * 被 V8 判死（连 OOM 的报错对象都分配不出来，进程直接消失）。判定只需要"是不是
+ * 子路径"，比较规范化后的前缀即可，零额外分配。
+ */
 function contained(root: string, child: string): boolean {
-  const relative = win32.relative(root, child);
-  return relative !== "" && relative !== ".." && !relative.startsWith("..\\") && !win32.isAbsolute(relative);
+  const base = canonical(root);
+  const target = canonical(child);
+  if (base === "" || target.length <= base.length + 1) return false;
+  return target.startsWith(base) && target[base.length] === "\\";
 }
 
 async function validatePaths(config: LaunchConfig): Promise<void> {
@@ -162,6 +190,16 @@ async function ensureOnlineLocked(store: Store, account: Account, run: Runner, r
     }
     if (!launched) {
       if (!account.launch) throw new ZenxError("LAUNCH_NOT_CONFIGURED", "目标实例离线且尚未配置启动路径；请明确配置既有 Edge Profile 后重试。");
+      // 先量内存再动手：拉起 Edge 是这一步最贵的操作，内存见底时拉起只会把浏览器
+      // 和 zenx 一起拖死（V8 致命错误无法捕获，整轮签到全丢）。宁可让这个账号失败。
+      const free = (dependencies.freeMemory ?? freemem)();
+      if (!(free >= MIN_FREE_MEMORY_BYTES)) {
+        throw new ZenxError(
+          "LOW_MEMORY",
+          `可用物理内存约 ${Math.round(free / 1024 / 1024)} MB，低于 ${Math.round(MIN_FREE_MEMORY_BYTES / 1024 / 1024)} MB 门槛；未拉起该 Profile 的 Edge。`,
+          { alias: account.alias },
+        );
+      }
       if ((dependencies.platform ?? process.platform) !== "win32") throw new ZenxError("UNSUPPORTED_PLATFORM", "按需启动目前仅支持 Windows；不会启动其他平台浏览器。");
       await validatePaths(account.launch);
       await rejectSharedProfile(store, account.alias, account.launch);

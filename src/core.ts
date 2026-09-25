@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { isLaunchConfig } from "./launch-config.ts";
 import type { LaunchConfig } from "./launch-config.ts";
 import { hintFor } from "./hints.ts";
@@ -189,14 +190,71 @@ export async function readStore(home: string): Promise<Store> {
   }
 }
 
+/** 持有者信息写不进锁里时，等这么久再看一次（正常只差微秒），仍没有就按残留锁回收。 */
+const STORE_LOCK_STALE_WAIT_MS = 250;
+
+/** 锁持有者的落盘信息：PID 用于判断上次进程是不是死透了，at 便于人工对账。 */
+type StoreLockOwner = { pid: number; at: string };
+
+/** 读持有者；文件缺失、内容损坏或 PID 非法都返回 null。 */
+async function readLockOwner(ownerFile: string): Promise<StoreLockOwner | null> {
+  try {
+    const value: unknown = JSON.parse(await readFile(ownerFile, "utf8"));
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+    const pid = (value as { pid?: unknown }).pid;
+    if (!Number.isSafeInteger(pid) || (pid as number) < 1) return null;
+    const at = (value as { at?: unknown }).at;
+    return { pid: pid as number, at: typeof at === "string" ? at : "" };
+  } catch {
+    return null;
+  }
+}
+
+/** PID 是否对应活着的进程：EPERM 是"存在但无权发信号"，只有 ESRCH 才说明已死。 */
+function pidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+}
+
+function storeBusy(owner: StoreLockOwner | null): ZenxError {
+  const who = owner ? `（持有者 PID ${owner.pid}${owner.at ? `，加锁于 ${owner.at}` : ""}）` : "";
+  return new ZenxError("STORE_BUSY", `另一个 ZenX 进程正在使用账号配置${who}；等它结束后再重试。`);
+}
+
+/**
+ * 互斥锁：mkdir 原子占位，owner.json 记录持有者 PID。
+ *
+ * 为什么带 PID：进程被强杀或崩溃（比如内存耗尽时 V8 直接把进程终结）时 finally
+ * 不会执行，锁目录就永远留下，之后的每一次运行都被它挡死——2026-09-26 凌晨就是
+ * 这样：一轮签到崩在半途，此后所有命令全部 STORE_BUSY，只能人工删锁。现在凭
+ * PID 判断持有者：已死（ESRCH）就回收残留锁照常继续；活着才报 STORE_BUSY。
+ * 持有者死了但 PID 恰好被无关进程复用时仍会误报忙——保守方向，宁可误报也不抢锁。
+ */
 export async function withStoreLock<T>(home: string, action: () => Promise<T>): Promise<T> {
   await mkdir(home, { recursive: true, mode: 0o700 });
   const lock = join(home, "accounts.lock");
-  try { await mkdir(lock); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new ZenxError("STORE_BUSY", "账号配置或启动正在进行，或留有锁；确认没有其他 ZenX 进程后再人工清理锁目录。");
-    throw error;
+  const ownerFile = join(lock, "owner.json");
+  try {
+    await mkdir(lock);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    let owner = await readLockOwner(ownerFile);
+    if (owner === null) {
+      // 持有者信息可能还没写完，稍等再看一次；仍没有就按残留锁回收。
+      await delay(STORE_LOCK_STALE_WAIT_MS);
+      owner = await readLockOwner(ownerFile);
+    }
+    if (owner !== null && pidAlive(owner.pid)) throw storeBusy(owner);
+    // 残留锁：清掉后重试。mkdir 是原子的，两个等待者同时回收也只会有一个成功。
+    await rm(lock, { recursive: true, force: true });
+    try {
+      await mkdir(lock);
+    } catch (retryError) {
+      if ((retryError as NodeJS.ErrnoException).code === "EEXIST") throw storeBusy(null);
+      throw retryError;
+    }
   }
+  await writeFile(ownerFile, `${JSON.stringify({ pid: process.pid, at: new Date().toISOString() })}\n`, { mode: 0o600 });
   try {
     return await action();
   } finally {

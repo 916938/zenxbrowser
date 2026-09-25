@@ -84,7 +84,7 @@ const HINTS: Record<string, HintTemplate> = {
 
   // --- 环境与配置 ---
   STORE_BUSY: {
-    text: "账号锁 .zenx\\accounts.lock 残留（进程被中断所致）。用 node -e \"require('fs').rmSync('.zenx/accounts.lock',{recursive:true,force:true})\" 清掉——别用 PowerShell Remove-Item，它会走环境删除钩子、经常超时。",
+    text: "另一个 zenx 进程正持有账号锁（持有者 PID 仍存活），等它结束再重试。崩溃残留的锁会被自动回收；若确认没有 zenx 在跑却反复出现，说明锁里的 PID 被无关进程复用了，用 node -e \"require('fs').rmSync('.zenx/accounts.lock',{recursive:true,force:true})\" 人工清一次——别用 PowerShell Remove-Item，它会走环境的删除钩子、经常超时。",
   },
   INVALID_STORE: {
     text: "账号文件损坏或存在重复（alias 与 instanceId 都必须唯一）。手工检查 .zenx\\accounts.json，改完务必跑 zenx accounts check 验证。",
@@ -106,6 +106,10 @@ const HINTS: Record<string, HintTemplate> = {
   },
   CHECKIN_TIMEOUT: {
     text: "总预算（默认 3 分钟）耗尽。用 --timeout 放宽到 5 分钟；若卡顿在登录环节，多半是站点限流，见 LOGIN_RATE_LIMITED。",
+  },
+  LOW_MEMORY: {
+    text: "本机 {alias} 的可用内存不足，已放弃拉起它的 Edge——继续拉会把浏览器和 zenx 一起拖死（V8 致命错误直接终结整轮签到）。先关掉不用的 Edge 窗口（zenx accounts close-all --confirm），或用 zenx accounts checkin-all --window 3 把同时在线上限调小后重跑。",
+    vars: ["alias"],
   },
 };
 

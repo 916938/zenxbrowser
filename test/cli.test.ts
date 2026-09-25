@@ -174,6 +174,8 @@ test("损坏、未来版本和重复配置均不覆盖", async (t) => {
 test("存在写锁时不修改账号文件", async (t) => {
   const home = await temporary(t);
   await mkdir(join(home, "accounts.lock"));
+  // 持有者 PID 仍存活（用本进程模拟）才会被挡住；崩溃残留锁会被自动回收。
+  await writeFile(join(home, "accounts.lock", "owner.json"), JSON.stringify({ pid: process.pid }));
   await assert.rejects(bindAccount(home, mock(), binding, true), { code: "STORE_BUSY" });
 });
 
