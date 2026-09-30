@@ -508,6 +508,8 @@ export type DailyTotal = {
   creditedSum: number;
   /** 当日实际到账的账号数。 */
   creditedAccounts: number;
+  /** 当日各账号消耗明细（快照优先，签到反推兜底），按消耗降序。 */
+  spentDetails?: { alias: string; spent: number; source: "snapshot" | "checkin" }[];
 };
 
 function localDay(iso: string): string {
@@ -642,6 +644,8 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
 
     /** day → 已有快照消耗数据的账号集合（避免与签到反推重复计数）。 */
     const snapshotSpentAliases = new Map<string, Set<string>>();
+    /** day → alias → 当日消耗明细。 */
+    const spentDetail = new Map<string, Map<string, { spent: number; source: "snapshot" | "checkin" }>>();
 
     for (const [alias, series] of points) {
       // 观测点按本地日压缩：同一天多次采集以最后一次为准。
@@ -673,6 +677,9 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
             let aliases = snapshotSpentAliases.get(observation.day);
             if (!aliases) { aliases = new Set(); snapshotSpentAliases.set(observation.day, aliases); }
             aliases.add(alias);
+            let dayDetail = spentDetail.get(observation.day);
+            if (!dayDetail) { dayDetail = new Map(); spentDetail.set(observation.day, dayDetail); }
+            dayDetail.set(alias, { spent: round2(delta), source: "snapshot" });
           }
         }
         previousSpent = observation.totalSpent;
@@ -716,10 +723,12 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
       const snapAliases = snapshotSpentAliases.get(day) ?? new Set<string>();
       let extraSpent = 0;
       let extraAccounts = 0;
+      const dayDetail = spentDetail.get(day) ?? new Map<string, { spent: number; source: "snapshot" | "checkin" }>();
       for (const [alias, spent] of checkinSpent) {
         if (snapAliases.has(alias)) continue;
         extraSpent += spent;
         extraAccounts += 1;
+        dayDetail.set(alias, { spent, source: "checkin" });
       }
       const totalSpentSum = (entry?.spentSum ?? 0) + extraSpent;
       const totalSpentAccounts = (entry?.spentAccounts ?? 0) + extraAccounts;
@@ -732,6 +741,10 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
         spentAccounts: totalSpentAccounts,
         creditedSum: round2(creditedSum),
         creditedAccounts: aliases.size,
+        spentDetails: dayDetail.size > 0
+          ? [...dayDetail.entries()].map(([alias, d]) => ({ alias, spent: d.spent, source: d.source }))
+              .sort((a, b) => b.spent - a.spent)
+          : undefined,
       };
     });
     const limit = options.days === undefined ? result.length : Math.max(0, Math.floor(options.days));

@@ -44,6 +44,7 @@ const page = `<!doctype html>
   th { color:var(--dim); font-weight:600; font-size:12px; background:#12151b }
   tr:last-child td { border-bottom:none }
   .ok { color:var(--ok) } .bad { color:var(--bad) }
+  .clickable { cursor:pointer } .clickable:hover { text-decoration:underline }
   .gain { color:var(--ok); font-weight:600 }
   .muted { color:var(--dim) }
   .empty { padding:32px; text-align:center; color:var(--dim) }
@@ -158,6 +159,7 @@ async function load() {
   ]) : '<div class="empty">还没有签到记录，先运行一次 <code>zenx accounts checkin</code> 吧。</div>';
 
   document.getElementById("daily").innerHTML = drawDaily(daily);
+  bindSpentDetail(daily);
 
   document.getElementById("ranges").innerHTML = drawRanges(ranges);
 
@@ -183,14 +185,55 @@ async function load() {
 
 function drawDaily(rows) {
   if (!rows.length) return '<div class="empty">还没有每日快照，先跑一次 <code>zenx accounts snapshot --all</code>。</div>';
-  const body = rows.slice().reverse().map(r => [
-    "<b>" + esc(r.day) + "</b>",
-    money(r.balanceSum),
-    spentCell(r.spentSum),
-    gain(r.creditedSum),
-    (r.balanceAccounts || 0) + " 个余额 / " + (r.spentAccounts || 0) + " 个消耗",
-  ]);
+  const body = rows.slice().reverse().map(r => {
+    const hasDetail = r.spentDetails && r.spentDetails.length;
+    const spentHtml = (r.spentSum === null || r.spentSum === undefined)
+      ? '<span class="muted">—</span>'
+      : hasDetail
+        ? '<span class="bad clickable" data-spent-day="' + esc(r.day) + '" title="点击展开各账号消耗明细">-$' + Number(r.spentSum).toFixed(2) + ' ▸</span>'
+        : '<span class="bad">-$' + Number(r.spentSum).toFixed(2) + '</span>';
+    return [
+      "<b>" + esc(r.day) + "</b>",
+      money(r.balanceSum),
+      spentHtml,
+      gain(r.creditedSum),
+      (r.balanceAccounts || 0) + " 个余额 / " + (r.spentAccounts || 0) + " 个消耗",
+    ];
+  });
   return table([["日期", "余额总额", "当日消耗", "当日签到到账", "覆盖账号"], ...body]);
+}
+
+/** 点击"当日消耗"展开/收起各账号消耗明细。 */
+function bindSpentDetail(daily) {
+  document.getElementById("daily").addEventListener("click", (e) => {
+    const el = e.target.closest("[data-spent-day]");
+    if (!el) return;
+    const day = el.dataset.spentDay;
+    const row = el.closest("tr");
+    const existing = row.nextElementSibling;
+    if (existing && existing.dataset.detailRow) {
+      existing.remove();
+      el.innerHTML = el.innerHTML.replace(" ▾", " ▸");
+      return;
+    }
+    const dayData = daily.find(d => d.day === day);
+    if (!dayData || !dayData.spentDetails) return;
+    const detailRow = document.createElement("tr");
+    detailRow.dataset.detailRow = "1";
+    const cell = document.createElement("td");
+    cell.colSpan = 5;
+    cell.style.cssText = "padding:8px 12px;background:#12151b";
+    cell.innerHTML = dayData.spentDetails.map(d =>
+      '<div style="display:flex;justify-content:space-between;padding:2px 0;gap:12px">' +
+      '<span>' + esc(d.alias) + '</span>' +
+      '<span class="bad">-$' + d.spent.toFixed(2) + '</span>' +
+      '<span class="muted" style="font-size:11px">' + (d.source === "snapshot" ? "快照" : "签到") + '</span>' +
+      '</div>'
+    ).join("");
+    detailRow.appendChild(cell);
+    row.after(detailRow);
+    el.innerHTML = el.innerHTML.replace(" ▸", " ▾");
+  });
 }
 
 function drawRanges(ranges) {
