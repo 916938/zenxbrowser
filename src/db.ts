@@ -515,12 +515,23 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
       "SELECT alias, time, balance, total_spent FROM balance_snapshots WHERE ok = 1 ORDER BY time, id",
     ).all() as { alias: string; time: string; balance: number | null; total_spent: number | null }[];
 
+    // 签到记录的 balance_after 也是余额观测点：用户每天跑 checkin-all 但不一定跑
+    // snapshot --all，只靠快照会让余额停留在最后一次快照的值（实测三天不变）。
+    // 合并时签到放前、快照放后：同一天的快照覆盖签到（快照更完整，含 totalSpent）。
+    const checkinBalances = db.prepare(
+      "SELECT alias, time, balance_after AS balance FROM checkins WHERE balance_after IS NOT NULL AND balance_after > 0 ORDER BY time, id",
+    ).all() as { alias: string; time: string; balance: number }[];
+    const observations = [
+      ...checkinBalances.map((row) => ({ alias: row.alias, time: row.time, balance: row.balance as number | null, totalSpent: null as number | null })),
+      ...snapshots.map((row) => ({ alias: row.alias, time: row.time, balance: row.balance, totalSpent: row.total_spent ?? null })),
+    ].sort((a, b) => a.time.localeCompare(b.time));
+
     type DayValue = { balance: number | null; totalSpent: number | null };
     /** alias → (本地日 → 该日最后一次观测值)，插入顺序即时间顺序。 */
     const perAlias = new Map<string, Map<string, DayValue>>();
     /** alias → 观测点序列（含时间与原始值），用于按真实时序反推当日到账。 */
     const points = new Map<string, { day: string; balance: number | null; totalSpent: number | null }[]>();
-    for (const row of snapshots) {
+    for (const row of observations) {
       if (!perAlias.has(row.alias)) perAlias.set(row.alias, new Map());
       if (!points.has(row.alias)) points.set(row.alias, []);
       const day = localDay(row.time);
@@ -528,7 +539,7 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
       // 把它当真值会让"当日到账"凭空多出上千（实测 edge-p11 一次 0 → 1175 的假到账）。
       const value: DayValue = {
         balance: row.balance !== null && row.balance > 0 ? row.balance : null,
-        totalSpent: row.total_spent ?? null,
+        totalSpent: row.totalSpent ?? null,
       };
       // 同一天多次采集时后写的覆盖先写的（已按时间排序）。
       perAlias.get(row.alias)!.set(day, value);
