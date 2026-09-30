@@ -193,9 +193,9 @@ function drawDaily(rows) {
 }
 
 function drawRanges(ranges) {
-  const note = '<div class="sub">到账 = 签到带来的余额增长；消耗 = 站点「历史消耗」的区间增量。' +
-               '消耗需要每日观测点：每天跑一次 <code>zenx accounts snapshot --all</code>，' +
-               '否则该区间显示「—」。</div>';
+  const note = '<div class="sub">到账 = 签到带来的余额增长；消耗优先取站点「历史消耗」的区间增量，' +
+               '快照缺失时由签到记录反推（上次余额 + 25 − 本次余额）。' +
+               '每天跑一次 <code>zenx accounts snapshot --all</code> 可让消耗更精确。</div>';
   return note + [["本周 vs 上周", ranges.week], ["本月 vs 上月", ranges.month]]
     .map(([title, cmp]) => rangeSection(title, cmp)).join("");
 }

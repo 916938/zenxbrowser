@@ -241,6 +241,45 @@ test("每日总额：同一天多次采集以最后一次为准", async (t) => {
   assert.equal(row.balanceAccounts, 1);
 });
 
+// 快照缺失时消耗由签到记录反推：上次余额 + 25 − 本次余额。
+// 快照的"历史消耗"需要每天跑 snapshot 才有观测点；签到记录每天都有，作为兜底。
+test("每日总额：快照缺失时由签到记录反推消耗", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  const day = 86_400_000;
+  const yesterday = new Date(Date.now() - day).toISOString();
+  const today = new Date().toISOString();
+  insertCheckin({ time: yesterday, alias: account.alias, instanceId: "inst", identity: "id", ok: true, balanceBefore: 1000, balanceAfter: 1025, credited: true, errorCode: null }, dbFile);
+  insertCheckin({ time: today, alias: account.alias, instanceId: "inst", identity: "id", ok: true, balanceBefore: 1010, balanceAfter: 1035, credited: true, errorCode: null }, dbFile);
+
+  const rows = dailyTotals({}, dbFile);
+  const last = rows[rows.length - 1];
+  // 昨日余额 1025 + 额度 25 − 今日余额 1035 = 消耗 15
+  assert.equal(last.spentSum, 15);
+  assert.equal(last.spentAccounts, 1);
+});
+
+// 既有快照又有签到记录时，快照优先，不重复计数。
+test("每日总额：快照与签到并存时消耗不重复计数", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  const { insertSnapshot } = await import("../src/db.ts");
+  const day = 86_400_000;
+  const yesterday = new Date(Date.now() - day).toISOString();
+  const today = new Date().toISOString();
+  const snap = (time: string, balance: number, spent: number) => ({
+    time, alias: account.alias, instanceId: "inst", identity: "id", balance, totalSpent: spent, ok: true, errorCode: null,
+  });
+  insertSnapshot(snap(yesterday, 1000, 50), dbFile);
+  insertSnapshot(snap(today, 1025, 70), dbFile);
+  insertCheckin({ time: yesterday, alias: account.alias, instanceId: "inst", identity: "id", ok: true, balanceBefore: 1000, balanceAfter: 1025, credited: true, errorCode: null }, dbFile);
+  insertCheckin({ time: today, alias: account.alias, instanceId: "inst", identity: "id", ok: true, balanceBefore: 1000, balanceAfter: 1025, credited: true, errorCode: null }, dbFile);
+
+  const rows = dailyTotals({}, dbFile);
+  const last = rows[rows.length - 1];
+  // 快照口径：70 - 50 = 20；签到口径：1025 + 25 - 1025 = 25。快照优先，只算 20。
+  assert.equal(last.spentSum, 20);
+  assert.equal(last.spentAccounts, 1);
+});
+
 test("CLI：snapshot 单账号与 --all", async (t) => {
   const { home, dbFile } = await temporary(t);
   const lines: string[] = [];

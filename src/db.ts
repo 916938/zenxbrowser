@@ -563,6 +563,33 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
       creditedFromCheckins.set(localDay(row.time), byDay);
     }
 
+    // 签到反推消耗：上次签到后的余额 + 当日额度(25) − 本次签到后的余额 = 两次签到之间的全部消耗。
+    // 快照的"历史消耗"需要每天跑 snapshot 才有观测点；签到记录每天都有（checkin-all 必然写
+    // checkins 表），作为快照缺失时的兜底来源。
+    const DAILY_CREDIT = 25;
+    /** day → alias → 签到反推的消耗 */
+    const spentFromCheckins = new Map<string, Map<string, number>>();
+    {
+      const byAlias = new Map<string, { time: string; balanceAfter: number }[]>();
+      for (const row of checkins) {
+        if (row.balance_after === null || row.balance_after <= 0) continue;
+        if (!byAlias.has(row.alias)) byAlias.set(row.alias, []);
+        byAlias.get(row.alias)!.push({ time: row.time, balanceAfter: row.balance_after });
+      }
+      for (const [alias, records] of byAlias) {
+        records.sort((a, b) => a.time.localeCompare(b.time));
+        for (let i = 1; i < records.length; i++) {
+          const previous = records[i - 1];
+          const current = records[i];
+          const spent = Math.max(0, round2(previous.balanceAfter + DAILY_CREDIT - current.balanceAfter));
+          const day = localDay(current.time);
+          const byDay = spentFromCheckins.get(day) ?? new Map<string, number>();
+          byDay.set(alias, spent);
+          spentFromCheckins.set(day, byDay);
+        }
+      }
+    }
+
     // 日期全集：有任何观测点或任何签到记录的日子都要出现在表里（哪怕当日没有余额数据）。
     const daySet = new Set<string>();
     for (const days of perAlias.values()) for (const day of days.keys()) daySet.add(day);
@@ -580,7 +607,10 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
       return created;
     };
 
-    for (const series of points.values()) {
+    /** day → 已有快照消耗数据的账号集合（避免与签到反推重复计数）。 */
+    const snapshotSpentAliases = new Map<string, Set<string>>();
+
+    for (const [alias, series] of points) {
       // 观测点按本地日压缩：同一天多次采集以最后一次为准。
       const observations: { day: string; balance: number | null; totalSpent: number | null }[] = [];
       const index = new Map<string, number>();
@@ -607,6 +637,9 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
             const entry = entryFor(observation.day);
             entry.spentSum += delta;
             entry.spentAccounts += 1;
+            let aliases = snapshotSpentAliases.get(observation.day);
+            if (!aliases) { aliases = new Set(); snapshotSpentAliases.set(observation.day, aliases); }
+            aliases.add(alias);
           }
         }
         previousSpent = observation.totalSpent;
@@ -645,13 +678,25 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
         creditedSum += value;
         if (value > 0) aliases.add(alias);
       }
+      // 消耗：快照优先；没有快照消耗的账号用签到反推兜底，两者不重复计数。
+      const checkinSpent = spentFromCheckins.get(day) ?? new Map<string, number>();
+      const snapAliases = snapshotSpentAliases.get(day) ?? new Set<string>();
+      let extraSpent = 0;
+      let extraAccounts = 0;
+      for (const [alias, spent] of checkinSpent) {
+        if (snapAliases.has(alias)) continue;
+        extraSpent += spent;
+        extraAccounts += 1;
+      }
+      const totalSpentSum = (entry?.spentSum ?? 0) + extraSpent;
+      const totalSpentAccounts = (entry?.spentAccounts ?? 0) + extraAccounts;
       return {
         day,
         balanceSum: entry && entry.balanceAccounts > 0 ? round2(entry.balanceSum) : null,
         balanceAccounts: entry?.balanceAccounts ?? 0,
         balanceStaleAccounts: entry?.stale ?? 0,
-        spentSum: entry && entry.spentAccounts > 0 ? round2(entry.spentSum) : null,
-        spentAccounts: entry?.spentAccounts ?? 0,
+        spentSum: totalSpentAccounts > 0 ? round2(totalSpentSum) : null,
+        spentAccounts: totalSpentAccounts,
         creditedSum: round2(creditedSum),
         creditedAccounts: aliases.size,
       };
