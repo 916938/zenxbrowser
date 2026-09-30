@@ -38,6 +38,8 @@ export type AccountSummary = {
   balanceSource: "checkin" | "snapshot" | null;
   /** 所有余额正增长之和（只统计实际增长）。 */
   totalGained: number;
+  /** 累计消耗：快照的站点"历史消耗"最新值优先；无快照时由签到记录反推（相邻两次签到间消耗之和）。 */
+  totalSpent: number | null;
   /** 最近一次打卡时间（UTC ISO）。 */
   lastTime: string | null;
   /** 最近一次结果。 */
@@ -266,6 +268,13 @@ export function summarizeAccounts(file: string = DEFAULT_DB_FILE): AccountSummar
       ) ORDER BY time DESC, identity LIMIT 1
     `);
     const snapshotStmt = db.prepare("SELECT COUNT(*) AS n FROM balance_snapshots WHERE alias = ?");
+    // 累计消耗：快照的站点"历史消耗"最新值优先；无快照时由签到记录反推。
+    const spentSnapshotStmt = db.prepare(
+      "SELECT total_spent FROM balance_snapshots WHERE alias = ? AND ok = 1 AND total_spent IS NOT NULL ORDER BY time DESC, id DESC LIMIT 1",
+    );
+    const spentCheckinStmt = db.prepare(
+      "SELECT balance_after FROM checkins WHERE alias = ? AND balance_after IS NOT NULL AND balance_after > 0 ORDER BY time, id",
+    );
 
     return aliases.map((alias) => {
       const stats = statsStmt.get(alias) as { total: number; credited: number; total_gained: number };
@@ -273,6 +282,18 @@ export function summarizeAccounts(file: string = DEFAULT_DB_FILE): AccountSummar
       const balance = balanceStmt.get(alias, alias) as { balance: number; time: string; source: string } | undefined;
       const identity = identityStmt.get(alias, alias) as { identity: string } | undefined;
       const snapshots = snapshotStmt.get(alias) as { n: number };
+      // 累计消耗：快照的站点"历史消耗"最新值优先。
+      const spentSnap = spentSnapshotStmt.get(alias) as { total_spent: number } | undefined;
+      let totalSpent: number | null = spentSnap?.total_spent ?? null;
+      if (totalSpent === null) {
+        // 无快照时由签到记录反推：相邻两次签到间消耗之和（上次余额 + 25 − 本次余额）。
+        const records = spentCheckinStmt.all(alias) as { balance_after: number }[];
+        let sum = 0;
+        for (let i = 1; i < records.length; i++) {
+          sum += Math.max(0, records[i - 1].balance_after + 25 - records[i].balance_after);
+        }
+        if (records.length > 1) totalSpent = round2(sum);
+      }
       return {
         alias,
         identity: identity?.identity ?? "",
@@ -282,6 +303,7 @@ export function summarizeAccounts(file: string = DEFAULT_DB_FILE): AccountSummar
         balanceTime: balance?.time ?? null,
         balanceSource: balance === undefined ? null : balance.source === "snapshot" ? "snapshot" : "checkin",
         totalGained: round2(stats.total_gained ?? 0),
+        totalSpent,
         lastTime: last?.time ?? null,
         lastOk: last === undefined ? null : last.ok === 1,
         lastErrorCode: last?.error_code ?? null,

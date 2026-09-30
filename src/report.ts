@@ -139,14 +139,15 @@ async function load() {
   const notObserved = bound.accounts
     ? bound.accounts.filter(a => !sum.some(s => s.alias === a.alias))
         .map(a => ["<b>" + esc(a.alias) + "</b>", esc(a.identity), '<span class="muted">从未采集</span>',
-                   '<span class="muted">—</span>', '<span class="muted">$0.00</span>',
+                   '<span class="muted">—</span>', '<span class="muted">$0.00</span>', '<span class="muted">—</span>',
                    0, 0, "—", "—", '<span class="muted">先跑一次 snapshot / checkin</span>'])
     : [];
   document.getElementById("summary").innerHTML = (accounts || notObserved.length) ? table([
-    ["账号","身份","当前余额","余额观测","累计到账","打卡次数","成功","成功率","最近打卡","最近结果"],
+    ["账号","身份","当前余额","余额观测","累计到账","累计消耗","打卡次数","成功","成功率","最近打卡","最近结果"],
     ...sum.map(s => [
       "<b>" + esc(s.alias) + "</b>", esc(s.identity), money(s.currentBalance), observedAt(s.balanceTime),
       s.totalGained ? '<span class="gain">+$' + s.totalGained.toFixed(2) + '</span>' : '<span class="muted">$0.00</span>',
+      spentCell(s.totalSpent),
       s.total, s.credited, (s.total ? Math.round(s.credited / s.total * 100) : 0) + "%",
       local(s.lastTime),
       s.lastOk === null ? "—" : s.lastOk
