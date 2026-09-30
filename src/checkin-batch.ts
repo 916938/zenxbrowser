@@ -23,6 +23,12 @@ export const DEFAULT_RETRY_CODES = ["LOGIN_RATE_LIMITED", "LOGIN_TIMEOUT"];
 
 const STATE_VERSION = 1;
 const DEFAULT_CLOSE_TIMEOUT_MS = 45_000;
+/**
+ * BSK_TIMEOUT 即时重试的等待时间。首次 bsk 调用常因扩展/守护进程冷启动而超时
+ * （edge-1 这类长期运行的用户自己的 Edge 尤其明显），短暂等待后重试通常成功。
+ * 与限流冷却（15 分钟）不同，这是快速重试，不影响其他账号，也不消耗限流重试次数。
+ */
+const BSK_TIMEOUT_RETRY_DELAY_MS = 10_000;
 
 export type BatchAccountState = {
   lastAttempt: string;
@@ -501,15 +507,32 @@ async function runOne(
     };
   }
   try {
-    const result: CheckinResult = await checkinAccount(home, run, account.alias, context.checkinTimeoutMs ?? 180_000, {
-      force: context.force === true,
-      dbFile: context.dbFile,
-      now: context.now,
-      sleep: context.sleep,
-      // 只关本轮拉起的实例：账号本来就在线时，那个 Edge 是用户自己的，
-      // 共用同一个 Profile —— 关掉会连标签页与未保存内容一起带走。
-      closeAfter: context.closeAfter && launched === true,
-    });
+    let result: CheckinResult;
+    try {
+      result = await checkinAccount(home, run, account.alias, context.checkinTimeoutMs ?? 180_000, {
+        force: context.force === true,
+        dbFile: context.dbFile,
+        now: context.now,
+        sleep: context.sleep,
+        // 只关本轮拉起的实例：账号本来就在线时，那个 Edge 是用户自己的，
+        // 共用同一个 Profile —— 关掉会连标签页与未保存内容一起带走。
+        closeAfter: context.closeAfter && launched === true,
+      });
+    } catch (firstError) {
+      // BSK_TIMEOUT 即时重试一次：首次 bsk 调用常因扩展/守护进程冷启动而超时
+      // （edge-1 这类长期运行的用户自己的 Edge 尤其明显），短暂等待后重试通常成功。
+      // 与限流冷却不同，这是快速重试，不影响其他账号，也不消耗限流重试次数。
+      if (!(firstError instanceof ZenxError) || firstError.code !== "BSK_TIMEOUT") throw firstError;
+      context.onProgress(`${account.alias}: BSK_TIMEOUT，${BSK_TIMEOUT_RETRY_DELAY_MS / 1000}s 后自动重试一次`);
+      await context.sleep(BSK_TIMEOUT_RETRY_DELAY_MS);
+      result = await checkinAccount(home, run, account.alias, context.checkinTimeoutMs ?? 180_000, {
+        force: context.force === true,
+        dbFile: context.dbFile,
+        now: context.now,
+        sleep: context.sleep,
+        closeAfter: context.closeAfter && launched === true,
+      });
+    }
     return {
       ...base,
       launched,

@@ -844,38 +844,57 @@ async function runCheckinSteps(
     }
   }
 
-  // ⑥ 退出：hover 用户菜单 → click 退出。
+  // ⑥ 退出：hover 用户菜单 → click 退出。会话可能已自行过期（页面实际已是登录页），
+  // 此时找不到菜单按钮或退出项不是 UI 故障——跳过退出直接进入登录流程。
+  let skippedLogout = false;
   const menuRef = menuPattern.exec(page.text);
-  if (!menuRef) throw new ZenxError("LOGOUT_FAILED", "未找到用户菜单按钮 ref；停止，不重试。");
-  await settleAnimations(run, sessionId, remaining);
-  await hoverTarget(page, `@${menuRef[1]}`);
-
-  // 菜单是懒渲染的，且入场动画很关键：hover 后立刻 settleAnimations 会把入场动画 finish
-  // 并补发 animationend，Semi Design 收到后立刻卸载——下拉再也不会出现（实测：settle 组
-  // 菜单 8 次轮询都不出现，不 settle 组约 1s 后出现）。因此这里只 observe，不 settle。
-  const menuDeadline = now() + MENU_OPEN_BUDGET_MS;
-  let logoutRef: string | undefined;
-  while (true) {
-    page = await observePage(run, sessionId, remaining);
-    // 退出项的可访问名是「图标名 + 文案」，中文界面 "exit 退出"、英文界面 "exit Quit"。
-    logoutRef = findRefByLabel(page, "exit 退出") ?? findRefByLabel(page, "exit Quit");
-    if (logoutRef || now() >= menuDeadline) break;
-    await sleep(MENU_OPEN_POLL_INTERVAL_MS);
+  if (!menuRef) {
+    if (isLoggedOut(page)) {
+      skippedLogout = true;
+    } else {
+      throw new ZenxError("LOGOUT_FAILED", "未找到用户菜单按钮 ref；停止，不重试。");
+    }
   }
 
-  if (!logoutRef) throw new ZenxError("LOGOUT_FAILED", `菜单展开后 ${MENU_OPEN_BUDGET_MS / 1000}s 内未找到退出项 ref；停止，不重试。`);
-  await clickTarget(page, logoutRef);
+  if (!skippedLogout && menuRef) {
+    await settleAnimations(run, sessionId, remaining);
+    await hoverTarget(page, `@${menuRef[1]}`);
 
-  // 退出后站点要经 SPA 路由跳转才到登录页（实测约 1.5s）。只看一次 observe 会仍在控制台，
-  // 误报 LOGOUT_FAILED——此时退出其实已经生效，重跑会遇到"未登录"状态。改为轮询等待。
-  const logoutDeadline = now() + LOGOUT_BUDGET_MS;
-  let loggedOut = false;
-  while (now() < logoutDeadline) {
-    await sleep(LOGOUT_POLL_INTERVAL_MS);
-    page = await observeSettled();
-    if (isLoggedOut(page)) { loggedOut = true; break; }
+    // 菜单是懒渲染的，且入场动画很关键：hover 后立刻 settleAnimations 会把入场动画 finish
+    // 并补发 animationend，Semi Design 收到后立刻卸载——下拉再也不会出现（实测：settle 组
+    // 菜单 8 次轮询都不出现，不 settle 组约 1s 后出现）。因此这里只 observe，不 settle。
+    const menuDeadline = now() + MENU_OPEN_BUDGET_MS;
+    let logoutRef: string | undefined;
+    while (true) {
+      page = await observePage(run, sessionId, remaining);
+      // 退出项的可访问名是「图标名 + 文案」，中文界面 "exit 退出"、英文界面 "exit Quit"。
+      logoutRef = findRefByLabel(page, "exit 退出") ?? findRefByLabel(page, "exit Quit");
+      if (logoutRef || now() >= menuDeadline) break;
+      await sleep(MENU_OPEN_POLL_INTERVAL_MS);
+    }
+
+    if (!logoutRef) {
+      // 菜单展开了但找不到退出项：会话可能在 hover 期间已自行过期（当前已是登录页）。
+      if (isLoggedOut(page)) {
+        skippedLogout = true;
+      } else {
+        throw new ZenxError("LOGOUT_FAILED", `菜单展开后 ${MENU_OPEN_BUDGET_MS / 1000}s 内未找到退出项 ref；停止，不重试。`);
+      }
+    } else {
+      await clickTarget(page, logoutRef);
+
+      // 退出后站点要经 SPA 路由跳转才到登录页（实测约 1.5s）。只看一次 observe 会仍在控制台，
+      // 误报 LOGOUT_FAILED——此时退出其实已经生效，重跑会遇到"未登录"状态。改为轮询等待。
+      const logoutDeadline = now() + LOGOUT_BUDGET_MS;
+      let loggedOut = false;
+      while (now() < logoutDeadline) {
+        await sleep(LOGOUT_POLL_INTERVAL_MS);
+        page = await observeSettled();
+        if (isLoggedOut(page)) { loggedOut = true; break; }
+      }
+      if (!loggedOut) throw new ZenxError("LOGOUT_FAILED", `点击退出后 ${LOGOUT_BUDGET_MS / 1000}s 内未见登录页；停止，不重试。`);
+    }
   }
-  if (!loggedOut) throw new ZenxError("LOGOUT_FAILED", `点击退出后 ${LOGOUT_BUDGET_MS / 1000}s 内未见登录页；停止，不重试。`);
 
   // ⑦ 重新登录：GitHub OAuth 轮询。落地页不定（首页/控制台），公告可能重现；
   // 登录成功的标志是用户菜单按钮（G <身份> chevron）出现——余额已不在落地页，
