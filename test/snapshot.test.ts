@@ -93,6 +93,16 @@ test("离线时不开窗口，只留失败快照", async (t) => {
   assert.equal(listSnapshots({ alias: account.alias }, dbFile)[0].errorCode, "OFFLINE");
 });
 
+test("页面读到 $0 时视为未渲染，快照记 null 而不是 0", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  // 窗口被遮挡/后台时页面渲染不出余额，站点给 $0 这类占位读数。
+  // 0 若被当成真值，报表会把"隐藏窗口"当成"余额归零"，制造假到账/假归零。
+  const result = await snapshotAccount(home, runner({ text: "控制台 当前余额 $0 历史消耗 $0 G github_16350 chevron_down" }), account.alias, 45_000, { dbFile, ...fast });
+  assert.equal(result.balance, null, "0 不是可用的余额读数");
+  assert.equal(result.totalSpent, 0, "消耗 0 是合法读数，站点确实没有消耗");
+  assert.equal(listSnapshots({ alias: account.alias }, dbFile)[0].balance, null);
+});
+
 test("批量采集：单个账号失败不中断，汇总如实计数", async (t) => {
   const second = { ...account, alias: "broken", instanceId: "eeee9999", expectedIdentity: "github_1" };
   const { home, dbFile } = await temporary(t, [account, second]);

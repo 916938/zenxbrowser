@@ -48,9 +48,17 @@ function parseEvaluate(raw: string): string {
  * 控制台上的"当前余额 $X"。页面没渲染出来时返回 null（不算失败）。
  * 站点界面语言随账号而异（中文"当前余额"、英文"Current balance"），
  * 两种怎么认由站点适配器决定，这里只转发。
+ *
+ * 读到 0 一律当缺失（返回 null）：窗口被遮挡/最小化/在后台时页面渲染不出余额，
+ * 站点给的是 $0 这类占位读数。0 若被当成真值，下游只会看到"余额没涨"，把一次
+ * 真实到账判成 CHECKIN_UNCONFIRMED——实测 2026-10-02 一轮签到里 8 个账号同时
+ * 读到 0，其中 edge-8 的当日 25 额度因此整轮丢失。账本层早已按 >0 过滤
+ * （见 db.ts 的余额观测点与 dailyTotals），这里把同一约定提到读取端，让所有
+ * 消费方口径一致。适配器保留原值（parse.balance 不做去 0），它只负责"照实读"。
  */
 export function extractBalance(text: string): number | null {
-  return agentRouter.parse.balance(text);
+  const value = agentRouter.parse.balance(text);
+  return value !== null && value > 0 ? value : null;
 }
 
 /**

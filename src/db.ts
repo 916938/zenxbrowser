@@ -316,25 +316,66 @@ export function summarizeAccounts(file: string = DEFAULT_DB_FILE): AccountSummar
 }
 
 /**
- * 该账号在 timeIso 之前的最后一次已知余额。
- * 供复查时当"发放前基准"：与当前余额比较即可判断当日额度是否已发放。
+ * 该账号在 timeIso 之前的最后一次已知余额，连带其观测时间。
  * 观测点同时取 checkins.balance_after 与 balance_snapshots.balance——只跑过快照的账号
  * （例如从未执行 checkin 的新绑账号）也必须能建立基准，否则永远显示"无法比较"。
- * 没有更早的记录时返回 null（新账号首次签到没有基准可比）。
+ * 时间一并返回：Δ消耗只有在"两个观测点之间"才等于区间消耗，调用方据此判断基准能否配对。
  */
-export function lastBalanceBefore(alias: string, timeIso: string, file: string = DEFAULT_DB_FILE): number | null {
+export type BalancePoint = { balance: number; time: string };
+
+export function lastBalancePointBefore(alias: string, timeIso: string, file: string = DEFAULT_DB_FILE): BalancePoint | null {
   const db = openDatabase(file);
   try {
     const row = db.prepare(`
-      SELECT balance FROM (
+      SELECT balance, time FROM (
         SELECT balance_after AS balance, time FROM checkins
         WHERE alias = ? AND balance_after IS NOT NULL AND balance_after > 0 AND time < ?
         UNION ALL
         SELECT balance, time FROM balance_snapshots
         WHERE alias = ? AND ok = 1 AND balance IS NOT NULL AND balance > 0 AND time < ?
       ) ORDER BY time DESC LIMIT 1
-    `).get(alias, timeIso, alias, timeIso) as { balance?: number | null } | undefined;
-    return row?.balance ?? null;
+    `).get(alias, timeIso, alias, timeIso) as { balance?: number; time?: string } | undefined;
+    if (row?.balance === undefined || typeof row.time !== "string") return null;
+    return { balance: row.balance, time: row.time };
+  } finally {
+    db.close();
+  }
+}
+
+export function lastBalanceBefore(alias: string, timeIso: string, file: string = DEFAULT_DB_FILE): number | null {
+  return lastBalancePointBefore(alias, timeIso, file)?.balance ?? null;
+}
+
+/**
+ * 最后一个"同时带余额与累计消耗"的快照观测点（配对观测点）。
+ *
+ * 为什么必须配对：真实到账 = Δ余额 + Δ消耗，但余额同时被发放和消耗影响——当天有
+ * 消耗时裸余额差会小于每日额度，把已到账误判成未到账（实测 edge-8：基准 1126.31、
+ * 当前 1147.49，裸差 21.18 < 25，而站点日志写着"每日签到成功 +$25"，差额 3.82 正是
+ * 当天消耗）。dailyTotals 早用这个口径（见其注释），这里补上配对读数让 recheck 一致。
+ *
+ * 为什么不能用"最新的其余观测点"凑合：Δ消耗只在两个观测点之间的时段里等于区间消耗。
+ * 若余额基准取自一条更晚的签到记录、消耗基准取自更早的快照，两者之间的那笔签到发放
+ * 会被重复计入 Δ消耗，凭空凑出第二笔 25；反之基准太旧（快照停更十天）则把十天的消耗
+ * 与发放一起算进今天，同样造出假到账。因此这里只返回**同一行**的配对观测点，由调用方
+ * 再确认它就是最新的余额观测点（即之后没有更晚的签到记录），否则丢弃 Δ消耗、退化为
+ * 只比余额——宁可漏判到账，也不凭空造一笔。
+ */
+export function lastPairedSnapshotBefore(
+  alias: string,
+  timeIso: string,
+  file: string = DEFAULT_DB_FILE,
+): { balance: number; totalSpent: number; time: string } | null {
+  const db = openDatabase(file);
+  try {
+    const row = db.prepare(`
+      SELECT balance, total_spent AS totalSpent, time FROM balance_snapshots
+      WHERE alias = ? AND ok = 1 AND balance IS NOT NULL AND balance > 0
+        AND total_spent IS NOT NULL AND time < ?
+      ORDER BY time DESC LIMIT 1
+    `).get(alias, timeIso) as { balance?: number; totalSpent?: number; time?: string } | undefined;
+    if (row?.balance === undefined || row.totalSpent === undefined || typeof row.time !== "string") return null;
+    return { balance: row.balance, totalSpent: row.totalSpent, time: row.time };
   } finally {
     db.close();
   }

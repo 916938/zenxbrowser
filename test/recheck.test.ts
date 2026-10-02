@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main } from "../src/cli.ts";
-import { insertCheckin, listCheckins } from "../src/db.ts";
+import { insertCheckin, insertSnapshot, listCheckins } from "../src/db.ts";
 import { recheckAccount } from "../src/recheck.ts";
 import type { Browser, Runner } from "../src/core.ts";
 
@@ -152,6 +152,102 @@ test("缺少发放前余额基准时判为未到账，并在说明里讲清无�
   assert.equal(result.verdict, "not_credited");
   assert.equal(result.baselineBalance, null);
   assert.match(result.note ?? "", /缺少发放前余额基准/);
+});
+
+// ---------------------------------------------------------------------------
+// 到账口径：Δ余额 + Δ消耗
+//
+// 余额同时被"签到发放"和"日常消耗"影响。间隔一天以上时，消耗会把余额差压到每日
+// 额度以下，只用裸余额差会把已到账误判成未到账——2026-10-02 的 edge-8 就是这样：
+// 基准 1126.31、当前 1147.49，裸差 21.18 < 25，但站点日志明确显示"每日签到成功
+// 增加额度 $25"，差额 3.82 正是当天消耗。账本里那批账号反复报 CHECKIN_UNCONFIRMED、
+// pending 永远清不掉，就是这条判据造成的。
+// ---------------------------------------------------------------------------
+
+/** 种一个"昨天"的配对快照：余额 + 站点累计消耗。日期基准随 todayIso 一起给出。 */
+function snapshot(dbFile: string, time: string, balance: number, totalSpent: number) {
+  insertSnapshot({
+    time, alias: account.alias, instanceId: account.instanceId, identity: account.expectedIdentity,
+    balance, totalSpent, ok: true, errorCode: null,
+  }, dbFile);
+}
+const YESTERDAY = new Date(Date.now() - 86_400_000).toISOString();
+
+test("余额差被当天消耗抵掉时，用 Δ余额 + Δ消耗 仍能确认到账（edge-8 实况）", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  snapshot(dbFile, YESTERDAY, 1126.31, 673.69);
+  // 当前余额 1147.49：裸差 21.18 < 25，加上消耗增量 3.82 才是真实的 +25。
+  const result = await recheckAccount(home, runner({ text: "控制台 当前余额 $1147.49 历史消耗 $677.51 G github_16350 chevron_down" }), account.alias, 45_000, { dbFile, ...fast });
+  assert.equal(result.balanceDelta, 21.18, "裸余额差如实报告");
+  assert.equal(result.spentDelta, 3.82);
+  assert.equal(result.creditDelta, 25, "Δ余额 + Δ消耗 才是真实到账");
+  assert.equal(result.verdict, "credited");
+  assert.equal(result.ok, true);
+});
+
+test("确认到账时补记的余额基准用配对快照，报表口径也对得上", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  snapshot(dbFile, YESTERDAY, 1126.31, 673.69);
+  const result = await recheckAccount(home, runner({ text: "控制台 当前余额 $1147.49 历史消耗 $677.51 G github_16350 chevron_down" }), account.alias, 45_000, { dbFile, ...fast });
+  assert.equal(result.recorded, true);
+  const today = listCheckins({ alias: account.alias }, dbFile).find((row) => row.credited);
+  assert.ok(today, "应补一条 credited 记录");
+  assert.equal(today?.balanceBefore, 1126.31);
+  assert.equal(today?.balanceAfter, 1147.49);
+  assert.equal(today?.ok, true);
+});
+
+test("没有消耗增量时判据退化为裸余额差，不凭空加分", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  snapshot(dbFile, YESTERDAY, 1100, 100);
+  const result = await recheckAccount(home, runner({ text: "控制台 当前余额 $1120.00 历史消耗 $100.00 G github_16350 chevron_down" }), account.alias, 45_000, { dbFile, ...fast });
+  assert.equal(result.spentDelta, 0);
+  assert.equal(result.creditDelta, 20);
+  assert.equal(result.verdict, "not_credited", "20 < 25，确实没到账");
+});
+
+test("站点不渲染消耗时只用余额差，不臆造消耗", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  snapshot(dbFile, YESTERDAY, 1126.31, 673.69);
+  const result = await recheckAccount(home, runner({ text: "控制台 当前余额 $1147.49 G github_16350 chevron_down" }), account.alias, 45_000, { dbFile, ...fast });
+  assert.equal(result.spentDelta, null, "读不到消耗就不算增量");
+  assert.equal(result.creditDelta, 21.18);
+  assert.equal(result.verdict, "not_credited");
+});
+
+test("没有快照（无消耗观测点）时退化为裸余额差，不臆造消耗", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  record(dbFile, { time: YESTERDAY, balanceBefore: null, balanceAfter: 1126.31, credited: false });
+  const result = await recheckAccount(home, runner({ text: "控制台 当前余额 $1147.49 历史消耗 $677.51 G github_16350 chevron_down" }), account.alias, 45_000, { dbFile, ...fast });
+  assert.equal(result.spentDelta, null);
+  assert.equal(result.baselineTotalSpent, null);
+  assert.equal(result.creditDelta, 21.18);
+  assert.equal(result.verdict, "not_credited");
+});
+
+// 配对必须是"同一个观测点"：余额基准晚于消耗基准时，两者之间的那笔签到发放会被
+// 重复算进 Δ消耗，凭空凑出第二笔额度、把没到账判成已到账。
+test("余额基准晚于消耗快照时不配对，不把中间那笔发放重复计入", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  snapshot(dbFile, new Date(Date.now() - 3 * 86_400_000).toISOString(), 1000, 100);
+  // 昨天有一笔签到（余额 1025），它比快照新：余额基准应取它，而消耗基准配不上。
+  record(dbFile, { time: YESTERDAY, balanceBefore: 1000, balanceAfter: 1025, credited: true });
+  const result = await recheckAccount(home, runner({ text: "控制台 当前余额 $1025.00 历史消耗 $100.00 G github_16350 chevron_down" }), account.alias, 45_000, { dbFile, ...fast });
+  assert.equal(result.baselineBalance, 1025);
+  assert.equal(result.spentDelta, null, "配不上就不算 Δ消耗");
+  assert.equal(result.creditDelta, 0);
+});
+
+// 基准太旧时，窗口里会包含多次发放与多日消耗，Δ余额 + Δ消耗 会把它一起算成
+// "今天的到账"。宁可漏判，也不能造出这种假到账。
+test("配对快照过旧（超过 48h）时放弃 Δ消耗，不把多日发放算成今天", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  snapshot(dbFile, new Date(Date.now() - 5 * 86_400_000).toISOString(), 900, 0);
+  const result = await recheckAccount(home, runner({ text: "控制台 当前余额 $1000.00 历史消耗 $10.00 G github_16350 chevron_down" }), account.alias, 45_000, { dbFile, ...fast });
+  assert.equal(result.spentDelta, null, "基准过旧不算 Δ消耗");
+  assert.equal(result.creditDelta, 100);
+  // 100 ≥ 25 确实会判到账（五天的发放本就累积在那里），但绝不能是 Δ消耗 凑出来的更大值。
+  assert.equal(result.baselineTotalSpent, null);
 });
 
 test("当前未登录时判为需人工登录，不给出额度结论", async (t) => {

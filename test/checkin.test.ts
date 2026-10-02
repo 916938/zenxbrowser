@@ -1152,6 +1152,38 @@ test("checkin 余额未变且无签到提示 → CHECKIN_UNCONFIRMED", async (t)
   assertStopped(script);
 });
 
+// 回归（2026-10-02 edge-8 实况）：窗口被遮挡时页面渲染不出余额，站点给 $0 占位读数。
+// 0 被当成真余额 → 0 > 0 为假 → 一次真实到账被判成 CHECKIN_UNCONFIRMED，账号留在
+// pending 里永远清不掉。0 必须视为"没读到"，让判据退回"签到成功"文本信号。
+test("checkin 余额读到 $0 视为未渲染，改按签到成功提示确认到账", async (t) => {
+  const home = await fixture(t);
+  const script = scriptRunner({
+    observes: [
+      reply(observeWithAnnouncement),
+      reply(vom([
+        'L1 page',
+        '    @e11 button "G github_16350 chevron_down [has-submenu]"',
+        '    main "账户数据 当前余额 $0 历史消耗 $3104.82"',
+      ].join("\n"))),
+      reply(observeMenuOpen),
+      reply(observeLoggedOut),
+      reply(observeLanding),
+      reply(observeDashboard("$0")),   // 确认阶段同样读不到余额，但有"签到成功"提示
+    ],
+  });
+  const c = clock();
+  const report = await checkinAccount(home, script.run, "work", 180_000, c);
+  assert.equal(report.balanceBefore, null, "0 不当真值");
+  assert.equal(report.balanceAfter, null);
+  assert.equal(report.checkinCredited, true, "文本信号兜底，不再误报未确认");
+  assert.equal(report.ok, true);
+  const saved = listCheckins({}, c.dbFile);
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].credited, true);
+  assert.equal(saved[0].errorCode, null, "不应再落 CHECKIN_UNCONFIRMED");
+  assertStopped(script);
+});
+
 test("checkin 离线直接报告，不启动 session", async (t) => {
   const home = await fixture(t);
   const { run, calls } = scriptRunner({}, []);

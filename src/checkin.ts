@@ -3,6 +3,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { isEdge, listBrowsers, protocolSupported, readStore, withStoreLock, ZenxError } from "./core.ts";
 import type { Account, Runner } from "./core.ts";
 import { DEFAULT_DB_FILE, hasCreditedBetween, insertCheckin, lastBalanceBefore } from "./db.ts";
+import { extractBalance as consoleExtractBalance } from "./console.ts";
 import { closeBrowser, findAccount } from "./launch.ts";
 import type { LaunchDependencies } from "./launch.ts";
 import { agentRouter } from "./sites/agentrouter.ts";
@@ -271,8 +272,14 @@ export function labelOfRef(page: SessionPage, ref: string): string | undefined {
     .trim();
 }
 
+/**
+ * 页面正文 → 当前余额。读到 0 一律当缺失（返回 null），与 console.extractBalance
+ * 同一口径：窗口被遮挡时页面渲染不出余额会读到 0，当成真值会让"余额没涨"的假象
+ * 覆盖掉真实的到账（见 console.ts 里 extractBalance 的说明）。
+ * 读不到时 checkinCredited 会退回文本信号 hasCheckinSuccess。
+ */
 function extractBalance(page: SessionPage): number | null {
-  return agentRouter.parse.balance(page.text);
+  return consoleExtractBalance(page.text);
 }
 
 function hasAnnouncement(page: SessionPage): boolean {

@@ -1,12 +1,23 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { isEdge, listBrowsers, protocolSupported, readStore, withStoreLock, ZenxError } from "./core.ts";
 import type { Runner } from "./core.ts";
-import { DEFAULT_DB_FILE, hasCreditedBetween, insertCheckin, lastBalanceBefore } from "./db.ts";
+import { DEFAULT_DB_FILE, hasCreditedBetween, insertCheckin, lastBalancePointBefore, lastPairedSnapshotBefore } from "./db.ts";
 import { readConsoleState } from "./console.ts";
 import { findAccount } from "./launch.ts";
 
 /** 站点每日签到发放的额度；余额相对基线的增量达到该值即认为当日已发放。 */
 const DAILY_CREDIT = 25;
+
+/**
+ * 配对消耗基准的最大年龄。
+ *
+ * Δ消耗只在两个观测点之间的时段里等于区间消耗，而"到账"每次登录最多发一次。
+ * 基准越旧，窗口里包含的发放次数越多：快照停更十天后，Δ余额 + Δ消耗 会把十天的
+ * 发放一起算成"今天的到账"，凭空判已到账（宁可漏判也不能造这种假）。
+ * 日例行会给每个账号落一笔快照，因此超过两天没有配对观测点，说明数据已经不足以
+ * 把窗口收敛到单日，此时放弃 Δ消耗、退化为只比余额。
+ */
+const MAX_BASELINE_AGE_MS = 48 * 60 * 60_000;
 
 export type RecheckDependencies = {
   /** 返回 epoch 毫秒；同时用于超时预算与"今天"的日期边界。 */
@@ -38,7 +49,13 @@ export type RecheckResult = {
   creditedToday: boolean;
   /** 账本里今天开始前该账号的最后一次已知余额（发放前基准）。 */
   baselineBalance: number | null;
-  /** 当前余额相对基线的增量；任一端读不到时为 null。 */
+  /** 与 baselineBalance 同一时点的站点累计消耗；无快照时为 null。 */
+  baselineTotalSpent?: number | null;
+  /** 站点累计消耗相对基线的增量；任一端读不到时为 null。 */
+  spentDelta?: number | null;
+  /** 到账增量 = Δ余额 + Δ消耗；这是判定"是否已发放"的口径。 */
+  creditDelta?: number | null;
+  /** 当前余额相对基线的增量（裸值，不含消耗）；任一端读不到时为 null。 */
   balanceDelta: number | null;
   verdict: "credited" | "not_credited" | "logged_out" | "manual_intervention" | "identity_mismatch" | "unknown";
   pageFeature?: string;
@@ -145,17 +162,50 @@ export async function recheckAccount(
     const state = await readConsoleState(run, account.instanceId, account.expectedIdentity, remaining, sleep);
     const { balance, siteCheckedIn } = state;
 
-    // 账本侧：今日到账记录 + 今日开始前的余额基准。
+    // 账本侧：今日到账记录 + 今日开始前的余额基准（含配对消耗）。
     const { start, end } = todayUtcRange(new Date(now()));
     let creditedToday = false;
     let baselineBalance: number | null = null;
+    let baselineTotalSpent: number | null = null;
+    let spentDelta: number | null = null;
     try {
-      creditedToday = hasCreditedBetween(account.alias, start, end, dependencies.dbFile ?? DEFAULT_DB_FILE);
-      baselineBalance = lastBalanceBefore(account.alias, start, dependencies.dbFile ?? DEFAULT_DB_FILE);
+      const dbFile = dependencies.dbFile ?? DEFAULT_DB_FILE;
+      creditedToday = hasCreditedBetween(account.alias, start, end, dbFile);
+      const latest = lastBalancePointBefore(account.alias, start, dbFile);
+      baselineBalance = latest?.balance ?? null;
+      /**
+       * Δ消耗只在"配对观测点"上成立，因此要求扫到的快照同时满足两条：
+       * 1) 它就是最新的余额观测点（之后没有更晚的签到记录/快照）——否则两者之间
+       *    的那笔签到发放会被重复计进 Δ消耗，凭空凑出第二笔额度；
+       * 2) 它足够新（见 MAX_BASELINE_AGE_MS）——否则跨多日的消耗与发放会一起
+       *    算进今天，同样造出假到账。
+       * 任一不满足都放弃 Δ消耗、退化为只比余额。
+       */
+      const paired = lastPairedSnapshotBefore(account.alias, start, dbFile);
+      const fresh = paired !== null && now() - Date.parse(paired.time) <= MAX_BASELINE_AGE_MS;
+      if (paired && fresh && latest !== null && paired.time === latest.time) {
+        baselineTotalSpent = paired.totalSpent;
+        if (state.totalSpent !== null) {
+          spentDelta = Math.max(0, Math.round((state.totalSpent - paired.totalSpent) * 100) / 100);
+        }
+      }
     } catch {
       // 账本读不了不能影响站点读数：只让判据退化，不报错。
     }
     const balanceDelta = balance !== null && baselineBalance !== null ? Math.round((balance - baselineBalance) * 100) / 100 : null;
+    /**
+     * 到账增量 = Δ余额 + Δ消耗。
+     *
+     * 为什么不能用裸余额差：余额同时被"签到发放"和"日常消耗"影响。间隔一天以上时，
+     * 消耗会把余额差压到每日额度以下，把已到账误判成未到账——实测 edge-8：基准
+     * 1126.31、当前 1147.49，裸差 21.18 < 25，但站点日志明确写着"每日签到成功
+     * 增加额度 $25"，那 3.82 就是当天的消耗。加上 Δ消耗后就还原为 25。
+     * 消耗读数缺失（没有配对快照）时退化为裸余额差：宁可漏判到账，也不要凭空加一笔
+     * 消耗制造假到账。
+     */
+    const creditDelta = balanceDelta === null
+      ? null
+      : Math.round((balanceDelta + (spentDelta ?? 0)) * 100) / 100;
 
     if (state.login === "manual_intervention") {
       return {
@@ -184,12 +234,13 @@ export async function recheckAccount(
       };
     }
 
-    const gained = balanceDelta !== null && balanceDelta >= DAILY_CREDIT;
+    const gained = creditDelta !== null && creditDelta >= DAILY_CREDIT;
     if (creditedToday || siteCheckedIn || gained) {
       const source = creditedToday ? "账本今日已有到账记录" : siteCheckedIn ? "站点显示今日已签到" : "余额相对基线已增长";
       return {
         ...base, ok: true, connection, login: "logged_in", identityMatch: true,
         balance, siteCheckedIn, creditedToday, baselineBalance, balanceDelta,
+        baselineTotalSpent, spentDelta, creditDelta,
         verdict: "credited", note: `已确认今日到账（依据：${source}）。`,
         recorded: recordMissingCredit(account, balance, baselineBalance, creditedToday, dependencies, now()),
       };
@@ -197,10 +248,11 @@ export async function recheckAccount(
     return {
       ...base, ok: false, connection, login: "logged_in", identityMatch: true,
       balance, siteCheckedIn, creditedToday, baselineBalance, balanceDelta,
+      baselineTotalSpent, spentDelta, creditDelta,
       verdict: "not_credited",
       note: balanceDelta === null
         ? "未发现到账证据（缺少发放前余额基准，无法比较增量）；可重试签到，或次日再看余额趋势。"
-        : "未发现到账证据：账本今日无到账记录、站点未显示已签到、余额也无增长。可重试签到。",
+        : "未发现到账证据：账本今日无到账记录、站点未显示已签到、余额与消耗合计也无增长。可重试签到。",
     };
   });
 }
