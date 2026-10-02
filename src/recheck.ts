@@ -50,11 +50,11 @@ export type RecheckResult = {
   /** 账本里今天开始前该账号的最后一次已知余额（发放前基准）。 */
   baselineBalance: number | null;
   /** 与 baselineBalance 同一时点的站点累计消耗；无快照时为 null。 */
-  baselineTotalSpent?: number | null;
+  baselineTotalSpent: number | null;
   /** 站点累计消耗相对基线的增量；任一端读不到时为 null。 */
-  spentDelta?: number | null;
+  spentDelta: number | null;
   /** 到账增量 = Δ余额 + Δ消耗；这是判定"是否已发放"的口径。 */
-  creditDelta?: number | null;
+  creditDelta: number | null;
   /** 当前余额相对基线的增量（裸值，不含消耗）；任一端读不到时为 null。 */
   balanceDelta: number | null;
   verdict: "credited" | "not_credited" | "logged_out" | "manual_intervention" | "identity_mismatch" | "unknown";
@@ -155,6 +155,7 @@ export async function recheckAccount(
       return {
         ...base, ok: false, connection, login: "unknown", identityMatch: false, balance: null,
         siteCheckedIn: false, creditedToday: false, baselineBalance: null, balanceDelta: null,
+        baselineTotalSpent: null, spentDelta: null, creditDelta: null,
         verdict: "unknown", note: "实例离线或不兼容；未启动 Edge，未读取站点。先执行 ensure-online。",
       };
     }
@@ -211,6 +212,7 @@ export async function recheckAccount(
       return {
         ...base, ok: false, connection, login: "manual_intervention", identityMatch: state.identityMatch,
         balance, siteCheckedIn, creditedToday, baselineBalance, balanceDelta,
+        baselineTotalSpent, spentDelta, creditDelta,
         verdict: "manual_intervention", pageFeature: state.pageFeature,
         note: "检测到 GitHub 授权/验证页；需人工完成登录后重试。",
       };
@@ -219,6 +221,7 @@ export async function recheckAccount(
       return {
         ...base, ok: false, connection, login: "logged_out", identityMatch: false,
         balance: null, siteCheckedIn: false, creditedToday, baselineBalance, balanceDelta: null,
+        baselineTotalSpent, spentDelta: null, creditDelta: null,
         verdict: "logged_out",
         note: creditedToday
           ? "当前未登录；但账本显示今天已确认到账，额度应已发放，可人工登录后再跑 recheck 核对。"
@@ -229,6 +232,7 @@ export async function recheckAccount(
       return {
         ...base, ok: false, connection, login: "logged_in", identityMatch: false,
         balance, siteCheckedIn, creditedToday, baselineBalance, balanceDelta,
+        baselineTotalSpent, spentDelta, creditDelta,
         verdict: "identity_mismatch",
         note: `控制台未出现预期身份 ${account.expectedIdentity}；不据此判断额度，请人工核对。`,
       };

@@ -273,6 +273,48 @@ test("登录身份与绑定不符时判为身份不符", async (t) => {
   assert.equal(result.identityMatch, false);
 });
 
+// 输出结构一致性：新增字段时最容易漏掉提前返回的分支，调用方拿到 undefined 才知道。
+// 字段一律必填（类型是 number | null，不是可选项），由类型系统兜底，这里再逐个
+// verdict 实测一遍，确保每条返回路径都带上了。
+const LEDGER_FIELDS = ["baselineTotalSpent", "spentDelta", "creditDelta"] as const;
+
+test("所有 verdict 分支都返回完整到账字段，不遗漏不 undefined", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  snapshot(dbFile, YESTERDAY, 1126.31, 673.69);
+
+  const cases: { name: string; text: string; browsers?: Browser[] }[] = [
+    { name: "credited", text: "控制台 当前余额 $1147.49 历史消耗 $677.51 G github_16350 chevron_down" },
+    { name: "not_credited", text: "控制台 当前余额 $1126.31 历史消耗 $673.69 G github_16350 chevron_down" },
+    { name: "logged_out", text: LOGGED_OUT },
+    { name: "manual_intervention", text: GITHUB_AUTH },
+    { name: "identity_mismatch", text: "控制台 当前余额 $100.00 G github_99999 chevron_down" },
+    { name: "unknown（离线）", text: LOGGED_IN, browsers: [] },
+  ];
+
+  for (const item of cases) {
+    const result = await recheckAccount(
+      home, runner({ text: item.text, browsers: item.browsers }), account.alias, 45_000,
+      { dbFile, record: false, ...fast },
+    );
+    for (const field of LEDGER_FIELDS) {
+      assert.ok(field in result, `${item.name} 分支缺少 ${field}`);
+      assert.notEqual((result as Record<string, unknown>)[field], undefined, `${item.name} 分支的 ${field} 是 undefined`);
+    }
+  }
+});
+
+test("登出态不给出额度结论，到账派生值一并置空", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  snapshot(dbFile, YESTERDAY, 1126.31, 673.69);
+  const result = await recheckAccount(home, runner({ text: LOGGED_OUT }), account.alias, 45_000, { dbFile, record: false, ...fast });
+  assert.equal(result.verdict, "logged_out");
+  assert.equal(result.balance, null);
+  assert.equal(result.balanceDelta, null);
+  assert.equal(result.spentDelta, null, "没有当前读数，Δ消耗无从计算");
+  assert.equal(result.creditDelta, null);
+  assert.equal(result.baselineTotalSpent, 673.69, "账本侧的基准值照常回传，便于人工核对");
+});
+
 test("隔离窗口必定回收", async (t) => {
   const { home, dbFile } = await temporary(t);
   const calls: string[][] = [];
