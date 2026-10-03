@@ -178,6 +178,83 @@ test("db 基准余额：没有签到记录时也能用快照建立发放前基�
   assert.equal(lastBalanceBefore("fresh", "2026-09-18T00:00:00.000Z", file), null);
 });
 
+// 站点"历史消耗"只在快照里读到，快照一旦停采，之后花掉的钱就没有观测点了。
+// 实测 edge-1：最后一次快照停在 9/22（当时累计消耗 0），10 月靠签到记录花掉 674.59，
+// 旧口径直接把最新快照的 0 当答案，账号汇总里显示成 -$0.00。
+test("db 汇总：累计消耗 = 最新快照的站点累计值 + 快照之后签到反推的消耗", (t) => {
+  const file = tempDb(t);
+  insertSnapshot({
+    time: "2026-09-22T13:07:40.000Z", alias: "edge-1", instanceId: "i",
+    identity: "github_236536", balance: 1550, totalSpent: 0, ok: true, errorCode: null,
+  }, file);
+  // 快照之后：一路 +25（无消耗），直到 10/02 两次签到之间各掉一笔。
+  const after = [
+    ["2026-09-22T14:25:54.000Z", 1550, 1575],
+    ["2026-09-24T15:40:43.000Z", 1575, 1600],
+    ["2026-09-28T10:30:45.000Z", 1600, 1625],
+    ["2026-09-30T06:29:03.000Z", 1625, 1650],
+    ["2026-10-01T08:26:10.000Z", 1650, 1675],
+    ["2026-10-02T10:58:21.000Z", 1621.79, 1646.79],   // 1675 + 25 − 1646.79 = 53.21
+    ["2026-10-02T19:36:41.000Z", 1100.41, 1125.41],   // 1646.79 + 25 − 1125.41 = 546.38
+  ] as const;
+  for (const [time, balanceBefore, balanceAfter] of after) {
+    insertCheckin(record({ time, balanceBefore, balanceAfter }), file);
+  }
+
+  const [summary] = summarizeAccounts(file);
+  assert.equal(summary.totalSpent, 599.59, "快照的 0 加上快照之后的 53.21 + 546.38");
+});
+
+test("db 汇总：只有快照的账号，累计消耗就是快照读到的站点累计值", (t) => {
+  const file = tempDb(t);
+  insertSnapshot({
+    time: "2026-09-22T13:07:40.000Z", alias: "fresh", instanceId: "i",
+    identity: "github_9", balance: 900, totalSpent: 1412.59, ok: true, errorCode: null,
+  }, file);
+  const [summary] = summarizeAccounts(file);
+  assert.equal(summary.totalSpent, 1412.59, "没有后续签到记录可反推，锚点值即答案");
+});
+
+// 近期消耗 = 现在的累计消耗 − 窗口起点的累计消耗，同源差分，所以不可能比累计还大。
+// 曾经按"每日明细累加"实现过一次：快照稀疏时跨窗口的那一大笔会被重复计入，
+// 实测 edge-1 算出 802.8 > 674.59，看着就像账本坏了。
+test("db 汇总：近期消耗 = 窗口内累计消耗的增量，且不超过累计消耗", (t) => {
+  const file = tempDb(t);
+  const at = (daysAgo: number) => {
+    const d = new Date();
+    d.setDate(d.getDate() - daysAgo);
+    d.setHours(12, 0, 0, 0);
+    return d.toISOString();
+  };
+  insertSnapshot({
+    time: at(10), alias: "edge-1", instanceId: "i", identity: "github_1",
+    balance: 1000, totalSpent: 0, ok: true, errorCode: null,
+  }, file);
+  // 窗口外：连着三天 +25，没有消耗。
+  insertCheckin(record({ time: at(9), balanceBefore: 1000, balanceAfter: 1025 }), file);
+  insertCheckin(record({ time: at(8), balanceBefore: 1025, balanceAfter: 1050 }), file);
+  // 窗口内：先 +25，再在两次签到之间花掉 100。
+  insertCheckin(record({ time: at(7), balanceBefore: 1050, balanceAfter: 1075 }), file);
+  insertCheckin(record({ time: at(3), balanceBefore: 975, balanceAfter: 1000 }), file);
+  insertCheckin(record({ time: at(1), balanceBefore: 1000, balanceAfter: 1025 }), file);
+
+  const [summary] = summarizeAccounts(file);
+  assert.equal(summary.totalSpent, 100, "累计消耗 = 快照锚点 0 + 反推出的 100");
+  assert.equal(summary.recentSpent, 100, "这 100 全发生在窗口内");
+  assert.ok(summary.recentSpent! <= summary.totalSpent!, "近期不可能超过累计");
+});
+
+// 窗口里一个观测点都没有时，差分必然是 0——但那是"没看到"，不是"没花钱"。
+test("db 汇总：近期窗口内没有观测点时近期消耗为 null，不谎报 0", (t) => {
+  const file = tempDb(t);
+  const old = new Date();
+  old.setDate(old.getDate() - 20);
+  insertCheckin(record({ time: old.toISOString(), balanceBefore: 100, balanceAfter: 125 }), file);
+  const [summary] = summarizeAccounts(file);
+  assert.equal(summary.recentSpent, null, "20 天前的数据不能用来回答最近 7 天");
+  assert.equal(summary.totalSpent, null, "只有一条观测点，无从反推消耗");
+});
+
 test("db 空库时汇总与列表返回空数组，不报错", (t) => {
   const file = tempDb(t);
   assert.deepEqual(summarizeAccounts(file), []);

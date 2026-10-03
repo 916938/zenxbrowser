@@ -38,8 +38,16 @@ export type AccountSummary = {
   balanceSource: "checkin" | "snapshot" | null;
   /** 所有余额正增长之和（只统计实际增长）。 */
   totalGained: number;
-  /** 累计消耗：快照的站点"历史消耗"最新值优先；无快照时由签到记录反推（相邻两次签到间消耗之和）。 */
+  /**
+   * 累计消耗：最新快照的站点"历史消耗"为锚点，加上该快照之后由签到记录反推的消耗；
+   * 完全没有快照时整段由签到记录反推。只有一条观测点、无从比较时为 null。
+   */
   totalSpent: number | null;
+  /**
+   * 近 7 天消耗（滚动窗口，按本地日计）= 累计消耗相对 7 天前的增量，与累计消耗同源。
+   * null = 这段窗口里没有任何观测点，不等于"没花钱"。
+   */
+  recentSpent: number | null;
   /** 最近一次打卡时间（UTC ISO）。 */
   lastTime: string | null;
   /** 最近一次结果。 */
@@ -225,9 +233,12 @@ export function listCheckins(
  *    最后一次打卡余额——后者在签到失败时会退化成"—"甚至旧值；
  * 3. 累计到账只统计余额实际正增长；当天重复签到（credited 但余额不变）计入成功次数，
  *    不计入金额——与站点实际发放规则一致。
+ * 4. 累计消耗与站点「历史消耗」对齐，近期消耗是它相对 7 天前的增量——一个回答"总共花了多少"，
+ *    一个回答"最近花得快不快"，两者不是同一个问题的两种算法。
  */
 export function summarizeAccounts(file: string = DEFAULT_DB_FILE): AccountSummary[] {
   const db = openDatabase(file);
+  const recentCutoff = recentWindowStart(RECENT_SPENT_DAYS);
   try {
     const aliases = (db.prepare(
       "SELECT DISTINCT alias FROM checkins UNION SELECT DISTINCT alias FROM balance_snapshots",
@@ -268,13 +279,34 @@ export function summarizeAccounts(file: string = DEFAULT_DB_FILE): AccountSummar
       ) ORDER BY time DESC, identity LIMIT 1
     `);
     const snapshotStmt = db.prepare("SELECT COUNT(*) AS n FROM balance_snapshots WHERE alias = ?");
-    // 累计消耗：快照的站点"历史消耗"最新值优先；无快照时由签到记录反推。
+    // 累计消耗：最新快照的站点"历史消耗"作锚点，之后的消耗由签到记录反推补齐。
+    // 三条语句都带 asOf 上界：近期消耗要用同一个算法算出"7 天前的值"，再取差分。
     const spentSnapshotStmt = db.prepare(
-      "SELECT total_spent FROM balance_snapshots WHERE alias = ? AND ok = 1 AND total_spent IS NOT NULL ORDER BY time DESC, id DESC LIMIT 1",
+      "SELECT total_spent, balance, time FROM balance_snapshots WHERE alias = ? AND ok = 1 AND total_spent IS NOT NULL AND time <= ? ORDER BY time DESC, id DESC LIMIT 1",
     );
     const spentCheckinStmt = db.prepare(
-      "SELECT balance_after FROM checkins WHERE alias = ? AND balance_after IS NOT NULL AND balance_after > 0 ORDER BY time, id",
+      "SELECT balance_after FROM checkins WHERE alias = ? AND balance_after IS NOT NULL AND balance_after > 0 AND time <= ? ORDER BY time, id",
     );
+    // 锚点之后（快照采集时刻之后）的签到余额，用于把快照没覆盖到的消耗补回来。
+    const spentCheckinAfterStmt = db.prepare(
+      "SELECT balance_after FROM checkins WHERE alias = ? AND balance_after IS NOT NULL AND balance_after > 0 AND time > ? AND time <= ? ORDER BY time, id",
+    );
+    /** 截止到 asOf 时刻的累计消耗；与"累计消耗"完全同源，只是把观测范围截断。 */
+    const spentUpTo = (alias: string, asOf: string): number | null => {
+      const snap = spentSnapshotStmt.get(alias, asOf) as
+        { total_spent: number; balance: number | null; time: string } | undefined;
+      if (snap === undefined) {
+        // 完全没有可读的站点累计值：整段都由签到记录反推。
+        const records = spentCheckinStmt.all(alias, asOf) as { balance_after: number }[];
+        return records.length > 1 ? spentFromBalances(records.map((r) => r.balance_after)) : null;
+      }
+      const after = spentCheckinAfterStmt.all(alias, snap.time, asOf) as { balance_after: number }[];
+      // 快照自己的余额作为序列起点，才能算出"快照 → 第一次签到"之间的消耗。
+      const balances = snap.balance !== null && snap.balance > 0
+        ? [snap.balance, ...after.map((r) => r.balance_after)]
+        : after.map((r) => r.balance_after);
+      return round2(snap.total_spent + spentFromBalances(balances));
+    };
 
     return aliases.map((alias) => {
       const stats = statsStmt.get(alias) as { total: number; credited: number; total_gained: number };
@@ -282,18 +314,19 @@ export function summarizeAccounts(file: string = DEFAULT_DB_FILE): AccountSummar
       const balance = balanceStmt.get(alias, alias) as { balance: number; time: string; source: string } | undefined;
       const identity = identityStmt.get(alias, alias) as { identity: string } | undefined;
       const snapshots = snapshotStmt.get(alias) as { n: number };
-      // 累计消耗：快照的站点"历史消耗"最新值优先。
-      const spentSnap = spentSnapshotStmt.get(alias) as { total_spent: number } | undefined;
-      let totalSpent: number | null = spentSnap?.total_spent ?? null;
-      if (totalSpent === null) {
-        // 无快照时由签到记录反推：相邻两次签到间消耗之和（上次余额 + 25 − 本次余额）。
-        const records = spentCheckinStmt.all(alias) as { balance_after: number }[];
-        let sum = 0;
-        for (let i = 1; i < records.length; i++) {
-          sum += Math.max(0, records[i - 1].balance_after + 25 - records[i].balance_after);
-        }
-        if (records.length > 1) totalSpent = round2(sum);
-      }
+      // 累计消耗：站点"历史消耗"只有快照采集的那一刻才准，快照一停采（实测 edge-1 最后一次
+      // 快照停在 9/22，10 月全靠签到记录）之后的消耗就不能凭空抹掉——用锚点 + 之后签到反推补齐。
+      const totalSpent = spentUpTo(alias, FAR_FUTURE);
+      // 近期消耗 = 现在的累计消耗 − 窗口起点的累计消耗。同源差分保证它永远不会比累计还大；
+      // 反过来按"每日明细"累加会在快照稀疏时重复计入跨窗口的那一大笔（实测 edge-1 曾算出
+      // 802.8 > 674.59）。窗口起点之前没有基线时按 0 计，等于把已有消耗都算作近期。
+      const beforeWindow = spentUpTo(alias, recentCutoff);
+      // 窗口里一个观测点都没有时，差分必然是 0，但那读作"最近没花钱"是骗人的——
+      // 那只是"没看到"。没观测就显示"—"，把 0 留给真正被看到却没花钱的账号。
+      const observedInWindow = balance?.time !== undefined && balance.time >= recentCutoff;
+      const recentSpent = totalSpent === null || !observedInWindow
+        ? null
+        : Math.max(0, round2(totalSpent - (beforeWindow ?? 0)));
       return {
         alias,
         identity: identity?.identity ?? "",
@@ -304,6 +337,7 @@ export function summarizeAccounts(file: string = DEFAULT_DB_FILE): AccountSummar
         balanceSource: balance === undefined ? null : balance.source === "snapshot" ? "snapshot" : "checkin",
         totalGained: round2(stats.total_gained ?? 0),
         totalSpent,
+        recentSpent,
         lastTime: last?.time ?? null,
         lastOk: last === undefined ? null : last.ok === 1,
         lastErrorCode: last?.error_code ?? null,
@@ -466,6 +500,25 @@ export type RangeRow = {
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
+}
+
+/** 站点每日签到发放的固定额度：反推消耗时要把这部分从余额变化里扣掉。 */
+const DAILY_CREDIT = 25;
+
+/** "不限时间"的上界：让带 asOf 的查询不必为"查全部"再写一份 SQL。 */
+const FAR_FUTURE = "9999-12-31T23:59:59.999Z";
+
+/**
+ * 由一串按时间正序的余额反推期间消耗：上次余额 + 当日额度 − 本次余额 = 期间花掉的钱。
+ * 余额同时被发放和消耗影响，只有扣掉额度后剩下的差额才是真实花费；
+ * 余额增长（没签到却变多）按 0 计，绝不把发放算成负消耗。
+ */
+function spentFromBalances(balances: number[]): number {
+  let sum = 0;
+  for (let i = 1; i < balances.length; i++) {
+    sum += Math.max(0, balances[i - 1] + DAILY_CREDIT - balances[i]);
+  }
+  return round2(sum);
 }
 
 /**
@@ -639,10 +692,9 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
       creditedFromCheckins.set(localDay(row.time), byDay);
     }
 
-    // 签到反推消耗：上次签到后的余额 + 当日额度(25) − 本次签到后的余额 = 两次签到之间的全部消耗。
+    // 签到反推消耗：上次签到后的余额 + 当日额度 − 本次签到后的余额 = 两次签到之间的全部消耗。
     // 快照的"历史消耗"需要每天跑 snapshot 才有观测点；签到记录每天都有（checkin-all 必然写
     // checkins 表），作为快照缺失时的兜底来源。
-    const DAILY_CREDIT = 25;
     /** day → alias → 签到反推的消耗 */
     const spentFromCheckins = new Map<string, Map<string, number>>();
     {
@@ -793,6 +845,20 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
   } finally {
     db.close();
   }
+}
+
+/** "近期消耗"的窗口天数（本地日，滚动）。报表文案里也写着这个数，改这里要同步。 */
+export const RECENT_SPENT_DAYS = 7;
+
+/**
+ * 近期消耗窗口的起点：今天在内的 N 个本地日的零点（UTC ISO）。
+ * 用本地日而不是"此刻减 N×24h"，否则一天里不同时刻打开报表会得到不同的窗口。
+ */
+function recentWindowStart(days: number = RECENT_SPENT_DAYS): string {
+  const start = new Date();
+  start.setDate(start.getDate() - (Math.max(1, days) - 1));
+  start.setHours(0, 0, 0, 0);
+  return start.toISOString();
 }
 
 /**

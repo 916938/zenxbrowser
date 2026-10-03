@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { readStore } from "./core.ts";
-import { balanceSeries, dailyTotals, listCheckins, rangeSummary, summarizeAccounts } from "./db.ts";
+import { balanceSeries, dailyTotals, listCheckins, rangeSummary, RECENT_SPENT_DAYS, summarizeAccounts } from "./db.ts";
 
 export type ReportOptions = {
   port?: number;
@@ -43,6 +43,7 @@ const page = `<!doctype html>
   th,td { padding:8px 12px; text-align:left; border-bottom:1px solid var(--line); white-space:nowrap }
   th { color:var(--dim); font-weight:600; font-size:12px; background:#12151b }
   tr:last-child td { border-bottom:none }
+  tr.total td { border-top:2px solid var(--line); font-weight:600; background:#12151b }
   .ok { color:var(--ok) } .bad { color:var(--bad) }
   .clickable { cursor:pointer } .clickable:hover { text-decoration:underline }
   .gain { color:var(--ok); font-weight:600 }
@@ -61,6 +62,7 @@ const page = `<!doctype html>
 <div class="cards" id="cards"></div>
 
 <h2>账号汇总</h2>
+<div class="sub">累计消耗 = 站点「历史消耗」；近期消耗 = 最近 ${RECENT_SPENT_DAYS} 天，同一算法相对 ${RECENT_SPENT_DAYS} 天前的增量（窗口内无观测点显示 —）。</div>
 <div id="summary"></div>
 
 <h2>每日总额</h2>
@@ -76,6 +78,7 @@ const page = `<!doctype html>
 <div id="detail"></div>
 
 <script>
+const RECENT_DAYS = ${RECENT_SPENT_DAYS};
 const COLORS = ["#58a6ff","#3fb950","#f0883e","#a371f7","#f85149","#39c5cf","#e3b341","#db61a2"];
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const money = v => v === null || v === undefined ? '<span class="muted">—</span>' : "$" + Number(v).toFixed(2);
@@ -123,6 +126,19 @@ async function load() {
   }
   const latestDay = daily.length ? daily[daily.length - 1] : null;
   const totalBalance = latestDay && latestDay.balanceSum !== null ? latestDay.balanceSum : null;
+  // 各合计都只累加"有读数"的账号：没有观测点的账号是缺失而不是 0，凑进去会让合计假装精确。
+  const sumOf = (pick) => {
+    const known = sum.map(pick).filter(v => v !== null && v !== undefined);
+    return known.length ? Math.round(known.reduce((a, v) => a + v, 0) * 100) / 100 : null;
+  };
+  const recentSum = sumOf(s => s.recentSpent);
+  const spentSum = sumOf(s => s.totalSpent);
+  const balanceSum = sumOf(s => s.currentBalance);
+  // 余额是"某个时刻的读数"，合计值旁边要说明它新鲜到什么程度——取所有账号里最新的那个观测点。
+  let freshest = null;
+  for (const s of sum) {
+    if (s.balanceTime && (!freshest || s.balanceTime > freshest)) freshest = s.balanceTime;
+  }
   const balanceNote = latestDay
     ? '<div class="k">' + (latestDay.balanceAccounts || 0) + " 个账号合计"
       + (latestDay.balanceStaleAccounts ? " · " + latestDay.balanceStaleAccounts + " 个沿用更早观测点" : "") + '</div>'
@@ -133,22 +149,34 @@ async function load() {
       : String(accounts)],
     ["打卡次数", totalRuns],
     ["成功到账", totalCredited], ["累计获得", "$" + totalGain.toFixed(2)],
+    ["历史总消耗", spentCell(spentSum)],
     ["余额总额", totalBalance === null ? '<span class="muted">—</span>' : "$" + totalBalance.toFixed(2) + balanceNote],
     ["最近一日消耗", spentCell(latestDay ? latestDay.spentSum : null)],
+    ["最近 " + RECENT_DAYS + " 天消耗", spentCell(recentSum)],
   ].map(([k, v]) => '<div class="card"><div class="k">' + k + '</div><div class="v">' + v + '</div></div>').join("");
 
   const notObserved = bound.accounts
     ? bound.accounts.filter(a => !sum.some(s => s.alias === a.alias))
         .map(a => ["<b>" + esc(a.alias) + "</b>", esc(a.identity), '<span class="muted">从未采集</span>',
                    '<span class="muted">—</span>', '<span class="muted">$0.00</span>', '<span class="muted">—</span>',
+                   '<span class="muted">—</span>',
                    0, 0, "—", "—", '<span class="muted">先跑一次 snapshot / checkin</span>'])
     : [];
+  // 账号按当前余额从高到低：一眼看出钱在哪。没读到余额的账号沉到最后——
+  // 它们是"未知"，不是"余额 0"，混在中间会被误读成最穷。
+  const byBalance = sum.slice().sort((a, b) => {
+    const x = a.currentBalance, y = b.currentBalance;
+    if (x === null || x === undefined) return y === null || y === undefined ? a.alias.localeCompare(b.alias) : 1;
+    if (y === null || y === undefined) return -1;
+    return y - x || a.alias.localeCompare(b.alias);
+  });
   document.getElementById("summary").innerHTML = (accounts || notObserved.length) ? table([
-    ["账号","身份","当前余额","余额观测","累计到账","累计消耗","打卡次数","成功","成功率","最近打卡","最近结果"],
-    ...sum.map(s => [
+    ["账号","身份","当前余额","余额观测","累计到账","累计消耗","近期消耗","打卡次数","成功","成功率","最近打卡","最近结果"],
+    ...byBalance.map(s => [
       "<b>" + esc(s.alias) + "</b>", esc(s.identity), money(s.currentBalance), observedAt(s.balanceTime),
       s.totalGained ? '<span class="gain">+$' + s.totalGained.toFixed(2) + '</span>' : '<span class="muted">$0.00</span>',
       spentCell(s.totalSpent),
+      spentCell(s.recentSpent),
       s.total, s.credited, (s.total ? Math.round(s.credited / s.total * 100) : 0) + "%",
       local(s.lastTime),
       s.lastOk === null ? "—" : s.lastOk
@@ -156,7 +184,15 @@ async function load() {
         : '<span class="bad">失败 ' + esc(s.lastErrorCode || "") + '</span>',
     ]),
     ...notObserved,
-  ]) : '<div class="empty">还没有签到记录，先运行一次 <code>zenx accounts checkin</code> 吧。</div>';
+  ], accounts ? [[
+    "<b>合计</b>", '<span class="muted">' + accounts + ' 个账号</span>',
+    // 各账号"各自最近一次观测"之和：观测点不在同一时刻，所以它是一组读数的合计，不是实时余额。
+    '<span title="各账号各自最近一次观测余额之和">' + money(balanceSum) + '</span>',
+    '<span title="所有账号里最新的一次余额观测">' + observedAt(freshest) + '</span>',
+    gain(totalGain), spentCell(spentSum), spentCell(recentSum),
+    totalRuns, totalCredited, (totalRuns ? Math.round(totalCredited / totalRuns * 100) : 0) + "%",
+    '<span class="muted">—</span>', '<span class="muted">—</span>',
+  ]] : []) : '<div class="empty">还没有签到记录，先运行一次 <code>zenx accounts checkin</code> 吧。</div>';
 
   document.getElementById("daily").innerHTML = drawDaily(daily);
   bindSpentDetail(daily);
@@ -263,10 +299,12 @@ function rangeSection(title, cmp) {
   ]);
 }
 
-function table(rows) {
+function table(rows, footer) {
   const head = rows[0].map(h => "<th>" + h + "</th>").join("");
   const body = rows.slice(1).map(r => "<tr>" + r.map(c => "<td>" + c + "</td>").join("") + "</tr>").join("");
-  return "<table><thead><tr>" + head + "</tr></thead><tbody>" + body + "</tbody></table>";
+  // 合计行渲染在末尾：它跨所有账号汇总，放在中间会被当成又一个账号。
+  const foot = (footer || []).map(r => '<tr class="total">' + r.map(c => "<td>" + c + "</td>").join("") + "</tr>").join("");
+  return "<table><thead><tr>" + head + "</tr></thead><tbody>" + body + foot + "</tbody></table>";
 }
 
 function drawChart(series) {
