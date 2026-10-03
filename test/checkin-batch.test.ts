@@ -95,7 +95,9 @@ test("checkin-all: retries=0 时不冷却、不重跑", async (t) => {
   assert.deepEqual(time.sleeps, []);
 });
 
-test("checkin-all: 非限流错误码不进冷却队列", async (t) => {
+// 非限流错误码不进**冷却**队列（不等待、不消耗限流预算），但失败不该就此丢下：
+// 收尾还会补签一轮。
+test("checkin-all: 非限流错误码不进冷却队列，收尾仍补签一次", async (t) => {
   const home = await fixture(t, [{ alias: "solo", instanceId: "cccc3333", expectedIdentity: "github_3", boundAt: "2026-09-13T00:00:00Z" }]);
   const time = clock();
   const report = await checkinAll(home, runner, {
@@ -105,9 +107,10 @@ test("checkin-all: 非限流错误码不进冷却队列", async (t) => {
     waitMs: 60_000,
     ...time,
   });
-  assert.equal(report.rounds, 1);
-  assert.equal(report.waitedMs, 0);
+  assert.equal(report.waitedMs, 0, "非限流失败不该冷却");
+  assert.deepEqual(time.sleeps, [], "一次都不该等");
   assert.equal(report.accounts[0].rateLimited, false);
+  assert.equal(report.accounts[0].attempts, 2, "收尾补签再试一次");
   assert.equal(report.failed, 1);
 });
 
@@ -513,4 +516,178 @@ test("checkin-all: --close-leftover 开跑前清理遗留实例，不碰账号�
   assert.deepEqual(closed, ["zzzz9999"], "只清追踪里的遗留实例，账号自己的实例一下都不碰");
   assert.deepEqual(report.leftoverCleanup, { tracked: 2, closed: 1, dropped: 1, failed: 0 });
   assert.deepEqual((await readLeftovers(home)).instances, [], "两条记录都应有归宿");
+});
+
+// --- 失败账号的补签：冷却顺带重试 + 收尾补一轮 ---
+
+/**
+ * 离线且没配启动路径的账号：ensure-online 立刻抛 LAUNCH_NOT_CONFIGURED，
+ * 用它稳定造出一种**非限流**的失败，好把补签队列和限流队列区分开。
+ */
+const offlineAccounts: Account[] = [
+  { alias: "off1", instanceId: "eeee1111", expectedIdentity: "g1", boundAt: "2026-09-13T00:00:00Z" },
+  { alias: "off2", instanceId: "eeee2222", expectedIdentity: "g2", boundAt: "2026-09-13T00:00:00Z" },
+];
+
+// 开头的账号卡在 BSK_TIMEOUT / PROFILE_CONNECT_TIMEOUT 之类，后面一路顺利：
+// 以前它们就这么被丢下了，现在收尾补一轮。
+test("checkin-all: 整轮没撞限流时，收尾给失败账号补签一轮", async (t) => {
+  const home = await fixture(t, offlineAccounts);
+  const time = clock();
+  const lines: string[] = [];
+  const report = await checkinAll(home, runner, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    maxRetries: 1,
+    windowSize: 0,
+    onProgress: (line) => lines.push(line),
+    ...time,
+    dbFile: tempDb(t),
+  });
+  assert.equal(report.waitedMs, 0, "没限流就不该冷却");
+  assert.equal(report.rounds, 2, "收尾补签算一轮");
+  for (const item of report.accounts) {
+    assert.equal(item.attempts, 2, `${item.alias} 失败后应再试一次`);
+    assert.equal(item.ok, false);
+  }
+  const sweep = lines.find((line) => line.includes("收尾补签"));
+  assert.match(sweep ?? "", /off1, off2/, "补签名单要写明是谁");
+});
+
+// 冷却那十几分钟是干等的，之前失败的账号顺手一起重试——不额外花时间，多一次机会。
+test("checkin-all: 冷却期间顺带重试之前失败的账号", async (t) => {
+  const home = await fixture(t, [
+    offlineAccounts[0],
+    { alias: "on2", instanceId: "aaaa1111", expectedIdentity: "g2", boundAt: "2026-09-13T00:00:00Z" },
+    { alias: "on3", instanceId: "bbbb2222", expectedIdentity: "g3", boundAt: "2026-09-13T00:00:00Z" },
+  ]);
+  // 第一轮 on2/on3 在线 → 签到超时（视为限流），off1 离线 → 非限流失败。
+  // 从第三轮（= 重试轮）起让 session start 直接失败：那样 on2/on3 是**非限流**失败，
+  // 不会再触发一次冷却把排在后面的 off1 挤掉，off1 才真的拿到第二次机会。
+  let starts = 0;
+  const spy: Runner = (args, options) => {
+    if (args[0] === "session" && args[1] === "start" && ++starts > 2) {
+      return Promise.resolve({ stdout: "session start failed", exitCode: 1 });
+    }
+    return runner(args, options);
+  };
+  const time = clock();
+  const lines: string[] = [];
+  const report = await checkinAll(home, spy, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    waitMs: 60_000,
+    maxRetries: 1,
+    windowSize: 0,
+    onProgress: (line) => lines.push(line),
+    ...time,
+    dbFile: tempDb(t),
+  });
+  const byAlias = new Map(report.accounts.map((item) => [item.alias, item]));
+  assert.equal(byAlias.get("off1")?.attempts, 2, "之前失败的账号应被顺带重试");
+  assert.equal(byAlias.get("on2")?.attempts, 2);
+  assert.equal(byAlias.get("on3")?.attempts, 2, "本组剩余账号照旧推迟到冷却后");
+  assert.equal(report.waitedMs, 60_000, "只冷却一次");
+  assert.match(lines.find((line) => line.includes("顺带重试")) ?? "", /off1/, "要说清顺带重试了谁");
+  assert.match(lines.find((line) => line.includes("随后重试")) ?? "", /on2, on3, off1/, "重试名单含补签账号");
+});
+
+// 跨组补签：前面组失败的账号在后面组的冷却里被重新拉起，组末回收必须覆盖它们，
+// 否则这些实例会漏在本轮之外（内存和 --close-after 一起失守）。
+test("checkin-all: 冷却期间跨组补签拉起的实例，组末照样回收", async (t) => {
+  const home = await fixture(t);
+  const launch = await launchable(home, "off1");
+  await writeFile(
+    join(home, "accounts.json"),
+    JSON.stringify({ version: 1, accounts: [{ ...offlineAccounts[0], launch }, offlineAccounts[1], { alias: "on3", instanceId: "aaaa1111", expectedIdentity: "g3", boundAt: "2026-09-13T00:00:00Z" }] }),
+  );
+  const online = new Set(["aaaa1111"]);
+  const closeCalls: string[] = [];
+  const spy: Runner = (args, options) => {
+    if (args[0] === "browsers" && args[1] === "close") {
+      closeCalls.push(args[3]);
+      // 关掉即下线：off1 第二次被拉起时才真的是"新拉起"的实例。
+      online.delete(args[3]);
+      return Promise.resolve({ stdout: JSON.stringify({ browser_id: args[3], closed: true, windows_closed: 1, sessions_stopped: 0, disconnected: true }), exitCode: 0 });
+    }
+    if (args[0] === "browsers") {
+      return Promise.resolve({ stdout: JSON.stringify([...online].map((id) => browser(id))), exitCode: 0 });
+    }
+    // off1 由 zenx 拉起后卡在 session start（非限流失败）；on3 走完整流程撞签到超时（限流）。
+    if (args[0] === "session" && args[1] === "start" && args.includes("eeee1111")) {
+      return Promise.resolve({ stdout: "session start failed", exitCode: 1 });
+    }
+    return runner(args, options);
+  };
+  const time = clock();
+  const report = await checkinAll(home, spy, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    waitMs: 60_000,
+    maxRetries: 1,
+    windowSize: 2,
+    launchDependencies: { launch: async () => { online.add("eeee1111"); }, platform: "win32", sleep: async () => {} },
+    ...time,
+    dbFile: tempDb(t),
+  });
+  const byAlias = new Map(report.accounts.map((item) => [item.alias, item]));
+  assert.equal(byAlias.get("off1")?.attempts, 2, "前面组失败的账号应被跨组补签");
+  assert.deepEqual(closeCalls, ["eeee1111", "eeee1111"], "两次拉起都要回收，第二次不能漏");
+  assert.equal(report.released, 2);
+});
+
+// 冷却时长：默认 11–13 分钟随机（站点约 10 分钟恢复），显式 --wait 不抖动。
+test("checkin-all: 默认冷却在 11–13 分钟之间取值", async (t) => {
+  const home = await fixture(t);
+  const short = await checkinAll(home, runner, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    maxRetries: 1,
+    random: () => 0,
+    ...clock(),
+    dbFile: tempDb(t),
+  });
+  assert.equal(short.waitedMs, 11 * 60_000, "随机取下限：11 分钟");
+  const long = await checkinAll(home, runner, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    maxRetries: 1,
+    random: () => 1,
+    ...clock(),
+    dbFile: tempDb(t),
+  });
+  assert.equal(long.waitedMs, 13 * 60_000, "随机取上限：13 分钟");
+});
+
+// 只关自己拉起的实例，但"自己拉起"要跨轮记忆：重试那轮实例已在线，
+// ensure-online 不会再报 launched=true（限流后冷却重试成功的账号就是这么漏掉的）。
+test("checkin-all: 上一轮拉起、这一轮仍在线的实例照常回收", async (t) => {
+  const home = await fixture(t);
+  const launch = await launchable(home, "alpha");
+  await writeFile(
+    join(home, "accounts.json"),
+    JSON.stringify({ version: 1, accounts: [{ ...accounts[0], launch }, accounts[1]] }),
+  );
+  const alphaUp = { up: false };
+  const closeCalls: string[] = [];
+  const spy = launchSpy(alphaUp, (id) => {
+    closeCalls.push(id);
+    return { stdout: JSON.stringify({ browser_id: id, closed: true, windows_closed: 1, sessions_stopped: 0, disconnected: true }), exitCode: 0 };
+  });
+  const time = clock();
+  const report = await checkinAll(home, spy, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    waitMs: 60_000,
+    maxRetries: 1,
+    closeAfter: true,
+    windowSize: 0,
+    launchDependencies: { launch: async () => { alphaUp.up = true; }, platform: "win32", sleep: async () => {} },
+    ...time,
+    dbFile: tempDb(t),
+  });
+  assert.equal(report.rounds, 2, "限流冷却后重试过一轮");
+  assert.equal(report.accounts.find((item) => item.alias === "alpha")?.launched, true, "alpha 的 Edge 是本轮拉起的");
+  assert.deepEqual(closeCalls, ["aaaa1111"], "alpha 是 zenx 拉起的，重试轮结束照样关掉");
+  assert.equal(report.released, 1);
 });

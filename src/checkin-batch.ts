@@ -13,11 +13,16 @@ import { recordLaunchedInstance } from "./leftover.ts";
 import { enrichBskTimeout } from "./diagnose.ts";
 
 /**
- * 站点登录限流后的默认冷却时间。站点约 10 分钟恢复，脚本取 15 分钟留余量。
+ * 站点登录限流后的默认冷却时长与随机波动范围。站点约 10 分钟恢复，取 12 分钟留余量，
+ * 再在 ±1 分钟内随机抖一下（实际落在 11–13 分钟）：固定 15 分钟一轮要多花好几分钟，
+ * 而固定单一值又容易被站点侧按节拍认出来。
+ *
  * 关键是：限流不是账号级的，而是**站点侧的共享配额**——同一出口 IP 连续登录若干次后，
  * 站点对所有账号都只提示"登录次数过多请稍后再试"，此时继续跑只会把更多账号退出成登出态。
  */
-export const DEFAULT_RETRY_WAIT_MS = 15 * 60_000;
+export const DEFAULT_RETRY_WAIT_MS = 12 * 60_000;
+/** 默认冷却的随机波动幅度：实际时长 = DEFAULT_RETRY_WAIT_MS ± 本值。显式传 --wait 时不抖动。 */
+export const DEFAULT_RETRY_WAIT_JITTER_MS = 60_000;
 /** 默认视为"可能是限流、值得冷却后重试"的错误码。 */
 export const DEFAULT_RETRY_CODES = ["LOGIN_RATE_LIMITED", "LOGIN_TIMEOUT"];
 
@@ -26,7 +31,7 @@ const DEFAULT_CLOSE_TIMEOUT_MS = 45_000;
 /**
  * BSK_TIMEOUT 即时重试的等待时间。首次 bsk 调用常因扩展/守护进程冷启动而超时
  * （edge-1 这类长期运行的用户自己的 Edge 尤其明显），短暂等待后重试通常成功。
- * 与限流冷却（15 分钟）不同，这是快速重试，不影响其他账号，也不消耗限流重试次数。
+ * 与限流冷却（11–13 分钟）不同，这是快速重试，不影响其他账号，也不消耗限流重试次数。
  */
 const BSK_TIMEOUT_RETRY_DELAY_MS = 10_000;
 
@@ -61,7 +66,10 @@ export type AccountOutcome = {
   /** 签到成功后是否已关闭该实例释放内存（未开 --close-after 时为 false）。 */
   closed: boolean;
   closureError?: string;
-  /** 该账号的 Edge 是否由本轮拉起；false 表示它本来就在跑（用户自己的）。 */
+  /**
+   * 该账号的 Edge 是否由本轮（含前面的轮次）拉起、且尚未关闭。
+   * false 表示它本来就在跑（用户自己的）——只关自己拉起的实例是硬约束。
+   */
   launched?: boolean;
 };
 
@@ -129,7 +137,10 @@ export type CheckinBatchOptions = {
   aliases?: string[];
   checkinTimeoutMs?: number;
   ensureTimeoutMs?: number;
-  /** 限流冷却时长；默认 15 分钟。 */
+  /**
+   * 限流冷却时长；默认 12 分钟上下随机（11–13 分钟）。显式指定时不抖动。
+   * 无论冷却与否，失败的账号都会再补签一次（见 checkinAll 的收尾补签）。
+   */
   waitMs?: number;
   /** 每个账号最多自动重试几次；默认 1。 */
   maxRetries?: number;
@@ -155,6 +166,8 @@ export type CheckinBatchOptions = {
   force?: boolean;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  /** 冷却时长的随机源（测试替身）；默认 Math.random。 */
+  random?: () => number;
   /** 批量状态文件；默认 .zenx/checkin-state.json。 */
   stateFile?: string;
   dbFile?: string;
@@ -227,9 +240,15 @@ function stamp(ms: number): string {
   return new Date(ms).toISOString();
 }
 
+/** 分钟数：整数就不带小数（"12 分钟"），抖动出来的才显示一位（"11.7 分钟"）。 */
+function formatMinutes(ms: number): string {
+  const minutes = ms / 60_000;
+  return Number.isInteger(minutes) ? String(minutes) : minutes.toFixed(1);
+}
+
 /**
  * 分段等待，每段结束报告剩余时长。
- * 分段而不是一次 sleep：15 分钟没有任何输出时无法区分"在等冷却"和"卡住了"。
+ * 分段而不是一次 sleep：十几分钟没有任何输出时无法区分"在等冷却"和"卡住了"。
  * 不足一整段时就是单次 sleep，行为与原来一致。
  */
 async function sleepWithProgress(
@@ -261,12 +280,17 @@ function chunkAccounts(accounts: Account[], size: number): Account[][] {
  *    而登出态连 checkin 都无法再启动，只能靠 zenx accounts login 恢复）；
  * 2. **窗口上限**（默认 8）：一次只让这么多账号在线，一组签完立刻关掉它们的 Edge 实例，
  *    再拉起下一组——内存占用的峰值因此被压在窗口大小的实例数上；
- * 3. 冷却等待期间已完成账号保持关闭状态，不会白占 15 分钟内存。
+ * 3. 冷却等待期间已完成账号保持关闭状态，不会白占十几分钟内存；
+ * 4. 失败的账号不会就此丢下：撞上限流时顺冷却一起重试，全程没限流也会在收尾补签一轮。
  */
 export async function checkinAll(home: string, run: Runner, options: CheckinBatchOptions = {}): Promise<CheckinBatchReport> {
   const now = options.now ?? (() => Date.now());
   const sleep = options.sleep ?? delay;
-  const waitMs = options.waitMs ?? DEFAULT_RETRY_WAIT_MS;
+  const random = options.random ?? Math.random;
+  const baseWaitMs = options.waitMs ?? DEFAULT_RETRY_WAIT_MS;
+  // 只有走默认值才抖动：显式 --wait 是用户算好的时长，不该被改掉。
+  const jitterMs = options.waitMs === undefined ? DEFAULT_RETRY_WAIT_JITTER_MS : 0;
+  const pickWaitMs = () => Math.round(baseWaitMs + (jitterMs > 0 ? (random() * 2 - 1) * jitterMs : 0));
   const maxRetries = options.maxRetries ?? 1;
   const retryCodes = new Set(options.retryCodes ?? DEFAULT_RETRY_CODES);
   const closeAfter = options.closeAfter === true;
@@ -322,10 +346,48 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
     }
   }
 
-  const groups = windowSize > 0 ? chunkAccounts(todo, windowSize) : [todo];
+  const plan = windowSize > 0 ? chunkAccounts(todo, windowSize) : [todo];
   let rounds = 0;
   let waited = 0;
   let released = 0;
+  /**
+   * 本轮由 zenx 拉起、尚未关闭的实例（按别名记，跨轮共享）。
+   *
+   * 必须跨轮记忆：重试那一轮实例已经在线，ensure-online 不会再报 launched=true，
+   * 只看当轮就会把"上一轮由 zenx 拉起、本轮该回收的 Edge"误判成用户自己的而永远不关
+   * ——限流后冷却重试成功的账号（edge-p14 那类）就是这么漏掉的。
+   */
+  const ours = new Set<string>();
+  /**
+   * 补签队列：本轮失败过、重试次数还没用完的账号（按失败先后排队）。
+   * 冷却那十几分钟是干等的，正好顺带把它们一起重试；全程没撞上限流时，
+   * 收尾还会再给它们一轮（开头的账号卡在 BSK_TIMEOUT、后面一切顺利时尤其有用）。
+   */
+  const retryPool = new Map<string, Account>();
+
+  /** 从补签队列取出最多 limit 个账号；exclude 里已有的（本组剩余账号）跳过。 */
+  const takeFromPool = (limit: number, exclude: Account[]): Account[] => {
+    const taken: Account[] = [];
+    for (const [alias, account] of retryPool) {
+      if (taken.length >= limit) break;
+      retryPool.delete(alias);
+      if (exclude.some((item) => item.alias === alias)) continue;
+      taken.push(account);
+    }
+    return taken;
+  };
+
+  /**
+   * 冷却期间还能再塞几个补签账号：zenx 拉起的在线实例数不能超过窗口上限。
+   * 已在重试名单里的本就占着位，不算进余量；用户自己的 Edge（非本轮拉起）不计入，
+   * 窗口上限管的是 zenx 同时开着的实例数。
+   */
+  const roomInWindow = (group: Account[], deferred: Account[]): number => {
+    if (windowSize <= 0) return Number.POSITIVE_INFINITY;
+    const already = new Set(deferred.map((item) => item.alias));
+    const stillOpen = group.filter((item) => !already.has(item.alias) && ours.has(item.alias)).length;
+    return Math.max(0, windowSize - deferred.length - stillOpen);
+  };
 
   const remember = async (alias: string, outcome: AccountOutcome) => {
     outcomes.set(alias, outcome);
@@ -341,13 +403,19 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
     await writeState(file, state);
   };
 
-  for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
-    const group = groups[groupIndex];
-    if (groups.length > 1) {
-      onProgress(`[组 ${groupIndex + 1}/${groups.length}] ${group.length} 个账号（同时在线上限 ${windowSize}）`);
+  for (let groupIndex = 0; groupIndex < plan.length; groupIndex++) {
+    const group = plan[groupIndex];
+    if (plan.length > 1) {
+      onProgress(`[组 ${groupIndex + 1}/${plan.length}] ${group.length} 个账号（同时在线上限 ${windowSize}）`);
     }
     let pending: Account[] = group;
     let round = 0;
+    /**
+     * 本组（含从补签队列拉进来、属于前面组的账号）实际碰过的账号。
+     * 收尾回收要覆盖它们：跨组补签会重新拉起 Edge，只回收本组会把这些实例漏在本轮之外，
+     * 内存和 --close-after 都会失守。
+     */
+    const handled: Account[] = [...group];
 
     while (pending.length > 0) {
       round += 1;
@@ -357,33 +425,57 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
         const account = pending[index];
         const attempt = (outcomes.get(account.alias)?.attempts ?? 0) + 1;
         onProgress(`[轮 ${round}] ${account.alias}: 第 ${attempt} 次签到`);
-        const outcome = await runOne(home, run, account, { ...options, attempt, closeAfter, onProgress, now, sleep });
+        const outcome = await runOne(home, run, account, { ...options, attempt, closeAfter, onProgress, now, sleep, ours });
         await remember(account.alias, outcome);
         if (outcome.ok) {
+          // 已经成了，就不必再补签（它可能之前失败过、队列里还留着记录）。
+          retryPool.delete(account.alias);
           onProgress(`${account.alias}: ${outcome.skipped ? `跳过（${outcome.skipped}）` : `已到账 ${outcome.balanceBefore} → ${outcome.balanceAfter}`}`);
           continue;
         }
         onProgress(`${account.alias}: 失败 ${outcome.code ?? "UNKNOWN"} — ${outcome.message ?? ""}`);
+        // 失败不是终局：排进补签队列，等冷却（或收尾）时再试一次。
+        // 限流类错误码不进这个队列——它们是站点侧的共享配额，不冷却就重试只会再撞一次墙；
+        // 它们走的是上面那条冷却重试的路子。
+        // 每次尝试都刷新这条记录：次数用完或已经成功时必须**移出**队列，
+        // 否则上次失败留下的旧记录会让收尾补签多跑一遍。
+        if (outcome.attempts <= maxRetries && (outcome.code === undefined || !retryCodes.has(outcome.code))) {
+          retryPool.set(account.alias, account);
+        } else {
+          retryPool.delete(account.alias);
+        }
         if (outcome.rateLimited) {
           // 本轮剩下的账号同样会命中共享配额，一并推迟到冷却之后再试。
           deferred.push(...pending.slice(index));
+          const deferredByLimit = deferred.length;
+          // 冷却是干等的十几分钟，顺手把之前失败的账号也拉进来重试：多等一轮不再花时间，
+          // 却给了开头卡在 BSK_TIMEOUT / PROFILE_CONNECT_TIMEOUT 的账号第二次机会。
+          const piggyback = takeFromPool(roomInWindow(handled, deferred), deferred);
+          if (piggyback.length > 0) {
+            deferred.push(...piggyback);
+            for (const item of piggyback) {
+              if (!handled.some((known) => known.alias === item.alias)) handled.push(item);
+            }
+            onProgress(`冷却期间顺带重试 ${piggyback.length} 个之前失败的账号：${piggyback.map((item) => item.alias).join(", ")}`);
+          }
           // 带上时间戳与错误码：限流是整轮最耗时的一步，事后排查全靠这几行。
           onProgress(
             `[${stamp(now())}] 命中站点登录限流（${outcome.code ?? "UNKNOWN"}，账号 ${account.alias}）：` +
-              `剩余 ${deferred.length} 个账号推迟到冷却后重试`,
+              `剩余 ${deferredByLimit} 个账号推迟到冷却后重试`,
           );
           break;
         }
       }
       if (deferred.length === 0 || round > maxRetries) break;
+      const cooldownMs = pickWaitMs();
       const coolStart = now();
-      const coolEnd = coolStart + waitMs;
+      const coolEnd = coolStart + cooldownMs;
       onProgress(
-        `[${stamp(coolStart)}] 冷却开始：${Math.round(waitMs / 60_000)} 分钟（${stamp(coolEnd)} 结束），` +
+        `[${stamp(coolStart)}] 冷却开始：${formatMinutes(cooldownMs)} 分钟（${stamp(coolEnd)} 结束），` +
           `随后重试 ${deferred.length} 个账号：${deferred.map((item) => item.alias).join(", ")}`,
       );
-      await sleepWithProgress(waitMs, sleep, onProgress);
-      waited += waitMs;
+      await sleepWithProgress(cooldownMs, sleep, onProgress);
+      waited += cooldownMs;
       onProgress(`[${stamp(now())}] 冷却结束，开始重试 ${deferred.length} 个账号`);
       pending = deferred;
     }
@@ -391,17 +483,21 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
     // 这一组结束就释放它们的 Edge 实例：内存峰值 = 窗口大小，而不是账号总数。
     // 在窗口内失败也要关——失败的账号同样占着一个 Edge 进程（它停在哪一步都不影响这一点）。
     if (closeAfter || windowSize > 0) {
-      for (const account of group) {
+      for (const account of handled) {
         const current = outcomes.get(account.alias);
         if (current?.closed) continue;
         // 只关本轮拉起的实例。本来就在跑的那个 Edge 是用户自己的（共用同一 Profile），
         // 关掉会连标签页和未保存内容一起带走——省内存远不值得冒这个险。
-        if (current?.launched === false) {
+        // 判定用跨轮的 ours：重试轮实例已在线，当轮的 launched 会是 false。
+        if (!ours.has(account.alias)) {
           onProgress(`${account.alias}: 实例非本轮拉起（用户自己的 Edge），保留不关`);
           continue;
         }
         const release = await releaseInstance(home, run, account.alias, onProgress);
-        if (release.closed) released += 1;
+        if (release.closed) {
+          released += 1;
+          ours.delete(account.alias);
+        }
         await remember(account.alias, {
           ...(current ?? {
             alias: account.alias,
@@ -423,6 +519,15 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
           await writeState(file, state);
         }
       }
+    }
+
+    // 收尾补签：所有账号都跑完了，还有失败过且重试次数没用完的账号，就再给它们一轮。
+    // 撞上限流的在冷却时已经顺带重试过（那时已从队列取走）；这里兜住的是"整轮都没限流"
+    // 的情形——例如开头几个账号卡在 BSK_TIMEOUT，后面一路顺利，它们本该再试一次。
+    if (groupIndex === plan.length - 1 && retryPool.size > 0) {
+      const extra = takeFromPool(Number.POSITIVE_INFINITY, []);
+      onProgress(`收尾补签：${extra.length} 个账号本轮失败过，再试一次：${extra.map((item) => item.alias).join(", ")}`);
+      plan.push(...(windowSize > 0 ? chunkAccounts(extra, windowSize) : [extra]));
     }
   }
 
@@ -448,7 +553,8 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
     waitedMs: waited,
     /** 同时在线上限；0 表示不分组。 */
     windowSize,
-    groups: groups.length,
+    /** 分组数；含失败账号的收尾补签组。 */
+    groups: plan.length,
     /** 本轮实际关闭的实例数（释放内存）。 */
     released,
     /** 开跑前就因"今天已到账"跳过、未拉起 Edge 的账号数。 */
@@ -476,11 +582,17 @@ async function runOne(
     maxRetries?: number;
     dbFile?: string;
     launchDependencies?: LaunchDependencies;
+    /**
+     * 本轮由 zenx 拉起、尚未关闭的实例（跨轮共享）。
+     * 重试那一轮实例已在线，当轮的 launched 恒为 false，只看当轮会漏关
+     * "上一轮拉起、这一轮签到成功"的实例。
+     */
+    ours: Set<string>;
   },
 ): Promise<AccountOutcome> {
   const retryCodes = new Set(context.retryCodes ?? DEFAULT_RETRY_CODES);
   const maxRetries = context.maxRetries ?? 1;
-  const base = {
+  const base = () => ({
     alias: account.alias,
     attempts: context.attempt,
     rateLimited: false,
@@ -488,24 +600,26 @@ async function runOne(
     balanceAfter: null,
     closed: false,
     credited: false,
-    launched: false,
-  };
-  let launched = false;
+    launched: context.ours.has(account.alias),
+  });
   try {
     const online = await ensureOnline(home, run, account.alias, context.ensureTimeoutMs ?? 60_000, context.launchDependencies);
-    launched = online.launched === true;
-    // zenx 拉起的实例立刻落盘：这一步之后无论签到成败、关闭成败，
-    // close-leftover 都能在事后识别出"这是 zenx 该负责的窗口"。
-    if (launched) await recordLaunchedInstance(home, account.alias, online.instanceId);
+    if (online.launched === true) {
+      context.ours.add(account.alias);
+      // zenx 拉起的实例立刻落盘：这一步之后无论签到成败、关闭成败，
+      // close-leftover 都能在事后识别出"这是 zenx 该负责的窗口"。
+      await recordLaunchedInstance(home, account.alias, online.instanceId);
+    }
   } catch (error) {
     const enriched = await enrichBskTimeout(error, run, { instanceId: account.instanceId });
     return {
-      ...base,
+      ...base(),
       ok: false,
       code: enriched instanceof ZenxError ? enriched.code : "COMMAND_FAILED",
       message: enriched instanceof Error ? enriched.message : "无法拉起 Edge。",
     };
   }
+  const launched = context.ours.has(account.alias);
   try {
     let result: CheckinResult;
     try {
@@ -514,9 +628,10 @@ async function runOne(
         dbFile: context.dbFile,
         now: context.now,
         sleep: context.sleep,
-        // 只关本轮拉起的实例：账号本来就在线时，那个 Edge 是用户自己的，
+        // 只关 zenx 自己拉起的实例：账号本来就在线时，那个 Edge 是用户自己的，
         // 共用同一个 Profile —— 关掉会连标签页与未保存内容一起带走。
-        closeAfter: context.closeAfter && launched === true,
+        // 用跨轮的 launched：上一轮拉起、这一轮才签到成功的实例同样要回收。
+        closeAfter: context.closeAfter && launched,
       });
     } catch (firstError) {
       // BSK_TIMEOUT 即时重试一次：首次 bsk 调用常因扩展/守护进程冷启动而超时
@@ -530,11 +645,12 @@ async function runOne(
         dbFile: context.dbFile,
         now: context.now,
         sleep: context.sleep,
-        closeAfter: context.closeAfter && launched === true,
+        closeAfter: context.closeAfter && launched,
       });
     }
+    if (result.closed === true) context.ours.delete(account.alias);
     return {
-      ...base,
+      ...base(),
       launched,
       ok: result.ok,
       credited: result.checkinCredited === true && result.skipped === undefined,
@@ -543,12 +659,16 @@ async function runOne(
       balanceAfter: result.balanceAfter,
       code: result.code,
       message: result.code === "CHECKIN_UNCONFIRMED" ? "流程跑完但未确认到账；用 zenx accounts recheck 核对。" : undefined,
+      // 签到成功时 --close-after 已经关掉了实例：如实回传，免得收尾再关一次
+      // 然后报一堆 INSTANCE_OFFLINE。
+      closed: result.closed === true,
+      ...(result.closureError === undefined ? {} : { closureError: result.closureError }),
     };
   } catch (error) {
     const enriched = await enrichBskTimeout(error, run, { instanceId: account.instanceId });
     const code = enriched instanceof ZenxError ? enriched.code : "COMMAND_FAILED";
     const message = enriched instanceof Error ? enriched.message : "签到失败。";
     const rateLimited = retryCodes.has(code) && context.attempt <= maxRetries;
-    return { ...base, launched, ok: false, code, message, rateLimited };
+    return { ...base(), launched, ok: false, code, message, rateLimited };
   }
 }

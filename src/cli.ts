@@ -42,7 +42,7 @@ const help = `ZenX Browser — Windows Edge 多账号连接台
   zenx accounts inspect-site <别名> [--tab-id <N>] [--timeout 45s]
   zenx accounts login <别名> [--timeout 3m]
   zenx accounts checkin <别名> [--timeout 3m] [--force] [--close-after] [--inhibit-sleep yes|no] [--inhibit-timeout 4m]
-  zenx accounts checkin-all [--timeout 3m] [--wait 15m] [--retries 1] [--window 8] [--close-after] [--close-leftover] [--retry-codes CODES] [--inhibit-sleep yes|no] [--inhibit-timeout 4h]
+  zenx accounts checkin-all [--timeout 3m] [--wait 12m] [--retries 1] [--window 8] [--close-after] [--close-leftover] [--retry-codes CODES] [--inhibit-sleep yes|no] [--inhibit-timeout 4h]
   zenx accounts recheck <别名> [--timeout 45s] [--record yes|no]
   zenx accounts snapshot <别名> [--timeout 45s]
   zenx accounts snapshot --all [--timeout 45s]
@@ -112,9 +112,11 @@ checkin 默认只回收本次的隔离窗口，Edge 进程留着；加 --close-a
 login 只补"登录"这一步（不退出、不签到）：用于 checkin 在重登阶段失败后账号停在登出态、
   因而连 checkin 都无法再启动的自救；已登录则原样返回，不动账号状态。
 checkin-all 依次处理全部账号，并自动处理站点登录限流：命中限流/登录超时的账号记录等待起点，
-  冷却 --wait（默认 15 分钟）后自动重试 --retries 次（默认 1）。--window（默认 8）限制同时在线
+  冷却 --wait（默认 11–13 分钟随机）后自动重试 --retries 次（默认 1）。失败的账号还会再补签一次：
+  撞上限流时顺冷却一起重试，全程没限流则收尾补一轮。--window（默认 8）限制同时在线
   的账号数：一组签完立刻关掉它们的 Edge 实例再拉下一组，把内存峰值压在窗口大小内（0=不分组）。
-  --close-after 即使不分组也逐个账号关闭；状态落在 .zenx/checkin-state.json，单个账号失败不中断后续。
+  --close-after 即使不分组也逐个账号关闭（只关 zenx 自己拉起的实例，含上一轮拉起、本轮签到成功的）；
+  状态落在 .zenx/checkin-state.json，单个账号失败不中断后续。
   两个命令在开始前都会开启**防休眠**（进程级，不改电源计划）：跑几十分钟、中间还可能
   等限流冷却，休眠一次就会整轮中断。--inhibit-sleep no 关闭；--inhibit-timeout 设上限
   （默认单账号 签到预算+1m、批量 4h，最长 24h），到点自动释放。激活失败只是降级并记日志，
