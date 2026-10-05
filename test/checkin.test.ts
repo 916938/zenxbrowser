@@ -1515,3 +1515,78 @@ test("checkin --force 时不做“今日已到账”判定（确需重跑就不�
   assert.equal((report as { code?: string }).code, "CHECKIN_UNCONFIRMED", "重登不会二次发放，如实报未确认");
   assertStopped(script);
 });
+
+// ---------------------------------------------------------------------------
+// 回归（2026-10-04/05 edge-10 实况）：高消耗账号的余额只跌不涨。
+//
+// 该账号日消耗约 500（站点"历史消耗"从 09-22 的 54.35 涨到 10-04 的 602.5），
+// 而每日额度只有 25。只比余额的话 balanceAfter > balanceBefore 永远为假，
+// 每次签到都判 CHECKIN_UNCONFIRMED → 账本永远没有到账记录 → pending 清不掉 →
+// 每天被反复退出重登，连续两天最终撞上站点共享登录限流（LOGIN_RATE_LIMITED）。
+//
+// 正确口径是 Δ余额 + Δ消耗（recheck.ts 一直这么判）：两端读数同源，
+// 余额变化只有"发放"和"消耗"两个来源，加回 Δ消耗剩下的就是发放额。
+// ---------------------------------------------------------------------------
+
+/** 带"历史消耗"的控制台正文：余额与累计消耗必须同源，Δ 才成立。 */
+const observeWithSpent = (balance: string, spent: string) => vom([
+  'L1 page',
+  '    @e11 button "G github_16350 chevron_down [has-submenu]"',
+  `    main "账户数据 当前余额 ${balance} 历史消耗 ${spent}"`,
+].join("\n"));
+
+test("checkin 高消耗账号：余额净跌但 Δ余额+Δ消耗 达到每日额度 → 确认到账", async (t) => {
+  const home = await fixture(t);
+  const script = scriptRunner({
+    observes: [
+      reply(observeWithSpent("$1522.50", "$602.50")),   // 退出前：余额 1522.50、累计消耗 602.50
+      reply(observeMenuOpen),
+      reply(observeLoggedOut),
+      reply(observeLanding),
+      // 重登后：余额跌到 1015.79，但消耗涨了 532.71 —— 发放 25 被消耗盖住了。
+      reply(observeWithSpent("$1015.79", "$1135.21")),
+    ],
+  });
+  const report = await checkinAccount(home, script.run, "work", 180_000, deps());
+  assert.equal(report.checkinCredited, true, "Δ余额 -506.71 + Δ消耗 532.71 = 25，钱确实到账了");
+  assert.equal(report.ok, true);
+  assert.equal((report as { code?: string }).code, undefined, "不得再报 CHECKIN_UNCONFIRMED");
+  assert.equal(report.balanceBefore, 1522.5);
+  assert.equal(report.balanceAfter, 1015.79, "如实记录余额，不因口径变化而粉饰");
+  assertStopped(script);
+});
+
+test("checkin 高消耗账号：只有消耗没有发放 → 仍报 CHECKIN_UNCONFIRMED（不制造假到账）", async (t) => {
+  const home = await fixture(t);
+  const script = scriptRunner({
+    observes: [
+      reply(observeWithSpent("$1522.50", "$602.50")),
+      reply(observeMenuOpen),
+      reply(observeLoggedOut),
+      reply(observeLanding),
+      // 余额跌 506.71，消耗也正好涨 506.71 —— 全是消耗，一分钱都没发放。
+      reply(observeWithSpent("$1015.79", "$1109.21").replace('alert "success type"', "")),
+    ],
+  });
+  const report = await checkinAccount(home, script.run, "work", 180_000, deps());
+  assert.equal(report.checkinCredited, false, "Δ 合计为 0，没有发放就不能算到账");
+  assert.equal((report as { code?: string }).code, "CHECKIN_UNCONFIRMED");
+  assertStopped(script);
+});
+
+test("checkin 读不到历史消耗时退化为裸余额差（宁可漏判，不凭空加一笔消耗）", async (t) => {
+  const home = await fixture(t);
+  const script = scriptRunner({
+    observes: [
+      reply(observeWithSpent("$1522.50", "$602.50")),
+      reply(observeMenuOpen),
+      reply(observeLoggedOut),
+      reply(observeLanding),
+      reply(observeDashboard("$1015.79", false)),  // 确认页没有"历史消耗"字段
+    ],
+  });
+  const report = await checkinAccount(home, script.run, "work", 180_000, deps());
+  assert.equal(report.checkinCredited, false, "缺一端消耗读数就不能加 Δ消耗，否则是凭空造账");
+  assert.equal((report as { code?: string }).code, "CHECKIN_UNCONFIRMED");
+  assertStopped(script);
+});

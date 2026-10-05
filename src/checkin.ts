@@ -2,8 +2,8 @@ import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 import { isEdge, listBrowsers, protocolSupported, readStore, withStoreLock, ZenxError } from "./core.ts";
 import type { Account, Runner } from "./core.ts";
-import { DEFAULT_DB_FILE, hasCreditedBetween, insertCheckin, lastBalanceBefore } from "./db.ts";
-import { extractBalance as consoleExtractBalance } from "./console.ts";
+import { DEFAULT_DB_FILE, hasCreditedBetween, insertCheckin, lastBalancePointBefore, lastPairedSnapshotBefore } from "./db.ts";
+import { extractBalance as consoleExtractBalance, extractTotalSpent as consoleExtractTotalSpent } from "./console.ts";
 import { closeBrowser, findAccount } from "./launch.ts";
 import type { LaunchDependencies } from "./launch.ts";
 import { agentRouter } from "./sites/agentrouter.ts";
@@ -48,6 +48,15 @@ const NAVIGATE_ATTEMPTS = 3;
 const NAVIGATE_RETRY_MS = 2_000;
 /** 站点每日签到发放的额度：登出态自救后用它判断"本次登录是否已发放"（与 recheck 同源）。 */
 const DAILY_CREDIT = 25;
+/**
+ * 配对消耗基准的最大年龄（与 recheck.ts 的 MAX_BASELINE_AGE_MS 同源同值）。
+ *
+ * Δ消耗只在两个观测点之间的时段里等于区间消耗，而发放每次登录最多一笔。基准越旧，
+ * 窗口里裹进的发放次数越多：快照停更十天后 Δ余额 + Δ消耗 会把十天的发放算成"今天到账"。
+ * 日例行每天给每个账号落一笔快照，超过两天没有配对观测点就说明数据不足以收敛到单日，
+ * 此时放弃 Δ消耗、退化为只比余额——宁可漏判到账，也不凭空造一笔。
+ */
+const MAX_BASELINE_AGE_MS = 48 * 60 * 60_000;
 
 /** 用于从 bsk 调用序列中识别"DOM 直调"表达式（测试与排障用）。 */
 const DOM_INTERACT_MARKER = "zenx-dom-interact";
@@ -280,6 +289,14 @@ export function labelOfRef(page: SessionPage, ref: string): string | undefined {
  */
 function extractBalance(page: SessionPage): number | null {
   return consoleExtractBalance(page.text);
+}
+
+/**
+ * 页面正文 → 站点"历史消耗"累计值（只增不减）。两个时点的差值才是区间真实消耗。
+ * 到账判定需要它：余额同时被发放和消耗影响，只比余额会把高消耗账号的真实到账判没。
+ */
+function extractTotalSpent(page: SessionPage): number | null {
+  return consoleExtractTotalSpent(page.text);
 }
 
 function hasAnnouncement(page: SessionPage): boolean {
@@ -748,14 +765,46 @@ async function runCheckinSteps(
     }
   };
 
-  /** 账本里"今天开始前"的最后一次余额：登出态自救时作为"发放前"基准（读不到就退化）。 */
-  const readBaselineBalance = (): number | null => {
+  /**
+   * 账本里"今天开始前"的发放前基准：最后一次余额，外加同一行的配对累计消耗。
+   *
+   * 配对消耗是可选的加强项（与 recheck.ts 同一套规则）：只有当那笔快照**同时**是
+   * 最新的余额观测点、且足够新（≤ MAX_BASELINE_AGE_MS）时才采用，否则丢弃、退化为
+   * 只比余额。理由见 db.lastPairedSnapshotBefore：基准错配会把别的时段的发放
+   * 重复计进 Δ消耗，凭空凑出一笔不存在的到账。
+   */
+  const readBaseline = (): { balance: number | null; totalSpent: number | null } => {
     try {
       const { start } = todayUtcRange(new Date());
-      return lastBalanceBefore(account.alias, start, dbFile);
+      const latest = lastBalancePointBefore(account.alias, start, dbFile);
+      const paired = lastPairedSnapshotBefore(account.alias, start, dbFile);
+      const fresh = paired !== null && Date.now() - Date.parse(paired.time) <= MAX_BASELINE_AGE_MS;
+      const usable = paired !== null && fresh && latest !== null && paired.time === latest.time;
+      return { balance: latest?.balance ?? null, totalSpent: usable ? paired.totalSpent : null };
     } catch {
-      return null;
+      return { balance: null, totalSpent: null };
     }
+  };
+
+  /**
+   * 相对基准的"到账增量" = Δ余额 + Δ消耗。
+   *
+   * 为什么不能用裸余额差：余额同时被签到发放和日常消耗拉动。高消耗账号每天烧掉的钱
+   * 远超每日额度（实测 edge-10：日消耗约 500，额度只有 25），余额永远只跌不涨，
+   * 只比余额会让它恒判 CHECKIN_UNCONFIRMED —— 账本因此永远没有到账记录，
+   * pending 清不掉，每天被反复重登直到撞上站点登录限流。
+   * 消耗读数缺失时返回裸余额差：宁可漏判，也不凭空加一笔消耗制造假到账。
+   */
+  const creditDeltaFrom = (
+    baseline: { balance: number | null; totalSpent: number | null },
+    balance: number | null,
+    totalSpent: number | null,
+  ): number | null => {
+    if (baseline.balance === null || balance === null) return null;
+    const spentDelta = baseline.totalSpent !== null && totalSpent !== null
+      ? Math.max(0, totalSpent - baseline.totalSpent)
+      : 0;
+    return Math.round((balance - baseline.balance + spentDelta) * 100) / 100;
   };
 
   let page = await preparePage(clickTarget);
@@ -782,20 +831,23 @@ async function runCheckinSteps(
     }
   }
 
-  // ⑤ 记录退出前余额。登出态自救的账号没有"退出前"这一说——本次登录就是发放动作，
-  // 对照组只能取账本里今天开始前的余额。
-  const baselineBalance = readBaselineBalance();
+  // ⑤ 记录退出前余额与累计消耗。两者必须取自**同一次**页面读取，Δ余额 + Δ消耗
+  // 才等于发放额。登出态自救的账号没有"退出前"这一说——本次登录就是发放动作，
+  // 对照组只能取账本里今天开始前的余额（连同配对消耗）。
+  const baseline = readBaseline();
+  const baselineBalance = baseline.balance;
   const balanceBefore = restoredByLogin ? baselineBalance : extractBalance(page);
+  const totalSpentBefore = restoredByLogin ? baseline.totalSpent : extractTotalSpent(page);
 
-  // ⑤d 今日额度在本次运行之前就已发放（当前余额相对"今天开始前"的基线已增长 ≥ 每日额度）
+  // ⑤d 今日额度在本次运行之前就已发放（到账增量相对"今天开始前"的基线 ≥ 每日额度）
   // → 收工：不退出重登，也不判 CHECKIN_UNCONFIRMED。
   // 站点是"登录即发放"：当天早些时候任何一次登录（哪怕是半途失败的 LOGIN_TIMEOUT /
   // LOGOUT_FAILED）都会把额度发掉。等 zenx 再跑"退出→重登"，重登不会二次发放，本次
   // 运行内余额必然纹丝不动——只认"本次运行期间增长"的话，这类账号会永远
   // CHECKIN_UNCONFIRMED、pending 永远清不掉，还要白白再耗一次站点登录配额
   // （连续约 10 次就触发共享限流）。判据与 recheck 一致，误判上限是"当天有人充过值"。
-  if (force !== true && !restoredByLogin && baselineBalance !== null && balanceBefore !== null &&
-      balanceBefore - baselineBalance >= DAILY_CREDIT) {
+  if (force !== true && !restoredByLogin &&
+      (creditDeltaFrom(baseline, balanceBefore, extractTotalSpent(page)) ?? -1) >= DAILY_CREDIT) {
     return {
       ok: true,
       alias: account.alias,
@@ -834,11 +886,11 @@ async function runCheckinSteps(
     };
   }
 
-  // ⑤c 登出态自救已能确认额度到账（余额相对"今天开始前"增长 ≥ 每日额度）→ 收工。
+  // ⑤c 登出态自救已能确认额度到账（到账增量相对"今天开始前"≥ 每日额度）→ 收工。
   // 不再走退出重登：那会多消耗一次站点登录配额（约 10 次连续登录就触发限流）。
   if (restoredByLogin) {
     const afterRestore = extractBalance(page);
-    if (baselineBalance !== null && afterRestore !== null && afterRestore - baselineBalance >= DAILY_CREDIT) {
+    if ((creditDeltaFrom(baseline, afterRestore, extractTotalSpent(page)) ?? -1) >= DAILY_CREDIT) {
       return {
         ok: true,
         alias: account.alias,
@@ -910,17 +962,29 @@ async function runCheckinSteps(
   page = relogin.page;
   sawCheckinSuccess = sawCheckinSuccess || relogin.sawCheckinSuccess;
 
-  // ⑧ 签到确认：回控制台仪表盘读新余额。
+  // ⑧ 签到确认：回控制台仪表盘读新余额与新的累计消耗。
   await navigateConsole();
   page = await preparePage(clickTarget);
   const balanceAfter = extractBalance(page);
   const hasCheckinSuccess = sawCheckinSuccess || page.text.includes("签到成功");
-  // 余额两端都读到时只认真实增长："签到成功"只是动作提示，实测当天重复登录也照样出现
-  // （账本里 10/15 条成功记录余额零增长），拿它当到账判据会批量制造假成功。
-  // 只有余额读不到（页面没渲染出余额）时才退回文本信号，此时结果标为未确认。
-  const checkinCredited = balanceBefore !== null && balanceAfter !== null
-    ? balanceAfter > balanceBefore
-    : hasCheckinSuccess;
+  /**
+   * 到账 = Δ余额 + Δ消耗，而不是裸余额差。
+   *
+   * 两端的余额与累计消耗都取自**同一次页面读取**，因此这个等式是精确的：
+   * 区间内余额的变化只有"发放"和"消耗"两个来源，加回 Δ消耗后剩下的就是发放额。
+   * 只比余额会漏判高消耗账号：实测 edge-10 日消耗约 500（额度只有 25），余额永远
+   * 只跌不涨，每次签到都被判 CHECKIN_UNCONFIRMED —— 账本因此永远没有到账记录，
+   * pending 清不掉，于是每天被反复退出重登，直到撞上站点共享登录限流。
+   *
+   * 只有余额读不到（页面没渲染出余额）时才退回文本信号"签到成功"，此时结果标为未确认：
+   * 那只是动作提示，当天重复登录也会出现，不能单独作为到账依据。
+   */
+  const creditDelta = creditDeltaFrom(
+    { balance: balanceBefore, totalSpent: totalSpentBefore },
+    balanceAfter,
+    extractTotalSpent(page),
+  );
+  const checkinCredited = creditDelta !== null ? creditDelta > 0 : hasCheckinSuccess;
   if (!checkinCredited) {
     return {
       ok: false,

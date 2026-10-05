@@ -405,7 +405,7 @@ Register-ScheduledTask -TaskName "ZenX 每日签到" -Action $action -Trigger $t
 | `MANUAL_INTERVENTION_REQUIRED` | 出现 GitHub 授权/验证页，需人工处理 |
 | `LOGIN_TIMEOUT` | 重新登录轮询超 60s（多数是站点限流的间接症状，可用 `zenx accounts login` 恢复登录态） |
 | `LOGIN_RATE_LIMITED` | 站点登录限流（页面明示“登录次数过多/请稍后再试”）；必须等待冷却，不可连续重试 |
-| `CHECKIN_UNCONFIRMED` | 流程完成但余额未变且无“签到成功”提示 |
+| `CHECKIN_UNCONFIRMED` | 流程完成但未确认到账：Δ余额 + Δ消耗 没有增长，且无“签到成功”提示 |
 | `RECHECK_EVAL_FAILED` | 复查时读不到页面正文；未给出额度结论 |
 | `RECHECK_TIMEOUT` | 复查总预算耗尽 |
 
