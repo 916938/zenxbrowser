@@ -367,16 +367,20 @@ test("CLI accounts close 按精确实例 ID 关闭，不启动也不改绑定", 
   const lines: string[] = [];
   const calls: string[][] = [];
   let launches = 0;
+  let closed = false;
   const code = await main(["accounts", "close", "work", "--confirm", "--json"], {
     home, output: (line) => lines.push(line),
     run: async (args, options) => {
       calls.push(args);
       if (args[1] === "close") {
         assert.deepEqual(options, { timeoutMs: 45_000 });
+        closed = true;
         return { stdout: closeReply, exitCode: 0 };
       }
-      assert.deepEqual(options, { timeoutMs: 45_000, env: { BSK_BROWSER_WAIT_MS: "0" } });
-      return { stdout: JSON.stringify([edge]), exitCode: 0 };
+      // 复核查询用的预算更短（不超过总预算），只核对零等待与预算上界。
+      assert.equal(options?.env?.BSK_BROWSER_WAIT_MS, "0");
+      assert.ok((options?.timeoutMs ?? 0) > 0 && (options?.timeoutMs ?? 0) <= 45_000);
+      return { stdout: JSON.stringify(closed ? [] : [edge]), exitCode: 0 };
     },
     launchDependencies: { now: () => 1000, launch: async () => { launches++; } },
   });
@@ -384,14 +388,31 @@ test("CLI accounts close 按精确实例 ID 关闭，不启动也不改绑定", 
   assert.deepEqual(calls, [
     ["browsers", "--json"],
     ["browsers", "close", "--browser-id", edge.instance_id, "--confirm", "--json"],
+    ["browsers", "--json"],
   ]);
   assert.equal(launches, 0);
   assert.equal(lines.length, 1);
   assert.deepEqual(JSON.parse(lines[0]), {
     ok: true, alias: "work", instanceId: edge.instance_id, browser_id: edge.instance_id,
     closed: true, windows_closed: 2, sessions_stopped: 1, disconnected: false, identity: "not_verified",
+    outcome: { requestAcked: true, windowsClosedReported: 2, instanceOffline: true },
   });
   assert.equal(await readFile(join(home, "accounts.json"), "utf8"), before);
+});
+
+test("CLI accounts close 复核仍在线时以非零退出，避免脚本误判已释放", async (t) => {
+  const { home } = await launchFixture(t);
+  const lines: string[] = [];
+  const code = await main(["accounts", "close", "work", "--confirm", "--json"], {
+    home, output: (line) => lines.push(line),
+    run: async (args) => {
+      if (args[1] === "close") return { stdout: closeReply, exitCode: 0 };
+      return { stdout: JSON.stringify([edge]), exitCode: 0 };
+    },
+    launchDependencies: { now: () => 1000, sleep: async () => {} },
+  });
+  assert.equal(code, 1, "未确认离线不能以 0 收尾");
+  assert.equal(JSON.parse(lines[0]).outcome.instanceOffline, false);
 });
 
 for (const [timeout, budget] of [["1500ms", 1500], ["2s", 2000], ["1m", 60_000], ["5m", 300_000]] as const) {

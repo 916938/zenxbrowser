@@ -46,10 +46,10 @@ const HINTS: Record<string, HintTemplate> = {
 
   // --- 站点与签到 ---
   LOGIN_RATE_LIMITED: {
-    text: "这是站点侧共享配额（同一出口 IP 连续登录触发），不是账号问题，立刻重试只会更糟。等待约 10 分钟后再跑；批量场景用 zenx accounts checkin-all --wait 12m 自动冷却重试。",
+    text: "这是站点侧共享配额（同一出口 IP 连续登录触发），不是账号问题，立刻重试只会更糟。等待 15 分钟后再跑；批量场景用 zenx accounts checkin-all 自动冷却重试（默认 15–18 分钟，且只补足距首次限流还没等够的那截）。",
   },
   LOGIN_TIMEOUT: {
-    text: "三种常见原因：① 窗口被隐藏/最小化（先激活该 Profile 的 Edge 窗口）② 站点限流（等约 10 分钟，见 LOGIN_RATE_LIMITED）③ GitHub 会话过期（人工登录一次）。可先跑 zenx accounts login {alias} 只补登录。",
+    text: "三种常见原因：① 窗口被隐藏/最小化（先激活该 Profile 的 Edge 窗口）② 站点限流（等 15 分钟以上，见 LOGIN_RATE_LIMITED）③ GitHub 会话过期（人工登录一次）。可先跑 zenx accounts login {alias} 只补登录。",
     vars: ["alias"],
   },
   IDENTITY_MISMATCH: {
@@ -100,6 +100,9 @@ const HINTS: Record<string, HintTemplate> = {
   },
   NOT_EDGE: {
     text: "目标实例不是 Microsoft Edge。确认 --instance-id 取自 Edge 实例（用 bsk browsers 核对）。",
+  },
+  CLOSE_UNCONFIRMED: {
+    text: "关闭请求已被响应，但复核时该实例仍在注册表里——窗口可能还在退出。等几秒后用 zenx accounts check 复核；仍未释放就跑 zenx accounts close-leftover --confirm，它会再关一次并保留失败原因。",
   },
   CLOSE_NOT_SUPPORTED: {
     text: "该实例的扩展不认识 browser.close。先用 bsk browsers 看 EXT 列：若显示的还是旧版本号，说明 daemon 仍持有更新扩展之前的旧注册（换了扩展构建后必须重启 daemon，否则新方法一概被当成 unknown_method）——先把该实例的 Edge 关掉，再跑 bsk daemon restart，确认 EXT 变成新版本后重试。",

@@ -38,6 +38,12 @@ const page = `<!doctype html>
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 18px; min-width:150px }
   .card .k { color:var(--dim); font-size:12px }
   .card .v { font-size:22px; font-weight:600; margin-top:2px }
+  /* 一个卡片里按站点分行：两个站点的额度不能互转，合起来显示会误导 */
+  .card .row { display:flex; justify-content:space-between; gap:16px; font-size:14px; margin-top:3px }
+  .card .row:first-of-type { margin-top:2px }
+  .card .row .n { color:var(--dim); font-size:12px }
+  .card .row .n b { color:var(--accent); font-weight:600 }
+  .card .multi .v { display:none }
   table { width:100%; border-collapse:collapse; background:var(--card);
           border:1px solid var(--line); border-radius:10px; overflow:hidden }
   th,td { padding:8px 12px; text-align:left; border-bottom:1px solid var(--line); white-space:nowrap }
@@ -80,6 +86,14 @@ const page = `<!doctype html>
 <script>
 const RECENT_DAYS = ${RECENT_SPENT_DAYS};
 const COLORS = ["#58a6ff","#3fb950","#f0883e","#a371f7","#f85149","#39c5cf","#e3b341","#db61a2"];
+// 站点：账本 alias 形如 "edge-6" / "edge-6@anyrouter"。同一个 Edge Profile 可以在
+// 多个站点上各有一个账号，两边的余额独立（不能互转），所以处处按站点分开显示。
+const SITE_NAMES = { agentrouter: "AgentRouter", anyrouter: "AnyRouter" };
+const SITE_ORDER = ["agentrouter", "anyrouter"];
+const siteOf = a => { const s = String(a ?? ""); const i = s.lastIndexOf("@"); return i > 0 ? s.slice(i + 1) : "agentrouter"; };
+const baseOf = a => { const s = String(a ?? ""); const i = s.lastIndexOf("@"); return i > 0 ? s.slice(0, i) : s; };
+const siteName = s => SITE_NAMES[s] || s;
+const siteRank = s => { const i = SITE_ORDER.indexOf(s); return i < 0 ? SITE_ORDER.length : i; };
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const money = v => v === null || v === undefined ? '<span class="muted">—</span>' : "$" + Number(v).toFixed(2);
 const local = t => t ? new Date(t).toLocaleString("zh-CN", { hour12:false }) : '<span class="muted">—</span>';
@@ -118,62 +132,97 @@ async function load() {
   const totalCredited = sum.reduce((a, s) => a + s.credited, 0);
   const totalGain = sum.reduce((a, s) => a + s.totalGained, 0);
   document.getElementById("meta").textContent =
-    (accounts ? accounts + " 个账号有数据 · 共 " + totalRuns + " 次打卡 · " : "暂无数据 · ")
+    // 一个 Edge Profile 可以在多个站点上各有账号，账本里每个"站点账号"一行，
+    // 所以这里说"站点账号"而不是"账号"——否则数字会比已绑定的 Profile 数多，看着像出错。
+    (accounts ? accounts + " 个站点账号有数据 · 共 " + totalRuns + " 次打卡 · " : "暂无数据 · ")
     + "数据为 UTC，显示已转本地时间";
   if (bound.ok && missing.length) {
     document.getElementById("meta").innerHTML +=
       ' · <span class="bad">' + missing.length + ' 个已绑定账号暂无观测点：' + esc(missing.join("、")) + '</span>';
   }
   const latestDay = daily.length ? daily[daily.length - 1] : null;
-  const totalBalance = latestDay && latestDay.balanceSum !== null ? latestDay.balanceSum : null;
+  // 按站点聚合：两个站点的额度不能互转，加起来得到的"总额"没有意义，
+  // 因此每个卡片按站点各给一行，而不是合成一个数字。
   // 各合计都只累加"有读数"的账号：没有观测点的账号是缺失而不是 0，凑进去会让合计假装精确。
-  const sumOf = (pick) => {
-    const known = sum.map(pick).filter(v => v !== null && v !== undefined);
-    return known.length ? Math.round(known.reduce((a, v) => a + v, 0) * 100) / 100 : null;
-  };
-  const recentSum = sumOf(s => s.recentSpent);
-  const spentSum = sumOf(s => s.totalSpent);
-  const balanceSum = sumOf(s => s.currentBalance);
-  // 余额是"某个时刻的读数"，合计值旁边要说明它新鲜到什么程度——取所有账号里最新的那个观测点。
-  let freshest = null;
+  const siteStats = new Map();
   for (const s of sum) {
-    if (s.balanceTime && (!freshest || s.balanceTime > freshest)) freshest = s.balanceTime;
+    const site = siteOf(s.alias);
+    const st = siteStats.get(site) || { accounts: 0, runs: 0, credited: 0, gain: 0,
+      spent: 0, hasSpent: false, recent: 0, hasRecent: false, balance: 0, balAccounts: 0, freshest: null };
+    st.accounts += 1;
+    st.runs += s.total || 0;
+    st.credited += s.credited || 0;
+    st.gain += s.totalGained || 0;
+    if (s.totalSpent !== null && s.totalSpent !== undefined) { st.spent += s.totalSpent; st.hasSpent = true; }
+    if (s.recentSpent !== null && s.recentSpent !== undefined) { st.recent += s.recentSpent; st.hasRecent = true; }
+    if (s.currentBalance !== null && s.currentBalance !== undefined) { st.balance += s.currentBalance; st.balAccounts += 1; }
+    if (s.balanceTime && (!st.freshest || s.balanceTime > st.freshest)) st.freshest = s.balanceTime;
+    siteStats.set(site, st);
   }
-  const balanceNote = latestDay
-    ? '<div class="k">' + (latestDay.balanceAccounts || 0) + " 个账号合计"
-      + (latestDay.balanceStaleAccounts ? " · " + latestDay.balanceStaleAccounts + " 个沿用更早观测点" : "") + '</div>'
-    : "";
+  const sitesPresent = [...siteStats.keys()].sort((a, b) => siteRank(a) - siteRank(b));
+  const perSiteCard = (title, pick) =>
+    '<div class="card multi"><div class="k">' + title + '</div><div class="v"></div>'
+    + sitesPresent.map(site =>
+        '<div class="row"><span class="n"><b>' + esc(siteName(site)) + '</b></span>'
+        + '<span>' + pick(siteStats.get(site), site) + '</span></div>').join("")
+    + '</div>';
+  const dash = '<span class="muted">—</span>';
   document.getElementById("cards").innerHTML = [
-    ["账号数", boundCount
-      ? '<span title="账本有数据 / 已绑定">' + accounts + ' / ' + boundCount + '</span>'
-      : String(accounts)],
-    ["打卡次数", totalRuns],
-    ["成功到账", totalCredited], ["累计获得", "$" + totalGain.toFixed(2)],
-    ["历史总消耗", spentCell(spentSum)],
-    ["余额总额", totalBalance === null ? '<span class="muted">—</span>' : "$" + totalBalance.toFixed(2) + balanceNote],
-    ["最近一日消耗", spentCell(latestDay ? latestDay.spentSum : null)],
-    ["最近 " + RECENT_DAYS + " 天消耗", spentCell(recentSum)],
-  ].map(([k, v]) => '<div class="card"><div class="k">' + k + '</div><div class="v">' + v + '</div></div>').join("");
+    perSiteCard("账号数", st => st.accounts + " 个"),
+    perSiteCard("打卡次数", st => st.runs),
+    perSiteCard("成功到账", st => st.credited),
+    perSiteCard("累计获得", st => '<span class="gain">+$' + st.gain.toFixed(2) + '</span>'),
+    perSiteCard("历史总消耗", st => st.hasSpent ? spentCell(st.spent) : dash),
+    perSiteCard("余额总额", (st, site) => {
+      if (!st.balAccounts) return dash;
+      const note = latestDay && latestDay.bySite && latestDay.bySite[site]
+        ? ' <span class="muted" style="font-size:11px">' + latestDay.bySite[site].balanceAccounts + ' 个账号</span>'
+        : "";
+      return money(st.balance) + note;
+    }),
+    perSiteCard("最近一日消耗", (st, site) => {
+      const d = latestDay && latestDay.bySite ? latestDay.bySite[site] : null;
+      return d ? spentCell(d.spentSum) : dash;
+    }),
+    perSiteCard("最近 " + RECENT_DAYS + " 天消耗", st => st.hasRecent ? spentCell(st.recent) : dash),
+  ].join("");
 
   const notObserved = bound.accounts
     ? bound.accounts.filter(a => !sum.some(s => s.alias === a.alias))
-        .map(a => ["<b>" + esc(a.alias) + "</b>", esc(a.identity), '<span class="muted">从未采集</span>',
+        .map(a => ["<b>" + esc(a.alias) + "</b>", esc(siteName("agentrouter")), esc(a.identity),
+                   '<span class="muted">从未采集</span>',
                    '<span class="muted">—</span>', '<span class="muted">$0.00</span>', '<span class="muted">—</span>',
                    '<span class="muted">—</span>',
                    0, 0, "—", "—", '<span class="muted">先跑一次 snapshot / checkin</span>'])
     : [];
-  // 账号按当前余额从高到低：一眼看出钱在哪。没读到余额的账号沉到最后——
-  // 它们是"未知"，不是"余额 0"，混在中间会被误读成最穷。
+  // 同一个 Profile 在多个站点上的行挨在一起（一眼看出这个 Profile 的两笔余额），
+  // 组间按该 Profile 的最高余额降序——仍是"钱多的在前"。没读到余额的沉到最后：
+  // 它们是"未知"而不是"余额 0"，混在中间会被误读成最穷。
+  const groupMax = new Map();
+  for (const s of sum) {
+    const key = baseOf(s.alias);
+    const v = s.currentBalance;
+    if (v !== null && v !== undefined) {
+      const cur = groupMax.get(key);
+      if (cur === undefined || v > cur) groupMax.set(key, v);
+    }
+  }
   const byBalance = sum.slice().sort((a, b) => {
-    const x = a.currentBalance, y = b.currentBalance;
-    if (x === null || x === undefined) return y === null || y === undefined ? a.alias.localeCompare(b.alias) : 1;
-    if (y === null || y === undefined) return -1;
-    return y - x || a.alias.localeCompare(b.alias);
+    const ga = baseOf(a.alias), gb = baseOf(b.alias);
+    if (ga !== gb) {
+      const xa = groupMax.get(ga), xb = groupMax.get(gb);
+      if (xa === undefined && xb === undefined) return ga.localeCompare(gb);
+      if (xa === undefined) return 1;
+      if (xb === undefined) return -1;
+      return xb - xa || ga.localeCompare(gb);
+    }
+    return siteRank(siteOf(a.alias)) - siteRank(siteOf(b.alias));
   });
   document.getElementById("summary").innerHTML = (accounts || notObserved.length) ? table([
-    ["账号","身份","当前余额","余额观测","累计到账","累计消耗","近期消耗","打卡次数","成功","成功率","最近打卡","最近结果"],
+    ["账号","站点","身份","当前余额","余额观测","累计到账","累计消耗","近期消耗","打卡次数","成功","成功率","最近打卡","最近结果"],
     ...byBalance.map(s => [
-      "<b>" + esc(s.alias) + "</b>", esc(s.identity), money(s.currentBalance), observedAt(s.balanceTime),
+      "<b>" + esc(baseOf(s.alias)) + "</b>", esc(siteName(siteOf(s.alias))), esc(s.identity),
+      money(s.currentBalance), observedAt(s.balanceTime),
       s.totalGained ? '<span class="gain">+$' + s.totalGained.toFixed(2) + '</span>' : '<span class="muted">$0.00</span>',
       spentCell(s.totalSpent),
       spentCell(s.recentSpent),
@@ -184,15 +233,18 @@ async function load() {
         : '<span class="bad">失败 ' + esc(s.lastErrorCode || "") + '</span>',
     ]),
     ...notObserved,
-  ], accounts ? [[
-    "<b>合计</b>", '<span class="muted">' + accounts + ' 个账号</span>',
+  ], accounts ? sitesPresent.map(site => {
+    const st = siteStats.get(site);
     // 各账号"各自最近一次观测"之和：观测点不在同一时刻，所以它是一组读数的合计，不是实时余额。
-    '<span title="各账号各自最近一次观测余额之和">' + money(balanceSum) + '</span>',
-    '<span title="所有账号里最新的一次余额观测">' + observedAt(freshest) + '</span>',
-    gain(totalGain), spentCell(spentSum), spentCell(recentSum),
-    totalRuns, totalCredited, (totalRuns ? Math.round(totalCredited / totalRuns * 100) : 0) + "%",
-    '<span class="muted">—</span>', '<span class="muted">—</span>',
-  ]] : []) : '<div class="empty">还没有签到记录，先运行一次 <code>zenx accounts checkin</code> 吧。</div>';
+    // 两站的额度不能互转，因此每个站点各一行合计，不给跨站点的总数。
+    return ["<b>合计 " + esc(siteName(site)) + "</b>", esc(siteName(site)),
+      '<span class="muted">' + st.accounts + ' 个账号</span>',
+      '<span title="各账号各自最近一次观测余额之和">' + money(st.balAccounts ? st.balance : null) + '</span>',
+      '<span title="该站点里最新的一次余额观测">' + observedAt(st.freshest) + '</span>',
+      gain(st.gain), spentCell(st.hasSpent ? st.spent : null), spentCell(st.hasRecent ? st.recent : null),
+      st.runs, st.credited, (st.runs ? Math.round(st.credited / st.runs * 100) : 0) + "%",
+      '<span class="muted">—</span>', '<span class="muted">—</span>'];
+  }) : []) : '<div class="empty">还没有签到记录，先运行一次 <code>zenx accounts checkin</code> 吧。</div>';
 
   document.getElementById("daily").innerHTML = drawDaily(daily);
   bindSpentDetail(daily);
@@ -202,12 +254,13 @@ async function load() {
   document.getElementById("chart").innerHTML = drawChart(series);
 
   document.getElementById("detail").innerHTML = rows.length ? table([
-    ["时间","账号","打卡前","打卡后","增减","结果"],
+    ["时间","账号","站点","打卡前","打卡后","增减","结果"],
     ...rows.map(r => {
       const delta = (r.balanceAfter !== null && r.balanceBefore !== null)
         ? r.balanceAfter - r.balanceBefore : null;
       return [
-        local(r.time), esc(r.alias), money(r.balanceBefore), money(r.balanceAfter),
+        local(r.time), esc(baseOf(r.alias)), esc(siteName(siteOf(r.alias))),
+        money(r.balanceBefore), money(r.balanceAfter),
         delta === null ? '<span class="muted">—</span>'
           : delta > 0 ? '<span class="gain">+$' + delta.toFixed(2) + '</span>'
           : delta < 0 ? '<span class="bad">-$' + Math.abs(delta).toFixed(2) + '</span>'
@@ -221,22 +274,36 @@ async function load() {
 
 function drawDaily(rows) {
   if (!rows.length) return '<div class="empty">还没有每日快照，先跑一次 <code>zenx accounts snapshot --all</code>。</div>';
-  const body = rows.slice().reverse().map(r => {
-    const hasDetail = r.spentDetails && r.spentDetails.length;
-    const spentHtml = (r.spentSum === null || r.spentSum === undefined)
-      ? '<span class="muted">—</span>'
-      : hasDetail
-        ? '<span class="bad clickable" data-spent-day="' + esc(r.day) + '" title="点击展开各账号消耗明细">-$' + Number(r.spentSum).toFixed(2) + ' ▸</span>'
-        : '<span class="bad">-$' + Number(r.spentSum).toFixed(2) + '</span>';
-    return [
-      "<b>" + esc(r.day) + "</b>",
-      money(r.balanceSum),
-      spentHtml,
-      gain(r.creditedSum),
-      (r.balanceAccounts || 0) + " 个余额 / " + (r.spentAccounts || 0) + " 个消耗",
-    ];
-  });
-  return table([["日期", "余额总额", "当日消耗", "当日签到到账", "覆盖账号"], ...body]);
+  const body = [];
+  // 一天按站点分成多行：两站的余额不能互转，合成一个数会误导。
+  for (const r of rows.slice().reverse()) {
+    const sites = r.bySite ? Object.keys(r.bySite).sort((a, b) => siteRank(a) - siteRank(b)) : [];
+    const groups = sites.length
+      ? sites.map(s => ({ site: s, d: r.bySite[s] }))
+      // 老账本没有 bySite：退回整行合计，不至于显示空白
+      : [{ site: null, d: { balanceSum: r.balanceSum, spentSum: r.spentSum, creditedSum: r.creditedSum,
+                            balanceAccounts: r.balanceAccounts, spentAccounts: r.spentAccounts } }];
+    for (const g of groups) {
+      const d = g.d;
+      const detailCount = (r.spentDetails || []).filter(x => g.site === null || siteOf(x.alias) === g.site).length;
+      const spentHtml = (d.spentSum === null || d.spentSum === undefined)
+        ? '<span class="muted">—</span>'
+        : detailCount
+          ? '<span class="bad clickable" data-spent-day="' + esc(r.day) + '"'
+            + (g.site ? ' data-spent-site="' + esc(g.site) + '"' : '')
+            + ' title="点击展开各账号消耗明细">-$' + Number(d.spentSum).toFixed(2) + ' ▸</span>'
+          : '<span class="bad">-$' + Number(d.spentSum).toFixed(2) + '</span>';
+      body.push([
+        "<b>" + esc(r.day) + "</b>",
+        g.site ? esc(siteName(g.site)) : '<span class="muted">全部</span>',
+        money(d.balanceSum),
+        spentHtml,
+        gain(d.creditedSum),
+        (d.balanceAccounts || 0) + " 个余额 / " + (d.spentAccounts || 0) + " 个消耗",
+      ]);
+    }
+  }
+  return table([["日期", "站点", "余额总额", "当日消耗", "当日签到到账", "覆盖账号"], ...body]);
 }
 
 /** 点击"当日消耗"展开/收起各账号消耗明细。 */
@@ -254,14 +321,18 @@ function bindSpentDetail(daily) {
     }
     const dayData = daily.find(d => d.day === day);
     if (!dayData || !dayData.spentDetails) return;
+    // 站点过滤：一天按站点分成多行，展开时只显示该站点的账号
+    const site = el.dataset.spentSite || null;
+    const details = dayData.spentDetails.filter(d => !site || siteOf(d.alias) === site);
+    if (!details.length) return;
     const detailRow = document.createElement("tr");
     detailRow.dataset.detailRow = "1";
     const cell = document.createElement("td");
-    cell.colSpan = 5;
+    cell.colSpan = 6;
     cell.style.cssText = "padding:8px 12px;background:#12151b";
-    cell.innerHTML = dayData.spentDetails.map(d =>
+    cell.innerHTML = details.map(d =>
       '<div style="display:flex;justify-content:space-between;padding:2px 0;gap:12px">' +
-      '<span>' + esc(d.alias) + '</span>' +
+      '<span>' + esc(baseOf(d.alias)) + ' <span class="muted">' + esc(siteName(siteOf(d.alias))) + '</span></span>' +
       '<span class="bad">-$' + d.spent.toFixed(2) + '</span>' +
       '<span class="muted" style="font-size:11px">' + (d.source === "snapshot" ? "快照" : "签到") + '</span>' +
       '</div>'
@@ -283,19 +354,35 @@ function drawRanges(ranges) {
 function rangeSection(title, cmp) {
   if (!cmp.current.length) return "<h3>" + title + "</h3>" + '<div class="empty">暂无数据</div>';
   const prev = new Map(cmp.previous.map(r => [r.alias, r]));
-  const rows = cmp.current.map(r => {
+  // 同一 Profile 的两站挨在一起，组内按站点顺序；合计每个站点各一行
+  const order = cmp.current.slice().sort((a, b) => {
+    const ga = baseOf(a.alias), gb = baseOf(b.alias);
+    return ga === gb ? siteRank(siteOf(a.alias)) - siteRank(siteOf(b.alias)) : ga.localeCompare(gb);
+  });
+  const rows = order.map(r => {
     const p = prev.get(r.alias) || { credited: 0, spent: null };
     const net = r.spent === null ? null : r.credited - r.spent;
     const pnet = p.spent === null ? null : (p.credited || 0) - p.spent;
-    return ["<b>" + esc(r.alias) + "</b>", gain(r.credited), spentCell(r.spent), netCell(net),
+    return ["<b>" + esc(baseOf(r.alias)) + "</b>", esc(siteName(siteOf(r.alias))),
+            gain(r.credited), spentCell(r.spent), netCell(net),
             gain(p.credited || 0), spentCell(p.spent === undefined ? null : p.spent), netCell(pnet)];
   });
-  const credited = cmp.current.reduce((a, r) => a + (r.credited || 0), 0);
-  const hasSpent = cmp.current.some(r => r.spent !== null);
-  const spent = hasSpent ? cmp.current.reduce((a, r) => a + (r.spent || 0), 0) : null;
-  rows.push(["<b>合计</b>", gain(credited), spentCell(spent), netCell(spent === null ? null : credited - spent), "", "", ""]);
+  const bySite = new Map();
+  for (const r of cmp.current) {
+    const site = siteOf(r.alias);
+    const st = bySite.get(site) || { credited: 0, spent: 0, hasSpent: false };
+    st.credited += r.credited || 0;
+    if (r.spent !== null && r.spent !== undefined) { st.spent += r.spent; st.hasSpent = true; }
+    bySite.set(site, st);
+  }
+  for (const site of [...bySite.keys()].sort((a, b) => siteRank(a) - siteRank(b))) {
+    const st = bySite.get(site);
+    const spent = st.hasSpent ? st.spent : null;
+    rows.push(["<b>合计</b>", esc(siteName(site)), gain(st.credited), spentCell(spent),
+               netCell(spent === null ? null : st.credited - spent), "", "", ""]);
+  }
   return "<h3>" + title + "</h3>" + table([
-    ["账号", "本期到账", "本期消耗", "本期净额", "上期到账", "上期消耗", "上期净额"], ...rows,
+    ["账号", "站点", "本期到账", "本期消耗", "本期净额", "上期到账", "上期消耗", "上期净额"], ...rows,
   ]);
 }
 
@@ -310,6 +397,25 @@ function table(rows, footer) {
 function drawChart(series) {
   const data = series.filter(s => s.points.length > 0);
   if (!data.length) return '<div class="empty">暂无余额数据</div>';
+  // 按站点分图：两站余额差一个数量级（AgentRouter $800~2000、AnyRouter $5000+），
+  // 共用一根 Y 轴会把低值那组压成一条直线，看不出趋势。
+  const bySite = new Map();
+  for (const s of data) {
+    const site = siteOf(s.alias);
+    if (!bySite.has(site)) bySite.set(site, []);
+    bySite.get(site).push(s);
+  }
+  const sites = [...bySite.keys()].sort((a, b) => siteRank(a) - siteRank(b));
+  return sites.map(site => {
+    const group = bySite.get(site);
+    const panel = drawChartPanel(group);
+    return sites.length > 1
+      ? '<h3>' + esc(siteName(site)) + ' · ' + group.length + ' 个账号</h3>' + panel
+      : panel;
+  }).join("");
+}
+
+function drawChartPanel(data) {
   const W = 1000, H = 280, PAD = 44;
   const all = data.flatMap(s => s.points.map(p => p.balance));
   let min = Math.min(...all), max = Math.max(...all);
@@ -345,7 +451,7 @@ function drawChart(series) {
 
   const legend = '<div class="legend">' + data.map((s, i) =>
     '<span><span class="dot" style="background:' + COLORS[i % COLORS.length] + '"></span>' +
-    esc(s.alias) + '</span>').join("") + '</div>';
+    esc(baseOf(s.alias)) + '</span>').join("") + '</div>';
 
   return '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" style="max-width:' + W + 'px">' +
          grid + axis + paths + '</svg>' + legend;

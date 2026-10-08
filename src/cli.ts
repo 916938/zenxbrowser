@@ -3,7 +3,7 @@ import { parseArgs } from "node:util";
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { bindAccount, checkAccounts, createRunner, doctor, isEdge, listBrowsers, ZenxError } from "./core.ts";
+import { bindAccount, bindAnyRouterIdentity, checkAccounts, createRunner, doctor, isEdge, listBrowsers, ZenxError } from "./core.ts";
 import type { Runner } from "./core.ts";
 import { closeAllBrowsers, closeBrowser, closeLeftoverInstances, configureLaunch, ensureOnline, inspectSite, openSite, relinkAccount } from "./launch.ts";
 import { enrichBskTimeout } from "./diagnose.ts";
@@ -11,6 +11,8 @@ import { checkinAccount } from "./checkin.ts";
 import { loginAccount } from "./login.ts";
 import { checkinAll, pendingCheckins } from "./checkin-batch.ts";
 import { recheckAccount } from "./recheck.ts";
+import { anyrouterCheckin } from "./anyrouter-checkin.ts";
+import { anyrouterCheckinAll } from "./anyrouter-batch.ts";
 import { snapshotAccount, snapshotAll } from "./snapshot.ts";
 import { startReportServer } from "./report.ts";
 import { isTabId } from "./site.ts";
@@ -41,11 +43,14 @@ const help = `ZenX Browser — Windows Edge 多账号连接台
   zenx accounts open-site <别名> [--tab-id <N>] [--timeout 45s]
   zenx accounts inspect-site <别名> [--tab-id <N>] [--timeout 45s]
   zenx accounts login <别名> [--timeout 3m]
+  zenx accounts bind-anyrouter <别名> --identity <AnyRouter站点用户名> --confirm
+  zenx accounts anyrouter-checkin <别名> [--timeout 60s] [--force]
+  zenx accounts anyrouter-checkin-all [--timeout 60s] [--force]
   zenx accounts checkin <别名> [--timeout 3m] [--force] [--close-after] [--inhibit-sleep yes|no] [--inhibit-timeout 4m]
-  zenx accounts checkin-all [--timeout 3m] [--wait 12m] [--retries 1] [--window 8] [--close-after] [--close-leftover] [--retry-codes CODES] [--inhibit-sleep yes|no] [--inhibit-timeout 4h]
-  zenx accounts recheck <别名> [--timeout 45s] [--record yes|no]
-  zenx accounts snapshot <别名> [--timeout 45s]
-  zenx accounts snapshot --all [--timeout 45s]
+  zenx accounts checkin-all [--timeout 3m] [--wait 16m] [--retries 1] [--window 8] [--close-after] [--close-leftover] [--retry-codes CODES] [--inhibit-sleep yes|no] [--inhibit-timeout 4h]
+  zenx accounts recheck <别名> [--timeout 45s] [--record yes|no] [--site agentrouter|anyrouter]
+  zenx accounts snapshot <别名> [--timeout 45s] [--site agentrouter|anyrouter]
+  zenx accounts snapshot --all [--timeout 45s] [--site agentrouter|anyrouter]
   zenx report [--port 8787] [--open]
 
 全局选项：
@@ -84,6 +89,8 @@ inspect-site 只读采集既有 AgentRouter 标签当前视口可见正文，核
 snapshot 采集一次"当前余额 + 站点累计消耗"写入账本（只读：不退出、不重登录、不消耗登录配额）；
   与 checkin 只记录签到那一刻不同，它提供连续观测点，供周/月对比到账与消耗；
   --all 依次采集全部已绑定账号，单个失败不中断；失败也留一条（ok=false + 错误码）。
+  **按站点各采一次**：账号在哪些站点绑了身份就采哪些（AgentRouter 用 expected-identity、
+  AnyRouter 用 bind-anyrouter 的身份），各写一条独立记录；--site 只采指定站点。
 recheck 只读复查某账号"今日签到额度是否已到账"：开隔离窗口读一次控制台，结合账本给出结论；
   不退出、不重新登录、不消耗站点登录配额，可在签到失败或未确认后反复使用。
   确认到账但账本今天没有记录时，默认补记一条到账记录（--record no 可关闭）：
@@ -91,6 +98,7 @@ recheck 只读复查某账号"今日签到额度是否已到账"：开隔离窗�
   因为记录路径不同而从账本与报表里消失。
   退出码 0=已确认到账，1=未到账或异常；离线/非 Edge/协议不兼容只报告，不启动 Edge（先 ensure-online）；
   遇 GitHub 授权/验证页或登录身份不符时停止判断，不给出额度结论。
+  --site 指定复查哪个站点（默认 agentrouter）；该站点未绑定身份时报 SITE_NOT_BOUND。
 --tab-id 仅供 open-site / inspect-site 使用，限 1–2147483647 的十进制整数。
 需要支持严格用户标签命令的新版 bsk CLI、daemon 和扩展；不回退到 session 或标签名称。
 --timeout 接受正整数加 ms/s/m，最大 5m，连接和站点操作共用总预算；超时不关闭 Edge。
@@ -109,10 +117,24 @@ checkin 在当天账本已有"确认到账"记录、或站点显示"今日已签
 checkin 默认只回收本次的隔离窗口，Edge 进程留着；加 --close-after 则在**签到成功后**
   连带关掉整个浏览器实例（停其全部会话 + 关其所有窗口，含与本项目无关的窗口，未保存
   内容会丢）。失败时不关——账号可能停在登出态，留着窗口便于人工处理。
+bind-anyrouter 给已绑定账号补记 AnyRouter（anyrouter.top）的站点身份：
+  同一个 Edge Profile 在 AgentRouter 与 AnyRouter 上通常是两个不同的站点账号
+  （实测 edge-6：AgentRouter github_206707、AnyRouter linuxdo_85789），因此必须单独记录；
+  必须先有 accounts bind 的 AgentRouter 绑定。同样需要 --confirm。
+anyrouter-checkin 签到 AnyRouter：导航到 anyrouter.top/console（这一步就是签到动作，
+  站点在页面加载时自动发放当日额度），核对登录身份，读余额确认到账；
+  与 AgentRouter 的"退出重登"完全不同——不退出、不重登、不消耗站点登录配额，
+  可以反复跑（当天已到账会直接跳过）。账本里记在 "<别名>@anyrouter" 下，
+  与 AgentRouter 的余额体系分开统计。需要账号已用 bind-anyrouter 绑定身份。
+anyrouter-checkin-all 依次给**所有绑定了 AnyRouter 身份**的账号签到：账号取自
+  accounts.json（绑了身份的才算），不用维护平行名单；离线按需拉起 Edge，今天已到账的
+  账号连 Edge 都不拉起；单个失败不中断后续账号，最后汇总成功/跳过/失败。
+  不做限流冷却与分组——刷新不消耗登录配额，且账号很少。--force 强制刷新已到账的账号。
 login 只补"登录"这一步（不退出、不签到）：用于 checkin 在重登阶段失败后账号停在登出态、
   因而连 checkin 都无法再启动的自救；已登录则原样返回，不动账号状态。
 checkin-all 依次处理全部账号，并自动处理站点登录限流：命中限流/登录超时的账号记录等待起点，
-  冷却 --wait（默认 11–13 分钟随机）后自动重试 --retries 次（默认 1）。失败的账号还会再补签一次：
+  冷却 --wait（默认 15–18 分钟随机）后自动重试 --retries 次（默认 1）；冷却从首次限流起算，
+  中途再撞限流只补足剩下的时间，已经等够就直接重试。失败的账号还会再补签一次：
   撞上限流时顺冷却一起重试，全程没限流则收尾补一轮。--window（默认 8）限制同时在线
   的账号数：一组签完立刻关掉它们的 Edge 实例再拉下一组，把内存峰值压在窗口大小内（0=不分组）。
   --close-after 即使不分组也逐个账号关闭（只关 zenx 自己拉起的实例，含上一轮拉起、本轮签到成功的）；
@@ -215,6 +237,17 @@ function parseRetryCodes(value?: string): string[] | undefined {
   return codes;
 }
 
+/** 站点 id：只接受已注册的站点，拼错立刻报错而不是静默读错站点。 */
+const SITE_IDS = ["agentrouter", "anyrouter"];
+function parseSiteId(value?: string): string | undefined {
+  if (value === undefined) return undefined;
+  const id = value.trim().toLowerCase();
+  if (!SITE_IDS.includes(id)) {
+    throw new ZenxError("INVALID_SITE", `--site 只接受 ${SITE_IDS.join(" / ")}。`);
+  }
+  return id;
+}
+
 function parseTabId(value?: string): number | undefined {
   if (value === undefined) return undefined;
   if (!/^[1-9]\d*$/.test(value) || !isTabId(Number(value))) throw new ZenxError("INVALID_TAB_ID", "--tab-id 必须是 1–2147483647 的十进制整数。");
@@ -287,6 +320,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
         home: { type: "string" },
         "instance-id": { type: "string" },
         "expected-identity": { type: "string" },
+        identity: { type: "string" },
         confirm: { type: "boolean" },
         "edge-path": { type: "string" },
         "user-data-dir": { type: "string" },
@@ -299,6 +333,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
         "close-after": { type: "boolean" },
         "close-leftover": { type: "boolean" },
         record: { type: "string" },
+        site: { type: "string" },
         window: { type: "string" },
         all: { type: "boolean" },
         "tab-id": { type: "string" },
@@ -327,6 +362,9 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     const closingAll = group === "accounts" && action === "close-all";
     const closingLeftover = group === "accounts" && action === "close-leftover";
     const loggingIn = group === "accounts" && action === "login";
+    const bindingAnyRouter = group === "accounts" && action === "bind-anyrouter";
+    const checkingInAnyRouter = group === "accounts" && action === "anyrouter-checkin";
+    const checkingInAnyRouterAll = group === "accounts" && action === "anyrouter-checkin-all";
     const checkingInAll = group === "accounts" && action === "checkin-all";
     const pendingList = group === "accounts" && action === "pending";
     const checkingIn = group === "accounts" && action === "checkin";
@@ -337,9 +375,11 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     if (binding) for (const key of ["instance-id", "expected-identity", "confirm"]) allowed.add(key);
     if (configuring) for (const key of ["edge-path", "user-data-dir", "profile-directory", "confirm"]) allowed.add(key);
     if (ensuring || opening || inspecting || relinking || closing || rechecking || snapshotting) allowed.add("timeout");
-    if (rechecking) allowed.add("record");
-    if (snapshotting) allowed.add("all");
+    if (rechecking) for (const key of ["record", "site"]) allowed.add(key);
+    if (snapshotting) for (const key of ["all", "site"]) allowed.add(key);
     if (loggingIn) allowed.add("timeout");
+    if (bindingAnyRouter) for (const key of ["identity", "confirm"]) allowed.add(key);
+    if (checkingInAnyRouter || checkingInAnyRouterAll) for (const key of ["timeout", "force"]) allowed.add(key);
     if (checkingInAll) for (const key of ["timeout", "wait", "retries", "retry-codes", "close-after", "close-leftover", "window", "inhibit-sleep", "inhibit-timeout"]) allowed.add(key);
     if (checkingIn) for (const key of ["timeout", "force", "inhibit-sleep", "inhibit-timeout", "close-after"]) allowed.add(key);
     if (relinking || closing) allowed.add("confirm");
@@ -411,6 +451,24 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
       report = await loginAccount(home, run, alias, parseTimeout(values.timeout ?? "3m"), {
         dbFile: dependencies.recheckDbFile,
       });
+    } else if (bindingAnyRouter && alias && positionals.length === 3) {
+      if (values.confirm !== true) throw new ZenxError("CONFIRM_REQUIRED", "记录 AnyRouter 身份会修改账号配置，需要 --confirm。");
+      const account = await bindAnyRouterIdentity(home, alias, values.identity ?? "", values.confirm === true);
+      report = { ok: true, account, site: "anyrouter", identity: "not_verified", dataDirectory: home };
+    } else if (checkingInAnyRouter && alias && positionals.length === 3) {
+      report = await anyrouterCheckin(home, run, alias, parseTimeout(values.timeout ?? "60s"), {
+        dbFile: dependencies.snapshotDbFile,
+        force: values.force === true,
+      });
+    } else if (checkingInAnyRouterAll && positionals.length === 2) {
+      const progress = (line: string) => { if (!asJson) output(line); };
+      report = await anyrouterCheckinAll(home, run, {
+        timeoutMs: parseTimeout(values.timeout ?? "60s"),
+        dbFile: dependencies.snapshotDbFile,
+        force: values.force === true,
+        launchDependencies: dependencies.launchDependencies,
+        onProgress: progress,
+      });
     } else if (pendingList && positionals.length === 2) {
       // 只读账本，不调 bsk、不拉起 Edge：签到前先看今天还差谁。
       report = await pendingCheckins(home, { dbFile: dependencies.snapshotDbFile, now: dependencies.now });
@@ -450,22 +508,39 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
       report = await recheckAccount(home, run, alias, parseTimeout(values.timeout), {
         dbFile: dependencies.recheckDbFile,
         record: parseRecordFlag(values.record),
+        siteId: parseSiteId(values.site),
       });
     } else if (snapshotting && values.all === true && positionals.length === 2) {
       report = await snapshotAll(home, run, parseTimeout(values.timeout), {
         dbFile: dependencies.snapshotDbFile,
+        siteId: parseSiteId(values.site),
       });
     } else if (snapshotting && alias && positionals.length === 3) {
-      report = await snapshotAccount(home, run, alias, parseTimeout(values.timeout), {
+      // 一个账号可能在多个站点各有身份，每个站点一条结果。
+      const results = await snapshotAccount(home, run, alias, parseTimeout(values.timeout), {
         dbFile: dependencies.snapshotDbFile,
+        siteId: parseSiteId(values.site),
       });
+      report = {
+        ok: results.length > 0 && results.every((item) => item.ok),
+        alias,
+        total: results.length,
+        saved: results.filter((item) => item.ok).length,
+        results,
+        ...(results.length === 0 ? { note: "该账号没有绑定任何站点身份；未采集。" } : {}),
+      };
     } else if (reporting) {
       return await runReport(values, output, dependencies);
     } else {
       throw new ZenxError("INVALID_ARGUMENT", "命令或参数不正确；运行 zenx --help 查看用法。");
     }
-    if (!asJson && !checkingIn && !checkingInAll && !closing && !closingAll && !closingLeftover && !rechecking && !snapshotting && !loggingIn) output("连接在线或打开站点不等于登录身份验证；未执行签到。");
+    if (!asJson && !checkingIn && !checkingInAll && !closing && !closingAll && !closingLeftover && !rechecking && !snapshotting && !loggingIn && !checkingInAnyRouter && !checkingInAnyRouterAll) output("连接在线或打开站点不等于登录身份验证；未执行签到。");
     output(JSON.stringify(report, null, 2));
+    // 单实例关闭：回包只说明"请求已响应"。没复核到实例离线就不能以 0 收尾，
+    // 否则脚本会把"窗口还在退出"当成"资源已释放"。
+    if (closing && typeof (report as { outcome?: { instanceOffline?: boolean } }).outcome?.instanceOffline === "boolean") {
+      return (report as { outcome: { instanceOffline: boolean } }).outcome.instanceOffline ? 0 : 1;
+    }
     return report.ok === false ? 1 : 0;
   } catch (error) {
     const code = error instanceof ZenxError ? error.code : "COMMAND_FAILED";

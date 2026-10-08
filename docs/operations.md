@@ -25,7 +25,7 @@ node src/cli.ts doctor
 powershell -ExecutionPolicy Bypass -File scripts\daily-checkin.ps1
 ```
 
-它会依次完成：`ensure-online`（离线才拉起 Edge）→ 每个账号 `checkin` → 每满 10 次登录冷却 11 分钟 → `snapshot --all` 采集当日余额与消耗 → 清理残留 session。
+它会依次完成：`ensure-online`（离线才拉起 Edge）→ 每个账号 `checkin` → 每满 10 次登录冷却 16 分钟 → `snapshot --all` 采集当日余额与消耗 → 清理残留 session。
 另外：签到期间开启防休眠（覆盖 11 分钟冷却这段没人跑命令的空档，`-NoSleepGuard` 可关闭）。
 
 | 退出码 | 含义 |
@@ -62,16 +62,46 @@ node src/cli.ts accounts checkin edge-1           # 签到（退出 → 重登 �
 node src/cli.ts accounts checkin edge-1 --close-after   # 签到成功后连 Edge 实例一起关掉（释放内存）
 node src/cli.ts accounts login edge-1             # 只补登录：把停在登出态的账号拉回登录态
 node src/cli.ts accounts recheck edge-1           # 只读复查：今天到底到账没有
-node src/cli.ts accounts snapshot edge-1          # 采集该账号的余额/消耗快照
+node src/cli.ts accounts recheck edge-6 --site anyrouter   # 复查 AnyRouter（默认 agentrouter）
+node src/cli.ts accounts snapshot edge-1          # 采集该账号的余额/消耗快照（按站点各采一条）
+node src/cli.ts accounts snapshot edge-6 --site anyrouter   # 只采指定站点
 node src/cli.ts accounts snapshot --all           # 采集全部账号
 node src/cli.ts accounts close edge-1 --confirm   # 关闭该实例的所有 Edge 窗口
 ```
+
+### AnyRouter 签到（anyrouter.top，与上面是**两个不同的站点**）
+
+```powershell
+node src/cli.ts accounts bind-anyrouter edge-6 --identity linuxdo_85789 --confirm   # 首次：补记身份
+node src/cli.ts accounts ensure-online edge-6      # 离线时拉起对应 Edge Profile
+node src/cli.ts accounts anyrouter-checkin edge-6  # 签到：刷新页面即可
+node src/cli.ts accounts anyrouter-checkin edge-6 --force   # 当天已到账时强制重跑
+
+# 批量：一条命令跑完所有绑了 AnyRouter 身份的账号（账号取自 accounts.json，不用维护名单）
+node src/cli.ts accounts anyrouter-checkin-all
+node src/cli.ts accounts anyrouter-checkin-all --force
+```
+
+**每日自动跑不用管**：`daily-checkin.ps1` 在 AgentRouter 签到之后、快照之前会自动调用 `anyrouter-checkin-all`，计划任务不用改。
+
+两者的关系：**批量命令是能力**（随时可手动跑），**脚本是调度**（每天自动跑，并复用它自己的防休眠、失败名单与日志）。脚本直接调批量命令，逻辑只写一遍。
+
+批量命令的行为：离线按需拉起 Edge、今天已到账的连 Edge 都不拉起、单个失败不中断后续账号、最后汇总成功/跳过/失败。不做限流冷却与 `--window` 分组——AnyRouter 刷新不消耗登录配额，账号也少，这两套机制用不上。
+
+要点：
+
+- **站点在控制台页面加载时自动发放额度**，没有签到按钮、不需要退出重登、不消耗站点登录配额，可以反复跑。
+- **同一个 Edge Profile 在两个站点上通常是两个不同账号**（实测 edge-6：AgentRouter `github_206707`、AnyRouter `linuxdo_85789`），余额体系完全独立（$1276 vs $5121）。所以身份要单独绑定、账本也分开统计（`<别名>@anyrouter`）。
+- **首次签到 `checkinCredited` 会是 `false`**：没有"今天开始前"的余额基线，无法确认到账——那是"无法证明"，不是"没签上"。第一次跑建立基线，之后每天跑就能对比确认了。
+- 只有 edge-6 和 edge-p16 两个账号需要打卡 AnyRouter。
+- **签到脚本分开，但 snapshot / recheck 两站共用**：`accounts snapshot edge-6` 会按站点各采一条观测点，`accounts recheck edge-6 --site anyrouter` 可复查 AnyRouter。身份按站点自动取（拿错站点的身份会误判成 `IDENTITY_MISMATCH`）。
+- 与 AgentRouter 的签到**互不干扰**：`checkin` / `checkin-all` 只管 AgentRouter，AnyRouter 用 `anyrouter-checkin*`。
 
 ### 批量签到（推荐替代 PowerShell 脚本）
 
 ```powershell
 node src/cli.ts accounts checkin-all                       # 全部账号，命中限流自动冷却重试一次
-node src/cli.ts accounts checkin-all --wait 12m --retries 1
+node src/cli.ts accounts checkin-all --wait 16m --retries 1
 node src/cli.ts accounts checkin-all --window 8            # 同时在线不超过 8 个（默认），一组签完即关再拉下一组
 node src/cli.ts accounts checkin-all --close-after         # 不分组也逐个账号关掉 Edge，释放内存
 node src/cli.ts accounts checkin-all --window 8 --close-after   # 两者可叠加：成功的账号签完即关，失败的由组结束时的释放兜底
@@ -107,15 +137,16 @@ node src/cli.ts accounts checkin-all --inhibit-timeout 2h       # 防休眠上�
 
 `--json` 模式下这两行不会打印（只输出报告）；`daily-checkin.ps1` 写进当天日志，形如 `--- sleep guard ON/OFF (strategy=...)`，加 `-NoSleepGuard` 可关闭。
 
-五条行为准则：
+几条行为准则：
 
 - **命中限流立刻停手**：限流是站点侧的**共享配额**（同一出口 IP 连续登录若干次触发），此时任何账号都登录不上。本轮剩下的账号会被推迟到冷却后统一重试，而不是继续把更多账号退出成登出态。
 - **冷却要能看出"在等"而不是"卡住"**：命中限流、冷却开始、冷却结束三行都带时间戳，冷却开始那行同时给出**预计结束时间**，长冷却（超过 5 分钟）每 5 分钟补一行剩余时长。例：
-  `[2026-09-20T14:12:03.115Z] 冷却开始：12.4 分钟（2026-09-20T14:24:27.115Z 结束），随后重试 6 个账号：edge-p14, ...`
+  `[2026-09-20T14:12:03.115Z] 冷却开始：16.4 分钟（2026-09-20T14:28:27.115Z 结束），随后重试 6 个账号：edge-p14, ...`
 - **窗口上限**（默认 8）：一次只让这么多账号在线，一组签完立刻关掉它们的 Edge 实例再拉下一组——十几个 Edge Profile 同时常驻是本机最大的内存开销，把峰值压在窗口大小内比"全部拉起再逐个关"稳得多。`--window 0` 关闭分组。
 - **失败的账号一定再试一次**：限流冷却是干等的十几分钟，之前失败的账号（BSK_TIMEOUT、PROFILE_CONNECT_TIMEOUT 之类）会一起塞进重试队列；整轮都没撞上限流时，收尾还会补签一轮——开头卡住的账号不会就这么被丢下。
 - **每次尝试都记状态**：`.zenx\checkin-state.json` 记录每个账号的最后尝试时间、结果、错误码与重试次数，中断后可接着看。
-- **默认重试一次**（`--retries`），冷却默认 11–13 分钟随机（`--wait`，显式指定则不抖动）。重试后仍失败就以失败收尾，不再无限循环。
+- **默认重试一次**（`--retries`），冷却默认 15–18 分钟随机（`--wait`，显式指定则不抖动）。重试后仍失败就以失败收尾，不再无限循环。
+- **冷却是"距首次限流"的总时长，不是一轮一轮重计**：站点的共享配额恢复只认墙钟，所以冷却后重试又撞上限流时只补足差额（`距首次限流已过 15.0 分钟（目标 18 分钟），本次只补足剩余部分`），已经等够就直接重试（`冷却已等够：…直接重试 N 个账号`）。这个起点跨轮、跨组共享，直到有账号真的签到成功才清零——真到账说明配额确实恢复了，之后再撞就是新一轮。
 
 几点约定：
 
@@ -137,7 +168,9 @@ zenx report --open                # 自动打开浏览器
 zenx report --port 9000           # 换端口
 ```
 
-四块内容：**账号汇总**（按当前余额从高到低，含每号余额的观测时间——非当天的会置灰，末行为合计）、**每日总额**（余额合计 / 当日消耗 / 当日签到到账 / 覆盖账号数）、**周月对比**（本期 vs 上期的到账与消耗）、**余额趋势**与打卡明细。顶部卡片另有**历史总消耗**（各账号累计消耗之和）与**最近 7 天消耗**。
+四块内容：**账号汇总**（同 Profile 相邻，含每号余额的观测时间——非当天的会置灰，末行按站点给合计）、**每日总额**（余额合计 / 当日消耗 / 当日签到到账 / 覆盖账号数）、**周月对比**（本期 vs 上期的到账与消耗）、**余额趋势**与打卡明细。顶部卡片另有**历史总消耗**（各账号累计消耗之和）与**最近 7 天消耗**。
+
+**两个站点在同一个报表里，但按站点分开统计**——额度不能互转，加起来没有意义：卡片按站点各一行（不相加）、账号汇总有「站点」列且同 Profile 两站相邻、每日总额按站点分行、趋势图按站点分图、明细有「站点」列。账本里 AnyRouter 记在 `<别名>@anyrouter` 下，所以顶部说的是"**站点账号**"数（比 Profile 数多，不是出错）。
 
 顶部"账号数"卡片显示 `有数据 / 已绑定` 两个数，并在两者不一致时列出尚未产生观测点的别名。看到差额不必惊慌：那是"还没跑过任何命令"，不是"账号丢了"。
 
@@ -162,6 +195,7 @@ node -e "const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync('
 | **余额总额** | 每个账号**截至该日的最后一次已知余额**（向前填充），并同时给出覆盖账号数与"沿用更早观测点"的账号数。只在当天恰好被采集的账号上求和会让漏采的号凭空消失，总额随之失真。 |
 | **余额为 0** | 窗口隐藏时站点会渲染出 `0`（实测）。统计一律**视为缺失**，绝不把它当真余额——否则会出现 0 → 1175 这种假到账。 |
 | **跳过不入账** | 当天已到账/站点显示已签到而跳过的，不算一次签到，不进账本（否则虚增成功率）。 |
+| **同日重复签到不算消耗** | 消耗兜底 = 上次余额 + 每日额度 − 本次余额，前提是两次签到之间发过一次额度。站点每日只发一次，同一天的第二条记录之间没有发放——若参与反推，"当天已签到所以没涨"会被算成"花掉 $25"（AnyRouter 同一天多刷新一次就多一笔假消耗）。因此**只跨天相邻对才反推**。 |
 
 两个容易踩的坑：
 

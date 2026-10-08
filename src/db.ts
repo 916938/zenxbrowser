@@ -6,6 +6,35 @@ import { DatabaseSync } from "node:sqlite";
 /** 签到数据库：项目根下的 zenxbrowser/checkin.db。 */
 export const DEFAULT_DB_FILE = fileURLToPath(new URL("../zenxbrowser/checkin.db", import.meta.url));
 
+/**
+ * 账本里 alias 的站点归属约定：`<Profile别名>@<站点id>`，没有后缀即默认站点。
+ *
+ * 同一个 Edge Profile 可以在多个站点上各有一个账号（实测 edge-6：AgentRouter
+ * `github_206707`、AnyRouter `linuxdo_85789`），两边的余额体系完全独立。账本因此
+ * 用后缀把它们存成两条独立记录——否则同一 Profile 两站的余额会互相覆盖，
+ * "当前余额"和"当日到账"都会失真。
+ *
+ * 这里定义解析与构造，报表按站点拆分统计时与写入侧共用同一套约定。
+ */
+export const DEFAULT_SITE = "agentrouter";
+
+/** `edge-6@anyrouter` → `anyrouter`；`edge-6` → `agentrouter`。 */
+export function siteOfAlias(alias: string): string {
+  const index = alias.lastIndexOf("@");
+  return index > 0 ? alias.slice(index + 1) : DEFAULT_SITE;
+}
+
+/** 去掉站点后缀的 Profile 别名：`edge-6@anyrouter` → `edge-6`。 */
+export function baseAliasOf(alias: string): string {
+  const index = alias.lastIndexOf("@");
+  return index > 0 ? alias.slice(0, index) : alias;
+}
+
+/** 构造带站点后缀的账本 alias；默认站点不加后缀，保持历史记录不变。 */
+export function ledgerAliasOf(alias: string, site: string): string {
+  return site === DEFAULT_SITE ? alias : `${alias}@${site}`;
+}
+
 export type CheckinRecord = {
   /** 打卡完成时间（ISO 8601，UTC）。 */
   time: string;
@@ -285,11 +314,11 @@ export function summarizeAccounts(file: string = DEFAULT_DB_FILE): AccountSummar
       "SELECT total_spent, balance, time FROM balance_snapshots WHERE alias = ? AND ok = 1 AND total_spent IS NOT NULL AND time <= ? ORDER BY time DESC, id DESC LIMIT 1",
     );
     const spentCheckinStmt = db.prepare(
-      "SELECT balance_after FROM checkins WHERE alias = ? AND balance_after IS NOT NULL AND balance_after > 0 AND time <= ? ORDER BY time, id",
+      "SELECT balance_after, time FROM checkins WHERE alias = ? AND balance_after IS NOT NULL AND balance_after > 0 AND time <= ? ORDER BY time, id",
     );
     // 锚点之后（快照采集时刻之后）的签到余额，用于把快照没覆盖到的消耗补回来。
     const spentCheckinAfterStmt = db.prepare(
-      "SELECT balance_after FROM checkins WHERE alias = ? AND balance_after IS NOT NULL AND balance_after > 0 AND time > ? AND time <= ? ORDER BY time, id",
+      "SELECT balance_after, time FROM checkins WHERE alias = ? AND balance_after IS NOT NULL AND balance_after > 0 AND time > ? AND time <= ? ORDER BY time, id",
     );
     /** 截止到 asOf 时刻的累计消耗；与"累计消耗"完全同源，只是把观测范围截断。 */
     const spentUpTo = (alias: string, asOf: string): number | null => {
@@ -297,15 +326,17 @@ export function summarizeAccounts(file: string = DEFAULT_DB_FILE): AccountSummar
         { total_spent: number; balance: number | null; time: string } | undefined;
       if (snap === undefined) {
         // 完全没有可读的站点累计值：整段都由签到记录反推。
-        const records = spentCheckinStmt.all(alias, asOf) as { balance_after: number }[];
-        return records.length > 1 ? spentFromBalances(records.map((r) => r.balance_after)) : null;
+        const records = spentCheckinStmt.all(alias, asOf) as { balance_after: number; time: string }[];
+        return records.length > 1
+          ? spentFromBalances(records.map((r) => ({ time: r.time, balance: r.balance_after })))
+          : null;
       }
-      const after = spentCheckinAfterStmt.all(alias, snap.time, asOf) as { balance_after: number }[];
+      const after = spentCheckinAfterStmt.all(alias, snap.time, asOf) as { balance_after: number; time: string }[];
       // 快照自己的余额作为序列起点，才能算出"快照 → 第一次签到"之间的消耗。
-      const balances = snap.balance !== null && snap.balance > 0
-        ? [snap.balance, ...after.map((r) => r.balance_after)]
-        : after.map((r) => r.balance_after);
-      return round2(snap.total_spent + spentFromBalances(balances));
+      const points = snap.balance !== null && snap.balance > 0
+        ? [{ time: snap.time, balance: snap.balance }, ...after.map((r) => ({ time: r.time, balance: r.balance_after }))]
+        : after.map((r) => ({ time: r.time, balance: r.balance_after }));
+      return round2(snap.total_spent + spentFromBalances(points));
     };
 
     return aliases.map((alias) => {
@@ -513,10 +544,16 @@ const FAR_FUTURE = "9999-12-31T23:59:59.999Z";
  * 余额同时被发放和消耗影响，只有扣掉额度后剩下的差额才是真实花费；
  * 余额增长（没签到却变多）按 0 计，绝不把发放算成负消耗。
  */
-function spentFromBalances(balances: number[]): number {
+function spentFromBalances(points: { time: string; balance: number }[]): number {
   let sum = 0;
-  for (let i = 1; i < balances.length; i++) {
-    sum += Math.max(0, balances[i - 1] + DAILY_CREDIT - balances[i]);
+  for (let i = 1; i < points.length; i++) {
+    const previous = points[i - 1];
+    const current = points[i];
+    // 同一天的两次读数之间不会再次发放额度（站点每日只发一次）。用"+25"去反推，
+    // 会把"当天已签到所以余额没涨"误算成"花掉了 $25"——AnyRouter 同一天多刷新
+    // 一次就多一笔凭空的消耗。跨天相邻对才可反推。
+    if (previous.time && localDay(previous.time) === localDay(current.time)) continue;
+    sum += Math.max(0, previous.balance + DAILY_CREDIT - current.balance);
   }
   return round2(sum);
 }
@@ -582,6 +619,20 @@ export function rangeSummary(startIso: string, endIso: string, file: string = DE
   }
 }
 
+/**
+ * 单个站点在一天的合计。两个站点的额度互相独立（不能互转），
+ * 因此报表按站点分开显示，而不是合成一个总数。
+ */
+export type DailySiteTotal = {
+  balanceSum: number | null;
+  balanceAccounts: number;
+  balanceStaleAccounts: number;
+  spentSum: number | null;
+  spentAccounts: number;
+  creditedSum: number;
+  creditedAccounts: number;
+};
+
 export type DailyTotal = {
   /** 本地日（YYYY-MM-DD）。 */
   day: string;
@@ -604,6 +655,8 @@ export type DailyTotal = {
   creditedAccounts: number;
   /** 当日各账号消耗明细（快照优先，签到反推兜底），按消耗降序。 */
   spentDetails?: { alias: string; spent: number; source: "snapshot" | "checkin" }[];
+  /** 按站点拆分的当日合计；站点 id 见 siteOfAlias。 */
+  bySite: Record<string, DailySiteTotal>;
 };
 
 function localDay(iso: string): string {
@@ -709,6 +762,9 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
         for (let i = 1; i < records.length; i++) {
           const previous = records[i - 1];
           const current = records[i];
+          // 同一天不会二次发放额度：跳过同天相邻对，否则"当天已签到、余额没涨"
+          // 会被反推成"花掉了 $25"（AnyRouter 同一天多刷新一次就多一笔假消耗）。
+          if (localDay(previous.time) === localDay(current.time)) continue;
           const spent = Math.max(0, round2(previous.balanceAfter + DAILY_CREDIT - current.balanceAfter));
           const day = localDay(current.time);
           const byDay = spentFromCheckins.get(day) ?? new Map<string, number>();
@@ -725,13 +781,27 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
     for (const row of checkins) daySet.add(localDay(row.time));
     const days = [...daySet].sort();
 
-    type Entry = { balanceSum: number; balanceAccounts: number; stale: number; spentSum: number; spentAccounts: number };
+    /**
+     * 一天的累加器。`all` 是所有站点之和（顶层合计字段用它，口径与历史一致）；
+     * `bySite` 按站点分开累加——两个站点的钱不能互转，报表要把它们分开显示，
+     * 而不是合成一个"总余额"。
+     */
+    type SiteEntry = { balanceSum: number; balanceAccounts: number; stale: number; spentSum: number; spentAccounts: number };
+    const emptySiteEntry = (): SiteEntry => ({ balanceSum: 0, balanceAccounts: 0, stale: 0, spentSum: 0, spentAccounts: 0 });
+    type Entry = { all: SiteEntry; bySite: Map<string, SiteEntry> };
     const totals = new Map<string, Entry>();
     const entryFor = (day: string): Entry => {
       const existing = totals.get(day);
       if (existing) return existing;
-      const created: Entry = { balanceSum: 0, balanceAccounts: 0, stale: 0, spentSum: 0, spentAccounts: 0 };
+      const created: Entry = { all: emptySiteEntry(), bySite: new Map() };
       totals.set(day, created);
+      return created;
+    };
+    const siteEntryFor = (entry: Entry, site: string): SiteEntry => {
+      const existing = entry.bySite.get(site);
+      if (existing) return existing;
+      const created = emptySiteEntry();
+      entry.bySite.set(site, created);
       return created;
     };
 
@@ -741,6 +811,7 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
     const spentDetail = new Map<string, Map<string, { spent: number; source: "snapshot" | "checkin" }>>();
 
     for (const [alias, series] of points) {
+      const site = siteOfAlias(alias);
       // 观测点按本地日压缩：同一天多次采集以最后一次为准。
       const observations: { day: string; balance: number | null; totalSpent: number | null }[] = [];
       const index = new Map<string, number>();
@@ -765,8 +836,11 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
           const delta = observation.totalSpent - previousSpent;
           if (delta >= 0) {
             const entry = entryFor(observation.day);
-            entry.spentSum += delta;
-            entry.spentAccounts += 1;
+            const siteEntry = siteEntryFor(entry, site);
+            entry.all.spentSum += delta;
+            entry.all.spentAccounts += 1;
+            siteEntry.spentSum += delta;
+            siteEntry.spentAccounts += 1;
             let aliases = snapshotSpentAliases.get(observation.day);
             if (!aliases) { aliases = new Set(); snapshotSpentAliases.set(observation.day, aliases); }
             aliases.add(alias);
@@ -788,10 +862,16 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
         }
         if (carried === null) continue;
         const entry = entryFor(day);
-        entry.balanceSum += carried;
-        entry.balanceAccounts += 1;
+        const siteEntry = siteEntryFor(entry, site);
+        entry.all.balanceSum += carried;
+        entry.all.balanceAccounts += 1;
+        siteEntry.balanceSum += carried;
+        siteEntry.balanceAccounts += 1;
         const observedDay = cursor > 0 ? observations[cursor - 1].day : null;
-        if (observedDay !== day) entry.stale += 1;
+        if (observedDay !== day) {
+          entry.all.stale += 1;
+          siteEntry.stale += 1;
+        }
       }
     }
 
@@ -802,38 +882,83 @@ export function dailyTotals(options: { days?: number } = {}, file: string = DEFA
       const fromSnapshots = creditedFromSnapshots.get(day) ?? new Map<string, number>();
       let creditedSum = 0;
       const aliases = new Set<string>();
+      /** 站点 → 当日到账合计 / 计入到账的账号集合。 */
+      const creditedBySite = new Map<string, number>();
+      const creditedAliasesBySite = new Map<string, Set<string>>();
+      const addCredited = (alias: string, value: number, countAlias: boolean) => {
+        const site = siteOfAlias(alias);
+        creditedBySite.set(site, (creditedBySite.get(site) ?? 0) + value);
+        if (countAlias) {
+          const set = creditedAliasesBySite.get(site) ?? new Set<string>();
+          set.add(alias);
+          creditedAliasesBySite.set(site, set);
+        }
+      };
       for (const [alias, value] of fromCheckins) {
         creditedSum += value;
         aliases.add(alias);
+        addCredited(alias, value, true);
       }
       for (const [alias, value] of fromSnapshots) {
         if (fromCheckins.has(alias)) continue;   // 签到口径优先，避免重复计数
         creditedSum += value;
-        if (value > 0) aliases.add(alias);
+        const counts = value > 0;
+        if (counts) aliases.add(alias);
+        addCredited(alias, value, counts);
       }
       // 消耗：快照优先；没有快照消耗的账号用签到反推兜底，两者不重复计数。
       const checkinSpent = spentFromCheckins.get(day) ?? new Map<string, number>();
       const snapAliases = snapshotSpentAliases.get(day) ?? new Set<string>();
       let extraSpent = 0;
       let extraAccounts = 0;
+      /** 站点 → 签到反推的消耗与账号数（快照消耗优先，两者不重复计数）。 */
+      const extraBySite = new Map<string, { spent: number; accounts: number }>();
       const dayDetail = spentDetail.get(day) ?? new Map<string, { spent: number; source: "snapshot" | "checkin" }>();
       for (const [alias, spent] of checkinSpent) {
         if (snapAliases.has(alias)) continue;
         extraSpent += spent;
         extraAccounts += 1;
+        const site = siteOfAlias(alias);
+        const bucket = extraBySite.get(site) ?? { spent: 0, accounts: 0 };
+        bucket.spent += spent;
+        bucket.accounts += 1;
+        extraBySite.set(site, bucket);
         dayDetail.set(alias, { spent, source: "checkin" });
       }
-      const totalSpentSum = (entry?.spentSum ?? 0) + extraSpent;
-      const totalSpentAccounts = (entry?.spentAccounts ?? 0) + extraAccounts;
+      const totalSpentSum = (entry?.all.spentSum ?? 0) + extraSpent;
+      const totalSpentAccounts = (entry?.all.spentAccounts ?? 0) + extraAccounts;
+
+      // 按站点拆分：余额/消耗来自 entry.bySite，到账与签到反推消耗按 alias 站点归类。
+      // 两个站点的额度不能互转，报表要的是"每站各有多少"，不是一个加总数字。
+      const siteIds = new Set<string>([
+        ...(entry?.bySite.keys() ?? []), ...creditedBySite.keys(), ...extraBySite.keys(),
+      ]);
+      const bySite: Record<string, DailySiteTotal> = {};
+      for (const site of siteIds) {
+        const se = entry?.bySite.get(site);
+        const extra = extraBySite.get(site) ?? { spent: 0, accounts: 0 };
+        const spentAccounts = (se?.spentAccounts ?? 0) + extra.accounts;
+        const credited = creditedBySite.get(site) ?? 0;
+        bySite[site] = {
+          balanceSum: se && se.balanceAccounts > 0 ? round2(se.balanceSum) : null,
+          balanceAccounts: se?.balanceAccounts ?? 0,
+          balanceStaleAccounts: se?.stale ?? 0,
+          spentSum: spentAccounts > 0 ? round2((se?.spentSum ?? 0) + extra.spent) : null,
+          spentAccounts,
+          creditedSum: round2(credited),
+          creditedAccounts: creditedAliasesBySite.get(site)?.size ?? 0,
+        };
+      }
       return {
         day,
-        balanceSum: entry && entry.balanceAccounts > 0 ? round2(entry.balanceSum) : null,
-        balanceAccounts: entry?.balanceAccounts ?? 0,
-        balanceStaleAccounts: entry?.stale ?? 0,
+        balanceSum: entry && entry.all.balanceAccounts > 0 ? round2(entry.all.balanceSum) : null,
+        balanceAccounts: entry?.all.balanceAccounts ?? 0,
+        balanceStaleAccounts: entry?.all.stale ?? 0,
         spentSum: totalSpentAccounts > 0 ? round2(totalSpentSum) : null,
         spentAccounts: totalSpentAccounts,
         creditedSum: round2(creditedSum),
         creditedAccounts: aliases.size,
+        bySite,
         spentDetails: dayDetail.size > 0
           ? [...dayDetail.entries()].map(([alias, d]) => ({ alias, spent: d.spent, source: d.source }))
               .sort((a, b) => b.spent - a.spent)

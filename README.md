@@ -71,9 +71,12 @@ node src/cli.ts --help    # 查看全部用法；也可 npm start -- --help
 | `zenx accounts inspect-site <别名>` | 只读核对登录身份与签到信号 |
 | `zenx accounts checkin <别名>` | 执行完整退出重登签到流程（支持无人值守/计划任务）；`--close-after` 在签到成功后连浏览器实例一起释放 |
 | `zenx accounts login <别名>` | 只补“登录”这一步：把重登失败后停在登出态的账号拉回登录态（不退出、不签到） |
-| `zenx accounts checkin-all` | 批量签到：自动处理站点登录限流（冷却 `--wait`，默认 11–13 分钟随机，后重试 `--retries` 次），失败账号顺冷却或收尾再补签一次，`--window`（默认 8）限制同时在线账号数，`--close-after` 逐个释放实例内存；全程开启防休眠（`--inhibit-sleep no` 关闭，`--inhibit-timeout` 设上限） |
-| `zenx accounts recheck <别名>` | 只读复查该账号今日签到额度是否已到账（不退出、不重登） |
-| `zenx accounts snapshot <别名>` / `--all` | 采集余额与站点累计消耗，写入账本（周/月对比的观测点） |
+| `zenx accounts checkin-all` | 批量签到：自动处理站点登录限流（冷却 `--wait`，默认 15–18 分钟随机、且从首次限流起算只补足剩余时间，后重试 `--retries` 次），失败账号顺冷却或收尾再补签一次，`--window`（默认 8）限制同时在线账号数，`--close-after` 逐个释放实例内存；全程开启防休眠（`--inhibit-sleep no` 关闭，`--inhibit-timeout` 设上限） |
+| `zenx accounts bind-anyrouter <别名> --identity <站点用户名> --confirm` | 给已绑定账号补记 AnyRouter（anyrouter.top）的站点身份 |
+| `zenx accounts anyrouter-checkin <别名>` | AnyRouter 签到：刷新页面即打卡（详见下文） |
+| `zenx accounts anyrouter-checkin-all` | AnyRouter 批量签到：依次处理所有绑定了 AnyRouter 身份的账号（离线按需拉起、已到账的连 Edge 都不拉起、单个失败不中断） |
+| `zenx accounts recheck <别名>` | 只读复查该账号今日签到额度是否已到账（不退出、不重登）；`--site` 指定站点 |
+| `zenx accounts snapshot <别名>` / `--all` | 采集余额与站点累计消耗，写入账本（周/月对比的观测点）；**按站点各采一次**，`--site` 只采一个 |
 | `zenx report [--port 8787] [--open]` | 启动本地网页报表，查看签到统计与余额趋势 |
 
 账号数据保存在 `.zenx/accounts.json`；可用 `--home <目录>` 或环境变量 `ZENX_HOME` 指定数据目录。全局加 `--json` 输出 JSON。除 `checkin` 外其余命令均保持只读，不保存密码、Cookie 或令牌。
@@ -140,12 +143,123 @@ node src/cli.ts accounts checkin edge-1
   - 窗口尺寸（哪怕 `outerWidth` 为 0，后台 Edge 常见）不影响判定，只要页面能求值就继续；只有求值本身失败才报 `WINDOW_NOT_INTERACTIVE`。
 - **遇验证页自动停止**：检测到 GitHub 授权页、两步验证、验证码等特征时报 `MANUAL_INTERVENTION_REQUIRED`，需人工完成登录后重新执行 `checkin`（这是无人值守唯一无法自动处理的情况：GitHub 会话过期需要人工重新登录一次）。
 - **站点已登出不用人工登录**：页面停在站点登录页（站点会话掉线）时，checkin 会自己点「使用 GitHub 继续」登录——GitHub 会话通常还在，这一步不需要人。登录事件本身就发放当日额度，登录后能确认到账就不再退出重登，省一次登录配额；确认不了才继续走退出重登。旧版在这里一律报 `IDENTITY_MISMATCH` 并提示"请先人工登录"，那是误报。
-- **登录频率限制（重要）**：站点对连续登录有限制——**连续登录约 10 次后会被临时拒绝登录**，需等待约 10 分钟才恢复。症状很隐蔽：点击 GitHub 按钮有响应但页面不跳转，最终报 `LOGIN_TIMEOUT`。因此不要短时间内反复手工退出重登同一批账号；批量脚本每完成 10 次签到会自动暂停 11 分钟（见下方脚本）。**当前脚本 20 个账号**：每满 10 次登录插入一次 11 分钟冷却（20 个账号仍只在第 10 次后冷却一次，属预期行为，不是故障）。冷却前后都会把时间写进当天日志。
+- **登录频率限制（重要）**：站点对连续登录有限制——**连续登录约 10 次后会被临时拒绝登录**，需等待 15 分钟以上才恢复。症状很隐蔽：点击 GitHub 按钮有响应但页面不跳转，最终报 `LOGIN_TIMEOUT`。因此不要短时间内反复手工退出重登同一批账号；批量脚本每完成 10 次签到会自动暂停 16 分钟（见下方脚本）。**当前脚本 20 个账号**：每满 10 次登录插入一次 16 分钟冷却（20 个账号仍只在第 10 次后冷却一次，属预期行为，不是故障）。冷却前后都会把时间写进当天日志。
 - **总预算默认 3 分钟**：`--timeout` 可调（最大 5m），超时报 `CHECKIN_TIMEOUT`。
 - **隔离窗口必定回收**：签到成功或失败后，隔离窗口都会被关闭（`session stop`），不留标签页在桌面上。关闭失败时会在输出中报 `CLEANUP_INCOMPLETE`（同时也会打印到 stderr），此时请手动关掉那个 Edge 窗口；批量脚本在全部账号跑完后还会兜底清理一次残留 session。
 - **多账号**：不内置批量签到；在脚本中按别名循环调用即可，每个账号独立执行一次。
 - **LinuxDO 站点账号也可用**：站点用户名可能显示为 `linuxdo_xxx`，只要该账号绑定了 GitHub，就仍走“退出 → 使用 GitHub 继续”重新登录，登录前后站点身份不变（已实测：`linuxdo_25672`、`linuxdo_27030` 账号经 GitHub 登录后仍显示原 linuxdo 身份，额度正常到账）。用户菜单的首字母是登录来源标识（G=GitHub、L=LinuxDO），zenx 不依赖它校验身份。
 - **签到后核对**：可用 `zenx accounts inspect-site <别名>` 只读查看当前登录身份与余额。
+
+---
+
+## 在 anyrouter.top 每日打卡（刷新页面即可）
+
+AnyRouter 的签到比 AgentRouter 简单得多：**站点在控制台页面加载时自动发放当日额度**，没有签到按钮、没有 toast 提示，也不需要退出重登。
+
+```powershell
+# 1.（首次）给账号补记 AnyRouter 的站点身份
+node src/cli.ts accounts bind-anyrouter edge-6 --identity linuxdo_85789 --confirm
+
+# 2.（可选）确保对应 Edge Profile 已在线；离线会自动启动一次
+node src/cli.ts accounts ensure-online edge-6
+
+# 3. 一条命令完成签到
+node src/cli.ts accounts anyrouter-checkin edge-6
+```
+
+成功输出示例：
+
+```json
+{
+  "ok": true,
+  "alias": "edge-6",
+  "instanceId": "a03f225b",
+  "identity": "linuxdo_85789",
+  "balanceBefore": 5096.77,
+  "balanceAfter": 5121.77,
+  "checkinCredited": true
+}
+```
+
+### 执行流程
+
+1. 前置检查：浏览器在线、为 Edge、协议受支持，否则直接返回（报 `OFFLINE` / `WRONG_BROWSER` / `UNSUPPORTED_PROTOCOL`），不启动任何窗口
+2. 当天账本已有到账记录 → 直接跳过（`skipped: "already_credited_today"`），不重复刷新
+3. 创建隔离 session，导航到 <https://anyrouter.top/console>（**这一步就是签到动作**）
+4. 等待页面渲染后读正文，**核对登录身份**与绑定的 AnyRouter 身份一致；不一致立即停止，报 `IDENTITY_MISMATCH`
+5. 读当前余额，与"今天开始前"的基线对比，增长 ≥ $25 即确认到账
+6. 结果写入账本，隔离窗口必定回收
+
+### 与 AgentRouter 签到的区别
+
+| | AgentRouter（`checkin`） | AnyRouter（`anyrouter-checkin`） |
+|---|---|---|
+| 签到动作 | 退出 → GitHub 重新登录 | 刷新/加载控制台页面 |
+| 登录配额 | 消耗（约 10 次连续登录触发限流） | **不消耗**，可反复跑 |
+| 公告弹窗 | 需要关闭（会遮住正文） | 常驻区块，无需处理 |
+| 总预算 | 默认 3m（最长 5m） | 默认 60s |
+
+### 注意事项
+
+- **同一个 Edge Profile 在两个站点上通常是两个不同的账号**（实测 edge-6：AgentRouter `github_206707`、AnyRouter `linuxdo_85789`），余额体系也完全独立（$1276 vs $5121）。因此 AnyRouter 的身份必须单独绑定，不能复用 `expectedIdentity`。
+- **账本分开统计**：AnyRouter 的签到记在 `<别名>@anyrouter` 下（如 `edge-6@anyrouter`），与 AgentRouter 的记录互不干扰，报表里也是两个独立账号。
+- **首次签到没有基线**，`checkinCredited` 会是 `false` —— 那是"无法证明"，不等于"没签上"。第一次跑建立基线，之后每天跑就能对比确认到账了。
+- **当天已到账会跳过**（`skipped: "already_credited_today"`）：站点每日只发一次，重复刷新不会二次发放。刷新不消耗任何配额，确需重跑加 `--force` 即可，无需清账本。
+- **不需要 `--close-after`**：本命令不开批量、不分组，跑完只回收隔离窗口，Edge 进程留着。
+- **需要账号已绑定身份**：未绑定时报 `ANYROUTER_NOT_BOUND`，提示先运行 `bind-anyrouter`。
+- **snapshot 与 recheck 同样支持 AnyRouter**（`--site anyrouter`，见下节）。
+
+### 只读能力按站点复用：`snapshot` / `recheck`
+
+`snapshot` 与 `recheck` 原先写死在 AgentRouter，现在由站点适配器驱动，两个站点共用同一套实现：
+
+```powershell
+node src/cli.ts accounts snapshot edge-6                      # 两站各采一条观测点
+node src/cli.ts accounts snapshot edge-6 --site anyrouter      # 只采 AnyRouter
+node src/cli.ts accounts snapshot --all                        # 全部账号 × 各自绑定的站点
+node src/cli.ts accounts recheck edge-6 --site anyrouter       # 复查 AnyRouter 今日到账
+```
+
+要点：
+
+- **snapshot 按站点各采一次**：账号在哪些站点绑了身份就采哪些（AgentRouter 取 `expected-identity`，AnyRouter 取 `bind-anyrouter` 的身份），各写一条独立记录（`<别名>` / `<别名>@anyrouter`）。返回值是**数组**（每站一条），顶层给 `total` / `saved`。
+- **身份按站点取**：拿错站点的身份会把正常页面判成 `IDENTITY_MISMATCH`，所以适配器各自提供 `identityMatches`——AgentRouter 用子串包含（VOM 会把身份拆成多个节点），AnyRouter 用问候语精确比对。
+- **`recheck --site`** 默认 `agentrouter`（既有行为不变）；指定的站点没绑身份时报 `SITE_NOT_BOUND`，站点 id 拼错报 `INVALID_SITE`。
+- **每日额度取适配器的 `dailyCredit`**，不再是写死的 25——将来接额度不同的站点不会静默算错。
+- **AnyRouter 没有"今日已签到"提示**（站点压根不显示），所以它的 `alreadyCheckedIn` 恒为 false，到账只能靠账本 + 余额基线判断。
+
+### AnyRouter 批量签到（`zenx accounts anyrouter-checkin-all`）
+
+一条命令跑完所有绑定了 AnyRouter 身份的账号：
+
+```powershell
+node src/cli.ts accounts anyrouter-checkin-all            # 全部已绑定的 AnyRouter 账号
+node src/cli.ts accounts anyrouter-checkin-all --force    # 已到账的也强制刷新
+```
+
+```json
+{ "ok": true, "total": 2, "credited": 0, "skipped": 0, "failed": 0,
+  "accounts": [
+    { "alias": "edge-6",   "identity": "linuxdo_85789", "ok": true, "balanceAfter": 5121.77, "credited": false, "launched": false },
+    { "alias": "edge-p16", "identity": "linuxdo_85219", "ok": true, "balanceAfter": 5037.06, "credited": false, "launched": false }
+  ] }
+```
+
+要点：
+
+- **账号取自 `accounts.json`**（绑了 `anyrouterIdentity` 的才算），不用维护平行名单——将来给新账号补绑身份，本命令自动覆盖它。
+- **离线按需拉起 Edge**：与 `ensure-online` 同一套逻辑，只拉起离线的；`launched` 字段如实记录哪些是本轮拉起的。
+- **今天已到账的连 Edge 都不拉起**：预判在拉起之前，省一个 Edge 进程（批量 AgentRouter 刚跑完时内存正紧）。
+- **单个失败不中断后续账号**，最后汇总成功/跳过/失败；`ok` 为 false 表示至少有一个失败。
+- **不做限流冷却与 `--window` 分组**：AnyRouter 刷新不消耗站点登录配额，且账号很少，这两套机制用不上。
+
+### 每日自动跑：`daily-checkin.ps1`
+
+[`scripts/daily-checkin.ps1`](file:///d:/916938/zenxbrowser/scripts/daily-checkin.ps1) 在 AgentRouter 签到之后、每日快照之前，会调用一次 `anyrouter-checkin-all`。所以计划任务不用改——每天自动把两个站点都签完。
+
+脚本与批量命令是**两个层次**：批量命令是能力（可随时手动跑），脚本是调度（每天自动跑，并复用它自己的防休眠、失败名单与日志）。脚本直接调批量命令，逻辑只写一遍。
+
+注意 edge-6 与 edge-p16 同时也在 AgentRouter 的名单里，而脚本给"本轮拉起的实例"加了 `--close-after`——如果 AgentRouter 阶段把它们关掉了，AnyRouter 阶段会重新拉起。这是预期行为，不是故障。
 
 ### 复查：当日额度到底到账没有（`zenx accounts recheck`）
 
@@ -217,7 +331,20 @@ zenx report --port 9000             # 换端口
 node src/cli.ts report --open
 ```
 
-报表包含：顶部卡片（账号数、打卡次数、累计获得、**历史总消耗**、余额总额、最近一日消耗、最近 7 天消耗）、**账号汇总**（按当前余额从高到低排列，末行给出合计）、每日总额、周/月对比、余额趋势图（SVG）与打卡明细（失败行标红并显示错误码）。仅监听本机回环地址，`Ctrl+C` 停止。
+报表包含：顶部卡片（账号数、打卡次数、累计获得、**历史总消耗**、余额总额、最近一日消耗、最近 7 天消耗）、**账号汇总**（同 Profile 相邻排列，末行按站点给出合计）、每日总额、周/月对比、余额趋势图（SVG）与打卡明细（失败行标红并显示错误码）。仅监听本机回环地址，`Ctrl+C` 停止。
+
+### 两个站点在报表里的呈现
+
+AgentRouter 与 AnyRouter 的数据**在同一个报表里**，但按站点分开统计——两个站点的额度不能互转，加起来得到的"总额"没有意义：
+
+- **顶部卡片**：每个指标按站点各给一行（AgentRouter / AnyRouter），不相加。
+- **账号汇总**：新增「站点」列；账号列显示 Profile 别名（去掉 `@anyrouter` 后缀）；**同一个 Profile 的两站挨在一起**，组间按该 Profile 的最高余额降序。合计行也按站点各一行。
+- **每日总额**：一天按站点分成多行。
+- **周/月对比**：同一 Profile 两站相邻，合计按站点分行。
+- **余额趋势**：按站点分图——两站余额差一个数量级（AgentRouter $800~2000、AnyRouter $5000+），共用一根 Y 轴会把低值那组压成直线。
+- **打卡明细**：新增「站点」列。
+
+账本里 AnyRouter 记在 `<别名>@anyrouter` 下，因此顶部"账号数"会说"**站点账号**"——一个 Edge Profile 可以在多个站点上各有账号，站点账号数自然比 Profile 数多，这不是出错。
 
 统计口径：
 
@@ -253,6 +380,7 @@ node src/cli.ts accounts snapshot edge-1 --json    # 只采集一个
 
 - **到账** = 区间内签到带来的余额实际增长之和（与"累计到账"一致）。
 - **消耗** = 站点「历史消耗」累计值的**区间增量**。**不用余额差**：余额同时被"发放"和"消耗"影响，用余额差会把"没签到"误算成"花多了"；累计消耗只增不减，差分才是真实花费。
+- **同一天多次签到不反推消耗**：消耗兜底算法是"上次余额 + 每日额度 − 本次余额"，前提是两次签到之间恰好发放过一次。站点每日只发一次，同一天的第二条记录之间没有发放，反推会把"当天已签到所以余额没涨"误算成"花掉了 $25"（AnyRouter 同一天多刷新一次就多一笔假消耗）。因此**同一天的相邻记录会被跳过**，只有跨天相邻对才参与反推。
 - 区间内没有任何快照时，消耗显示 `—`，不臆造数字。
 - 总额只统计**当天真正有观测点**的账号，并同时给出覆盖账号数 —— 不会把"今天只采了 3 个号"当成全员总额。消耗还需要相邻两个观测点，所以首次采集那天显示 `—`。
 - 每个账号一天若采集多次，以**最后一次**为准。
@@ -287,7 +415,7 @@ New-Item (Split-Path $log) -ItemType Directory -Force | Out-Null
 # Site rate limit: after ~10 logins in quick succession it starts refusing sign-in.
 # Each checkin performs exactly one login, so pause after every $loginLimit logins.
 $loginLimit   = 10
-$coolDownMin  = 11
+$coolDownMin  = 16
 
 # A failed checkin can leave the account logged out on the site. Re-running blind then
 # fails again with IDENTITY_MISMATCH and never recovers, so accounts that already failed
@@ -384,7 +512,7 @@ Register-ScheduledTask -TaskName "ZenX 每日签到" -Action $action -Trigger $t
 - 首次配置后手动运行一次验证全链路：`powershell -ExecutionPolicy Bypass -File scripts\daily-checkin.ps1`（前提：`zenx doctor` 通过、各账号已绑定且配置了启动参数）。
 - 账号串行执行、互不阻塞；单账号失败不中断后续账号。
 - **签完释放实例**：脚本对本轮 `ensure-online` 拉起的账号自动加 `--close-after`，整个 Edge 进程退出；你自己本来就开着的 Edge 不会被关（同一 Profile，关了会丢你的标签页与未保存内容）。
-- **全程开启防休眠**（进程级，不改电源计划）：跑几十分钟、中间还有 11 分钟冷却，休眠会让后续账号全部中断。`-NoSleepGuard` 关闭。
+- **全程开启防休眠**（进程级，不改电源计划）：跑几十分钟、中间还有 16 分钟冷却，休眠会让后续账号全部中断。`-NoSleepGuard` 关闭。
 - 退出码：`0` 全部成功；`1` 本次有新失败，需要关注；`2` 本次无新失败，只是跳过了当天早前已失败的账号。“任务计划程序 → 上次运行结果”非 0 即有失败。
 - 日志按天追加在 `.zenx\logs\checkin-日期.log`（`.zenx` 已被 git 忽略）。
 - **失败账号当天不再自动重试**：签到失败可能让账号停留在“已登出”状态，盲目重跑只会反复报 `IDENTITY_MISMATCH`、越跑越糟。失败的别名会记入 `.zenx\logs\failed-日期.txt`，当天后续运行直接跳过（日志里标 `skipped`）。人工完成一次 GitHub 登录后，用 `daily-checkin.ps1 -Force` 清掉该文件再跑；不处理的话次日自动恢复（文件名按日期变化）。

@@ -50,6 +50,8 @@ export type Account = {
   profileAccountId?: string;
   /** 锚点采集来源，便于判断可信度。 */
   profileAccountSource?: "preferences" | "bsk" | "manual";
+  /** AnyRouter 站点的登录身份（与 expectedIdentity 不同站点可不同）。 */
+  anyrouterIdentity?: string;
 };
 export type Store = { version: 1; accounts: Account[] };
 
@@ -180,6 +182,7 @@ export async function readStore(home: string): Promise<Store> {
       if ("launch" in item && !isLaunchConfig(item.launch)) throw new Error();
       if ("profileAccountId" in item && typeof item.profileAccountId !== "string") throw new Error();
       if ("profileAccountSource" in item && !["preferences", "bsk", "manual"].includes(item.profileAccountSource as string)) throw new Error();
+      if ("anyrouterIdentity" in item && (typeof item.anyrouterIdentity !== "string" || !text(item.anyrouterIdentity))) throw new Error();
       if (aliases.has(item.alias) || ids.has(item.instanceId)) throw new Error();
       aliases.add(item.alias);
       ids.add(item.instanceId);
@@ -292,6 +295,28 @@ export async function bindAccount(home: string, run: Runner, account: Omit<Accou
     const saved = { ...account, boundAt: new Date().toISOString() };
     store.accounts.push(saved);
     return saved;
+  });
+}
+
+/**
+ * 绑定 AnyRouter 站点身份到已有账号。
+ *
+ * 同一个 Edge Profile 在 AgentRouter 与 AnyRouter 上是两个不同的站点账号
+ * （实测 edge-6：AgentRouter `github_206707`、AnyRouter `linuxdo_85789`），
+ * 因此 AnyRouter 的身份必须单独记录，不能复用 expectedIdentity。
+ *
+ * 必须先有 AgentRouter 绑定（alias 已存在），再补这个站点的身份。
+ */
+export async function bindAnyRouterIdentity(home: string, alias: string, identity: string, confirm: boolean): Promise<Account> {
+  if (!confirm) throw new ZenxError("CONFIRM_REQUIRED", "请核对该 Profile 在 AnyRouter 上的实际用户名后添加 --confirm；此操作只记录预期身份，不证明站点已登录该账号。");
+  if (!text(identity) || identity !== identity.trim() || identity.length > 200 || /[\r\n\x00-\x1f]/.test(identity)) {
+    throw new ZenxError("INVALID_IDENTITY", "请提供 AnyRouter 上的预期用户名或用户 ID，不要填写密码或令牌。");
+  }
+  return updateStore(home, async (store) => {
+    const account = store.accounts.find((item) => item.alias === alias);
+    if (!account) throw new ZenxError("ACCOUNT_NOT_FOUND", "账号别名尚未绑定；请先用 accounts bind 绑定 AgentRouter 账号。");
+    account.anyrouterIdentity = identity.trim();
+    return account;
   });
 }
 

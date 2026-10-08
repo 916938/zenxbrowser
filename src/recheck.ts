@@ -1,12 +1,23 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { isEdge, listBrowsers, protocolSupported, readStore, withStoreLock, ZenxError } from "./core.ts";
-import type { Runner } from "./core.ts";
-import { DEFAULT_DB_FILE, hasCreditedBetween, insertCheckin, lastBalancePointBefore, lastPairedSnapshotBefore } from "./db.ts";
+import type { Account, Runner } from "./core.ts";
+import { DEFAULT_DB_FILE, hasCreditedBetween, insertCheckin, lastBalancePointBefore, lastPairedSnapshotBefore, ledgerAliasOf } from "./db.ts";
 import { readConsoleState } from "./console.ts";
 import { findAccount } from "./launch.ts";
+import { agentRouter } from "./sites/agentrouter.ts";
+import { anyRouter } from "./sites/anyrouter.ts";
+import type { ReadableSite } from "./sites/readable.ts";
 
-/** 站点每日签到发放的额度；余额相对基线的增量达到该值即认为当日已发放。 */
-const DAILY_CREDIT = 25;
+/** 可复查的站点，以及"这个账号在该站点的身份"（与 snapshot.ts 同一套口径）。 */
+const SITES: { site: ReadableSite; identityOf: (account: Account) => string | undefined }[] = [
+  { site: agentRouter, identityOf: (account) => account.expectedIdentity },
+  { site: anyRouter, identityOf: (account) => account.anyrouterIdentity },
+];
+
+/** 按站点 id 取适配器；未知 id 返回 undefined，由调用方报错。 */
+function siteById(id: string): { site: ReadableSite; identityOf: (account: Account) => string | undefined } | undefined {
+  return SITES.find((entry) => entry.site.id === id);
+}
 
 /**
  * 配对消耗基准的最大年龄。
@@ -32,6 +43,8 @@ export type RecheckDependencies = {
    * 记账本不影响站点状态，也不消耗登录配额。
    */
   record?: boolean;
+  /** 复查哪个站点（默认 AgentRouter）。 */
+  siteId?: string;
 };
 
 export type RecheckResult = {
@@ -43,6 +56,8 @@ export type RecheckResult = {
   connection: "online" | "offline" | "wrong_browser" | "unsupported_protocol";
   login: "logged_in" | "logged_out" | "manual_intervention" | "unknown";
   identityMatch: boolean;
+  /** 站点 id；账本记录在 ledgerAliasOf(alias, site) 下。 */
+  site: string;
   balance: number | null;
   siteCheckedIn: boolean;
   /** 账本里今天是否已有"确认到账"记录。 */
@@ -90,7 +105,9 @@ function deadlineBudget(timeoutMs: number, now: () => number): () => number {
  * 触发发放）。写失败不影响复查结论——账本只是 Remembering，不是判定依据。
  */
 function recordMissingCredit(
-  account: { alias: string; instanceId: string; expectedIdentity: string },
+  ledgerAlias: string,
+  instanceId: string,
+  identity: string,
   balance: number | null,
   baselineBalance: number | null,
   creditedToday: boolean,
@@ -101,9 +118,9 @@ function recordMissingCredit(
   try {
     insertCheckin({
       time: new Date(now).toISOString(),
-      alias: account.alias,
-      instanceId: account.instanceId,
-      identity: account.expectedIdentity,
+      alias: ledgerAlias,
+      instanceId,
+      identity,
       ok: true,
       balanceBefore: baselineBalance,
       balanceAfter: balance,
@@ -139,10 +156,21 @@ export async function recheckAccount(
   const now = dependencies.now ?? (() => Date.now());
   const sleep = dependencies.sleep ?? delay;
   const remaining = deadlineBudget(timeoutMs, now);
+  const target = siteById(dependencies.siteId ?? agentRouter.id);
+  if (target === undefined) {
+    throw new ZenxError("UNKNOWN_SITE", `未知站点 ${dependencies.siteId}；可用：${SITES.map((s) => s.site.id).join(", ")}。`);
+  }
+  const { site, identityOf } = target;
   return withStoreLock(home, async () => {
     const store = await readStore(home);
     const account = findAccount(store, alias);
-    const base = { alias: account.alias, instanceId: account.instanceId, identity: account.expectedIdentity };
+    const identity = identityOf(account);
+    if (!identity) {
+      throw new ZenxError("SITE_NOT_BOUND", `账号 ${alias} 未绑定 ${site.name} 身份；无法复查该站点。`);
+    }
+    // 账本按站点分开：AgentRouter 记在 alias，其他站点记在 alias@站点id。
+    const ledgerAlias = ledgerAliasOf(account.alias, site.id);
+    const base = { alias: account.alias, instanceId: account.instanceId, identity, site: site.id };
 
     const browsers = await listBrowsers(run, {
       timeoutMs: Math.min(60_000, remaining()),
@@ -160,7 +188,7 @@ export async function recheckAccount(
       };
     }
 
-    const state = await readConsoleState(run, account.instanceId, account.expectedIdentity, remaining, sleep);
+    const state = await readConsoleState(run, account.instanceId, identity, remaining, sleep, site);
     const { balance, siteCheckedIn } = state;
 
     // 账本侧：今日到账记录 + 今日开始前的余额基准（含配对消耗）。
@@ -171,8 +199,8 @@ export async function recheckAccount(
     let spentDelta: number | null = null;
     try {
       const dbFile = dependencies.dbFile ?? DEFAULT_DB_FILE;
-      creditedToday = hasCreditedBetween(account.alias, start, end, dbFile);
-      const latest = lastBalancePointBefore(account.alias, start, dbFile);
+      creditedToday = hasCreditedBetween(ledgerAlias, start, end, dbFile);
+      const latest = lastBalancePointBefore(ledgerAlias, start, dbFile);
       baselineBalance = latest?.balance ?? null;
       /**
        * Δ消耗只在"配对观测点"上成立，因此要求扫到的快照同时满足两条：
@@ -182,7 +210,7 @@ export async function recheckAccount(
        *    算进今天，同样造出假到账。
        * 任一不满足都放弃 Δ消耗、退化为只比余额。
        */
-      const paired = lastPairedSnapshotBefore(account.alias, start, dbFile);
+      const paired = lastPairedSnapshotBefore(ledgerAlias, start, dbFile);
       const fresh = paired !== null && now() - Date.parse(paired.time) <= MAX_BASELINE_AGE_MS;
       if (paired && fresh && latest !== null && paired.time === latest.time) {
         baselineTotalSpent = paired.totalSpent;
@@ -214,7 +242,7 @@ export async function recheckAccount(
         balance, siteCheckedIn, creditedToday, baselineBalance, balanceDelta,
         baselineTotalSpent, spentDelta, creditDelta,
         verdict: "manual_intervention", pageFeature: state.pageFeature,
-        note: "检测到 GitHub 授权/验证页；需人工完成登录后重试。",
+        note: "检测到需人工处理的授权/验证页；需人工完成登录后重试。",
       };
     }
     if (state.login === "logged_out") {
@@ -234,11 +262,11 @@ export async function recheckAccount(
         balance, siteCheckedIn, creditedToday, baselineBalance, balanceDelta,
         baselineTotalSpent, spentDelta, creditDelta,
         verdict: "identity_mismatch",
-        note: `控制台未出现预期身份 ${account.expectedIdentity}；不据此判断额度，请人工核对。`,
+        note: `控制台未出现预期身份 ${identity}；不据此判断额度，请人工核对。`,
       };
     }
 
-    const gained = creditDelta !== null && creditDelta >= DAILY_CREDIT;
+    const gained = creditDelta !== null && creditDelta >= site.dailyCredit;
     if (creditedToday || siteCheckedIn || gained) {
       const source = creditedToday ? "账本今日已有到账记录" : siteCheckedIn ? "站点显示今日已签到" : "余额相对基线已增长";
       return {
@@ -246,7 +274,7 @@ export async function recheckAccount(
         balance, siteCheckedIn, creditedToday, baselineBalance, balanceDelta,
         baselineTotalSpent, spentDelta, creditDelta,
         verdict: "credited", note: `已确认今日到账（依据：${source}）。`,
-        recorded: recordMissingCredit(account, balance, baselineBalance, creditedToday, dependencies, now()),
+        recorded: recordMissingCredit(ledgerAlias, account.instanceId, identity, balance, baselineBalance, creditedToday, dependencies, now()),
       };
     }
     return {

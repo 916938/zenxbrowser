@@ -9,6 +9,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { checkAccounts, createRunner, readStore, withStoreLock, ZenxError } from "../src/core.ts";
 import type { Account, Browser, Runner } from "../src/core.ts";
 import { closeBrowser, configureLaunch, ensureOnline, MIN_FREE_MEMORY_BYTES } from "../src/launch.ts";
+import { readLeftovers, recordLaunchedInstance } from "../src/leftover.ts";
 import type { LaunchConfig } from "../src/launch.ts";
 
 const edge: Browser = {
@@ -364,26 +365,84 @@ test("关闭在线实例：精确实例 ID、零等待、回显结果且不改�
   const time = clock();
   const calls: string[][] = [];
   const budgets: number[] = [];
+  let closed = false;
   const run: Runner = async (args, options) => {
     calls.push(args);
     if (args[0] === "browsers" && args[1] === "--json") {
       assert.equal(options?.env?.BSK_BROWSER_WAIT_MS, "0");
       budgets.push(options!.timeoutMs!);
       time.advance(100);
-      return { stdout: JSON.stringify([edge]), exitCode: 0 };
+      // 关闭前在线；关掉之后实例才从注册表消失（真实退出要几秒）。
+      return { stdout: JSON.stringify(closed ? [] : [edge]), exitCode: 0 };
     }
     budgets.push(options!.timeoutMs!);
+    closed = true;
     return { stdout: closeReply, exitCode: 0 };
   };
   const result = await closeBrowser(home, run, "work", 5000, time);
   assert.equal(result.ok, true);
-  assert.deepEqual(calls, [["browsers", "--json"], ["browsers", "close", "--browser-id", edge.instance_id, "--confirm", "--json"]]);
-  assert.deepEqual(budgets, [5000, 4900]);
+  assert.deepEqual(calls, [
+    ["browsers", "--json"],
+    ["browsers", "close", "--browser-id", edge.instance_id, "--confirm", "--json"],
+    ["browsers", "--json"], // 关闭后的复核只读查询
+  ]);
+  assert.deepEqual(budgets, [5000, 4900, 4900]);
   assert.deepEqual(result, {
     ok: true, alias: "work", instanceId: edge.instance_id, browser_id: edge.instance_id,
     closed: true, windows_closed: 2, sessions_stopped: 1, disconnected: false, identity: "not_verified",
+    outcome: { requestAcked: true, windowsClosedReported: 2, instanceOffline: true },
   });
   assert.equal(await readFile(join(home, "accounts.json"), "utf8"), before);
+});
+
+test("请求已响应但复核仍在线：不宣称释放，并留下可重试的原因", async (t) => {
+  const { home } = await fixture(t);
+  await recordLaunchedInstance(home, "work", edge.instance_id);
+  // 列表始终返回该实例：窗口还在退出，注册表里它还没消失。
+  const run: Runner = async (args) => {
+    if (args[0] === "browsers" && args[1] === "--json") return { stdout: JSON.stringify([edge]), exitCode: 0 };
+    return { stdout: closeReply, exitCode: 0 };
+  };
+  const result = await closeBrowser(home, run, "work", 1000, { now: () => 0, sleep: async () => {} });
+  assert.equal(result.outcome.requestAcked, true, "请求确实被响应了");
+  assert.equal(result.outcome.instanceOffline, false, "没确认离线就不能算释放");
+  const leftovers = await readLeftovers(home);
+  assert.equal(leftovers.instances.length, 1, "记录要留下，供 close-leftover 再试");
+  assert.match(leftovers.instances[0]?.lastCloseError ?? "", /CLOSE_UNCONFIRMED/);
+});
+
+test("复核时读不到在线列表：按未确认处理，不因为查不到就宣称已释放", async (t) => {
+  const { home } = await fixture(t);
+  await recordLaunchedInstance(home, "work", edge.instance_id);
+  let listed = false;
+  const run: Runner = async (args) => {
+    if (args[0] === "browsers" && args[1] === "--json") {
+      if (listed) return { stdout: "", exitCode: 1 }; // 复核查询失败
+      listed = true;
+      return { stdout: JSON.stringify([edge]), exitCode: 0 };
+    }
+    return { stdout: closeReply, exitCode: 0 };
+  };
+  const result = await closeBrowser(home, run, "work", 1000, { now: () => 0, sleep: async () => {} });
+  assert.equal(result.outcome.instanceOffline, false);
+  assert.match((await readLeftovers(home)).instances[0]?.lastCloseError ?? "", /CLOSE_UNCONFIRMED/);
+});
+
+test("断连路径：daemon 已确认离开注册表即视为离线，窗口计数标为未知", async (t) => {
+  const { home } = await fixture(t);
+  const dropped = JSON.stringify({
+    browser_id: edge.instance_id, closed: true, windows_closed: 0, sessions_stopped: 0, disconnected: true,
+  });
+  const run: Runner = async (args) => {
+    if (args[0] === "browsers" && args[1] === "--json") return { stdout: JSON.stringify([edge]), exitCode: 0 };
+    return { stdout: dropped, exitCode: 0 };
+  };
+  // 复核查不到（仍列着），但 disconnected 是 daemon 侧已确认移除的兜底。
+  const result = await closeBrowser(home, run, "work", 1000, { now: () => 0, sleep: async () => {} });
+  assert.equal(result.outcome.requestAcked, true);
+  assert.equal(result.outcome.windowsClosedReported, null, "断连路径的计数不可信");
+  assert.equal(result.outcome.instanceOffline, true);
+  assert.deepEqual((await readLeftovers(home)).instances, [], "确认离线后不留记录");
 });
 
 test("离线、非 Edge 或协议不兼容都不调用关闭", async (t) => {

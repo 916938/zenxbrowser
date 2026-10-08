@@ -75,3 +75,10 @@ test("适配器元数据可用于域名路由", () => {
   assert.equal(agentRouter.consoleUrl, "https://agentrouter.org/console");
   assert.equal(agentRouter.mutating, true, "签到会改变站点状态，不是只读");
 });
+
+test("只读能力接口的字段齐全（snapshot / recheck 依赖它们）", () => {
+  assert.equal(agentRouter.dailyCredit, 25);
+  assert.equal(agentRouter.textLimit, 4000);
+  assert.equal(agentRouter.identityMatches("G github_16350 chevron_down", "github_16350"), true);
+  assert.equal(agentRouter.identityMatches("G github_99999", "github_16350"), false);
+});

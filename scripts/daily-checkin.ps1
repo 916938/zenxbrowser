@@ -44,9 +44,10 @@ try {
 # Site rate limit: after ~10 logins in quick succession it starts refusing sign-in
 # ("cannot log in") for a while. Each checkin performs exactly one login, so pause
 # after every $loginLimit logins. Keep this conservative - the block is silent
-# (clicks land, nothing happens) and only clears after roughly 10 minutes.
+# (clicks land, nothing happens) and needs 15+ minutes to clear; an 11-minute pause
+# was observed to expire while the site was still refusing, costing a re-run.
 $loginLimit   = 10
-$coolDownMin  = 11
+$coolDownMin  = 16
 
 # A failed checkin can leave the account logged out on the site. Re-running blind then
 # fails again with IDENTITY_MISMATCH and never recovers, so accounts that already failed
@@ -235,6 +236,23 @@ for ($i = 0; $i -lt $aliases.Count; $i++) {
   # into a needless 11-minute cool-down - exactly what happens when re-running a
   # batch that was interrupted half-way.
   if (-not ($script:LastOutput -match '"skipped"\s*:')) { $logins++ }
+}
+
+# AnyRouter (anyrouter.top) - a DIFFERENT site from AgentRouter above.
+# Same Edge profiles, but different site accounts and a separate balance pool,
+# so it is tracked under "<alias>@anyrouter" in the ledger and signed in with its
+# own command. Signing in here is just a page refresh: it does NOT consume the
+# AgentRouter login quota, so none of the cool-down logic above applies.
+# Accounts come from accounts.json (whichever are bound with bind-anyrouter),
+# not from a parallel list, so binding a new account is all it takes to add one.
+Add-Content -Path $log -Encoding UTF8 -Value "`n===== $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') anyrouter checkin ====="
+$anyrouter = Invoke-Zenx @("accounts", "anyrouter-checkin-all")
+if (0 -ne $anyrouter) {
+  # Not fatal for the AgentRouter run: report it and keep going. The accounts are
+  # independent, and a refresh failure (offline profile, identity mismatch) does
+  # not leave the site account logged out the way an AgentRouter failure can.
+  Add-Content -Path $log -Encoding UTF8 -Value "--- anyrouter check-in incomplete (see report above); continuing"
+  $failed += "anyrouter(incomplete)"
 }
 
 # Daily snapshot: record each account's balance and cumulative site spend.

@@ -23,6 +23,10 @@ export type SiteAdapter = {
   consoleUrl: string;
   /** 签到会退出重登，会改变站点状态——不是只读操作。 */
   mutating: boolean;
+  /** 每日签到发放的额度。 */
+  dailyCredit: number;
+  /** 读取页面正文的截断长度。 */
+  textLimit: number;
   parse: {
     /** "当前余额 $X" / "Current balance $X"；页面没渲染出来返回 null（不算失败）。 */
     balance: (text: PageText) => number | null;
@@ -45,6 +49,8 @@ export type SiteAdapter = {
     /** 存在需要关闭的系统公告。 */
     hasAnnouncement: (text: PageText) => boolean;
   };
+  /** 页面正文里该账号的登录身份是否出现（只读路径共用，见 sites/readable.ts）。 */
+  identityMatches: (text: PageText, expectedIdentity: string) => boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -105,6 +111,9 @@ export const agentRouter: SiteAdapter = {
   origin: "https://agentrouter.org",
   consoleUrl: "https://agentrouter.org/console",
   mutating: true,
+  dailyCredit: 25,
+  // 控制台正文 4000 字符足够覆盖身份、余额与消耗（实测）。
+  textLimit: 4000,
   parse: {
     balance: (text) =>
       money(/当前余额\s*\$([\d,]+(?:\.\d+)?)/.exec(text)) ??
@@ -134,4 +143,7 @@ export const agentRouter: SiteAdapter = {
       (text.includes("系统公告") && (text.includes("今日关闭") || text.includes("关闭公告"))) ||
       (text.includes("System Notice") && (text.includes("Close Today") || text.includes("Close Notice"))),
   },
+  // 身份散落在 VOM 的多个节点里（"G" + "github_16350" 可能被拆开），
+  // 逐节点精确比必然漏判，子串包含才可靠。
+  identityMatches: (text, expectedIdentity) => text.includes(expectedIdentity),
 };

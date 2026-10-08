@@ -13,16 +13,19 @@ import { recordLaunchedInstance } from "./leftover.ts";
 import { enrichBskTimeout } from "./diagnose.ts";
 
 /**
- * 站点登录限流后的默认冷却时长与随机波动范围。站点约 10 分钟恢复，取 12 分钟留余量，
- * 再在 ±1 分钟内随机抖一下（实际落在 11–13 分钟）：固定 15 分钟一轮要多花好几分钟，
- * 而固定单一值又容易被站点侧按节拍认出来。
+ * 站点登录限流后的默认冷却区间：15–18 分钟。
+ *
+ * 站点约 10–15 分钟恢复。原来 11–13 分钟的实测问题是"刚冷却完就再撞一次"，
+ * 于是一轮签到里连着冷两次、多花二十几分钟（后半截的等待其实大半已经等过了）。
+ * 下限抬到 15、上限 18：宁可多等两分钟，也别把整轮拖成两次冷却。
+ * 取区间而不是定值：固定单一值容易被站点侧按节拍认出来。
  *
  * 关键是：限流不是账号级的，而是**站点侧的共享配额**——同一出口 IP 连续登录若干次后，
  * 站点对所有账号都只提示"登录次数过多请稍后再试"，此时继续跑只会把更多账号退出成登出态。
+ * 正因为是共享配额、恢复只看墙钟，冷却就从**第一次撞上限流**起算：中途再撞只补足差额。
  */
-export const DEFAULT_RETRY_WAIT_MS = 12 * 60_000;
-/** 默认冷却的随机波动幅度：实际时长 = DEFAULT_RETRY_WAIT_MS ± 本值。显式传 --wait 时不抖动。 */
-export const DEFAULT_RETRY_WAIT_JITTER_MS = 60_000;
+export const DEFAULT_RETRY_WAIT_MIN_MS = 15 * 60_000;
+export const DEFAULT_RETRY_WAIT_MAX_MS = 18 * 60_000;
 /** 默认视为"可能是限流、值得冷却后重试"的错误码。 */
 export const DEFAULT_RETRY_CODES = ["LOGIN_RATE_LIMITED", "LOGIN_TIMEOUT"];
 
@@ -31,7 +34,7 @@ const DEFAULT_CLOSE_TIMEOUT_MS = 45_000;
 /**
  * BSK_TIMEOUT 即时重试的等待时间。首次 bsk 调用常因扩展/守护进程冷启动而超时
  * （edge-1 这类长期运行的用户自己的 Edge 尤其明显），短暂等待后重试通常成功。
- * 与限流冷却（11–13 分钟）不同，这是快速重试，不影响其他账号，也不消耗限流重试次数。
+ * 与限流冷却（15–18 分钟）不同，这是快速重试，不影响其他账号，也不消耗限流重试次数。
  */
 const BSK_TIMEOUT_RETRY_DELAY_MS = 10_000;
 
@@ -138,7 +141,8 @@ export type CheckinBatchOptions = {
   checkinTimeoutMs?: number;
   ensureTimeoutMs?: number;
   /**
-   * 限流冷却时长；默认 12 分钟上下随机（11–13 分钟）。显式指定时不抖动。
+   * 限流冷却时长；默认在 15–18 分钟之间随机取值。显式指定时不抖动。
+   * 它是"距首次限流"要等到的总时长，中途再撞限流只补足差额（见 checkinAll 里的 limitedSince）。
    * 无论冷却与否，失败的账号都会再补签一次（见 checkinAll 的收尾补签）。
    */
   waitMs?: number;
@@ -217,8 +221,9 @@ async function releaseInstance(
 ): Promise<{ closed: boolean; error?: string }> {
   try {
     const reply = await closeBrowser(home, run, alias, DEFAULT_CLOSE_TIMEOUT_MS);
-    if (reply.disconnected) return { closed: true };
-    return { closed: false, error: "实例仍处于连接状态；未关闭。" };
+    // 只有复核确认离线才算释放：回包里的 closed 只是"请求已响应"。
+    if (reply.outcome.instanceOffline) return { closed: true };
+    return { closed: false, error: "关闭请求已响应，但复核时实例仍在注册表；未确认释放。" };
   } catch (error) {
     const message = error instanceof ZenxError ? `${error.code}: ${error.message}` : error instanceof Error ? error.message : "关闭失败。";
     onProgress(`${alias}: 释放实例失败（${message}）；可稍后用 zenx accounts close 或 close-leftover 处理。`);
@@ -240,7 +245,7 @@ function stamp(ms: number): string {
   return new Date(ms).toISOString();
 }
 
-/** 分钟数：整数就不带小数（"12 分钟"），抖动出来的才显示一位（"11.7 分钟"）。 */
+/** 分钟数：整数就不带小数（"18 分钟"），带零头的才显示一位（"16.4 分钟"）。 */
 function formatMinutes(ms: number): string {
   const minutes = ms / 60_000;
   return Number.isInteger(minutes) ? String(minutes) : minutes.toFixed(1);
@@ -281,16 +286,18 @@ function chunkAccounts(accounts: Account[], size: number): Account[][] {
  * 2. **窗口上限**（默认 8）：一次只让这么多账号在线，一组签完立刻关掉它们的 Edge 实例，
  *    再拉起下一组——内存占用的峰值因此被压在窗口大小的实例数上；
  * 3. 冷却等待期间已完成账号保持关闭状态，不会白占十几分钟内存；
- * 4. 失败的账号不会就此丢下：撞上限流时顺冷却一起重试，全程没限流也会在收尾补签一轮。
+ * 4. 失败的账号不会就此丢下：撞上限流时顺冷却一起重试，全程没限流也会在收尾补签一轮；
+ * 5. 冷却时长是"距**首次**限流"要等到的总时长（默认 15–18 分钟）：共享配额的恢复只认墙钟，
+ *    冷却后重试又撞上限流时只补足差额，不重新计满。
  */
 export async function checkinAll(home: string, run: Runner, options: CheckinBatchOptions = {}): Promise<CheckinBatchReport> {
   const now = options.now ?? (() => Date.now());
   const sleep = options.sleep ?? delay;
   const random = options.random ?? Math.random;
-  const baseWaitMs = options.waitMs ?? DEFAULT_RETRY_WAIT_MS;
-  // 只有走默认值才抖动：显式 --wait 是用户算好的时长，不该被改掉。
-  const jitterMs = options.waitMs === undefined ? DEFAULT_RETRY_WAIT_JITTER_MS : 0;
-  const pickWaitMs = () => Math.round(baseWaitMs + (jitterMs > 0 ? (random() * 2 - 1) * jitterMs : 0));
+  // 显式 --wait 是用户算好的时长，原样使用；走默认值才在 15–18 分钟之间随机取。
+  const waitMinMs = options.waitMs ?? DEFAULT_RETRY_WAIT_MIN_MS;
+  const waitMaxMs = options.waitMs ?? DEFAULT_RETRY_WAIT_MAX_MS;
+  const pickWaitMs = () => Math.round(waitMinMs + random() * (waitMaxMs - waitMinMs));
   const maxRetries = options.maxRetries ?? 1;
   const retryCodes = new Set(options.retryCodes ?? DEFAULT_RETRY_CODES);
   const closeAfter = options.closeAfter === true;
@@ -364,6 +371,17 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
    * 收尾还会再给它们一轮（开头的账号卡在 BSK_TIMEOUT、后面一切顺利时尤其有用）。
    */
   const retryPool = new Map<string, Account>();
+  /**
+   * 本次限流窗口的起点：第一次撞到站点限流的时刻（null = 本次运行还没撞过）。
+   *
+   * 必须跨轮、跨组记忆：限流是站点侧的**共享配额**，恢复只认墙钟时间。
+   * 冷却重试之后又撞上限流时，不能再从头等一整轮——从第一次撞上算起已经过去十几分钟了，
+   * 只补足剩下的几分钟即可（原来每次都重新计满，一轮签到能白等两遍）。
+   * 反过来，有账号真的签到成功就说明配额已经恢复：此时把起点清零，
+   * 之后再来一次限流算新的一轮，重新等满——否则"上轮等到解除、这轮又立刻撞上"
+   * 会被算成已经等够了，一次都不等就再撞一次墙。
+   */
+  let limitedSince: number | null = null;
 
   /** 从补签队列取出最多 limit 个账号；exclude 里已有的（本组剩余账号）跳过。 */
   const takeFromPool = (limit: number, exclude: Account[]): Account[] => {
@@ -430,6 +448,9 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
         if (outcome.ok) {
           // 已经成了，就不必再补签（它可能之前失败过、队列里还留着记录）。
           retryPool.delete(account.alias);
+          // 真拿到当日额度= 站点的共享配额确实已经恢复：限流窗口就此结束，
+          // 之后再来一次限流就从那一刻重新计冷却。
+          if (outcome.credited) limitedSince = null;
           onProgress(`${account.alias}: ${outcome.skipped ? `跳过（${outcome.skipped}）` : `已到账 ${outcome.balanceBefore} → ${outcome.balanceAfter}`}`);
           continue;
         }
@@ -467,16 +488,33 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
         }
       }
       if (deferred.length === 0 || round > maxRetries) break;
-      const cooldownMs = pickWaitMs();
       const coolStart = now();
-      const coolEnd = coolStart + cooldownMs;
-      onProgress(
-        `[${stamp(coolStart)}] 冷却开始：${formatMinutes(cooldownMs)} 分钟（${stamp(coolEnd)} 结束），` +
-          `随后重试 ${deferred.length} 个账号：${deferred.map((item) => item.alias).join(", ")}`,
-      );
-      await sleepWithProgress(cooldownMs, sleep, onProgress);
-      waited += cooldownMs;
-      onProgress(`[${stamp(now())}] 冷却结束，开始重试 ${deferred.length} 个账号`);
+      if (limitedSince === null) limitedSince = coolStart;
+      // 冷却按墙钟计：从第一次撞限流算起，已经等过的部分不重复计入，只补足差额。
+      const targetMs = pickWaitMs();
+      const elapsedMs = coolStart - limitedSince;
+      const cooldownMs = Math.max(0, targetMs - elapsedMs);
+      const retryNames = deferred.map((item) => item.alias).join(", ");
+      if (cooldownMs <= 0) {
+        onProgress(
+          `[${stamp(coolStart)}] 冷却已等够：自首次限流起已过 ${formatMinutes(elapsedMs)} 分钟（目标 ${formatMinutes(targetMs)} 分钟），` +
+            `直接重试 ${deferred.length} 个账号：${retryNames}`,
+        );
+      } else {
+        if (elapsedMs > 0) {
+          onProgress(
+            `[${stamp(coolStart)}] 距首次限流已过 ${formatMinutes(elapsedMs)} 分钟（目标 ${formatMinutes(targetMs)} 分钟），` +
+              `本次只补足剩余部分`,
+          );
+        }
+        onProgress(
+          `[${stamp(coolStart)}] 冷却开始：${formatMinutes(cooldownMs)} 分钟（${stamp(coolStart + cooldownMs)} 结束），` +
+            `随后重试 ${deferred.length} 个账号：${retryNames}`,
+        );
+        await sleepWithProgress(cooldownMs, sleep, onProgress);
+        waited += cooldownMs;
+        onProgress(`[${stamp(now())}] 冷却结束，开始重试 ${deferred.length} 个账号`);
+      }
       pending = deferred;
     }
 

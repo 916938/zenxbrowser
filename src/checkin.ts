@@ -600,8 +600,9 @@ async function closeInstanceAfterCheckin(
 ): Promise<{ closed: boolean; error?: string }> {
   try {
     const reply = await closeBrowser(home, run, alias, CLOSE_AFTER_TIMEOUT_MS, dependencies.closeDependencies);
-    if (reply.disconnected || reply.closed) return { closed: true };
-    return { closed: false, error: "实例仍处于连接状态；未关闭。" };
+    // 只有复核确认离线才算释放：回包里的 closed 只是"请求已响应"。
+    if (reply.outcome.instanceOffline) return { closed: true };
+    return { closed: false, error: "关闭请求已响应，但复核时实例仍在注册表；未确认释放。" };
   } catch (error) {
     const message = error instanceof ZenxError ? `${error.code}: ${error.message}` : error instanceof Error ? error.message : "关闭失败。";
     return { closed: false, error: message };

@@ -1,8 +1,8 @@
 import { ZenxError } from "./core.ts";
 import type { Runner } from "./core.ts";
 import { agentRouter } from "./sites/agentrouter.ts";
+import type { ReadableSite } from "./sites/readable.ts";
 
-const siteUrl = agentRouter.consoleUrl;
 const PAGE_SETTLE_MS = 2_000;
 const SESSION_TEXT_MAX_LENGTH = 20_000;
 
@@ -46,8 +46,7 @@ function parseEvaluate(raw: string): string {
 
 /**
  * 控制台上的"当前余额 $X"。页面没渲染出来时返回 null（不算失败）。
- * 站点界面语言随账号而异（中文"当前余额"、英文"Current balance"），
- * 两种怎么认由站点适配器决定，这里只转发。
+ * 怎么认由站点适配器决定（中英文、不同站点各自的文案），这里只转发。
  *
  * 读到 0 一律当缺失（返回 null）：窗口被遮挡/最小化/在后台时页面渲染不出余额，
  * 站点给的是 $0 这类占位读数。0 若被当成真值，下游只会看到"余额没涨"，把一次
@@ -56,8 +55,8 @@ function parseEvaluate(raw: string): string {
  * （见 db.ts 的余额观测点与 dailyTotals），这里把同一约定提到读取端，让所有
  * 消费方口径一致。适配器保留原值（parse.balance 不做去 0），它只负责"照实读"。
  */
-export function extractBalance(text: string): number | null {
-  const value = agentRouter.parse.balance(text);
+export function extractBalance(text: string, site: ReadableSite = agentRouter): number | null {
+  const value = site.parse.balance(text);
   return value !== null && value > 0 ? value : null;
 }
 
@@ -66,17 +65,16 @@ export function extractBalance(text: string): number | null {
  * 两个时点的差值才是某段时间真实花掉的钱，用它对比比用余额差更可靠：
  * 余额同时被签到发放和消耗影响，缺口法会把"没签到"误算成"花多了"。
  */
-export function extractTotalSpent(text: string): number | null {
-  return agentRouter.parse.totalSpent(text);
-}
-
-function isLoggedOut(text: string): boolean {
-  return agentRouter.classify.loggedOut(text);
+export function extractTotalSpent(text: string, site: ReadableSite = agentRouter): number | null {
+  return site.parse.totalSpent(text);
 }
 
 /**
  * 在隔离窗口里读一次控制台（只读：不退出、不重登录、不点击）。
  * 隔离窗口在返回前必定回收；失败也一样，不留窗口在桌面。
+ *
+ * `site` 决定读哪个站点：默认 AgentRouter（保持既有调用方不变），
+ * 传入其他适配器即可让 snapshot / recheck 这类只读能力支持新站点。
  */
 export async function readConsoleState(
   run: Runner,
@@ -84,6 +82,7 @@ export async function readConsoleState(
   expectedIdentity: string,
   remaining: () => number,
   sleep: (ms: number) => Promise<void>,
+  site: ReadableSite = agentRouter,
 ): Promise<ConsoleState> {
   const startReply = await run(
     ["session", "start", "--browser-id", instanceId, "--width", "1280", "--height", "800", "--json"],
@@ -95,26 +94,26 @@ export async function readConsoleState(
   }
   const sessionId = parseSessionStart(startReply.stdout);
   try {
-    const navigate = await run(["navigate", siteUrl, "--session", sessionId], {
+    const navigate = await run(["navigate", site.consoleUrl, "--session", sessionId], {
       timeoutMs: Math.min(60_000, remaining()), env: { BSK_BROWSER_WAIT_MS: "0" },
     });
     remaining();
-    if (navigate.exitCode !== 0) throw new ZenxError("SITE_TIMEOUT", "导航到 AgentRouter 控制台失败；停止，不重试。");
+    if (navigate.exitCode !== 0) throw new ZenxError("SITE_TIMEOUT", `导航到 ${site.name} 控制台失败；停止，不重试。`);
     await sleep(PAGE_SETTLE_MS);
     remaining();
-    const evaluate = await run(["evaluate", "document.body.innerText.slice(0, 4000)", "--json", "--session", sessionId], {
+    const evaluate = await run(["evaluate", `document.body.innerText.slice(0, ${site.textLimit})`, "--json", "--session", sessionId], {
       timeoutMs: Math.min(60_000, remaining()), env: { BSK_BROWSER_WAIT_MS: "0" },
     });
     remaining();
     const text = parseEvaluate(evaluate.stdout);
-    const manual = agentRouter.classify.manualIntervention(text);
+    const manual = site.classify.manualIntervention(text);
     const state: ConsoleState = {
       text,
-      login: manual ? "manual_intervention" : isLoggedOut(text) ? "logged_out" : "logged_in",
-      identityMatch: text.includes(expectedIdentity),
-      balance: extractBalance(text),
-      totalSpent: extractTotalSpent(text),
-      siteCheckedIn: agentRouter.classify.alreadyCheckedIn(text),
+      login: manual ? "manual_intervention" : site.classify.loggedOut(text) ? "logged_out" : "logged_in",
+      identityMatch: site.identityMatches(text, expectedIdentity),
+      balance: extractBalance(text, site),
+      totalSpent: extractTotalSpent(text, site),
+      siteCheckedIn: site.classify.alreadyCheckedIn(text),
     };
     return manual ? { ...state, pageFeature: manual } : state;
   } finally {

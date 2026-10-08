@@ -39,10 +39,21 @@ async function temporary(t: { after: (fn: () => Promise<void>) => void }, accoun
 
 const fast = { sleep: async () => {} };
 
+/**
+ * 取单站点结果。snapshotAccount 现在按站点返回数组（一个 Profile 可能在多个站点
+ * 各有身份），这些 fixture 账号只绑了 AgentRouter 身份，所以恒为一条。
+ */
+async function snapshotOne(...args: Parameters<typeof snapshotAccount>) {
+  const results = await snapshotAccount(...args);
+  assert.equal(results.length, 1, "只绑了 AgentRouter 身份，应当只有一条结果");
+  return results[0];
+}
+
 test("快照写入余额与站点累计消耗", async (t) => {
   const { home, dbFile } = await temporary(t);
-  const result = await snapshotAccount(home, runner({ text: LOGGED_IN }), account.alias, 45_000, { dbFile, ...fast });
+  const result = await snapshotOne(home, runner({ text: LOGGED_IN }), account.alias, 45_000, { dbFile, ...fast });
   assert.equal(result.ok, true);
+  assert.equal(result.site, "agentrouter");
   assert.equal(result.balance, 1100);
   assert.equal(result.totalSpent, 125);
   const rows = listSnapshots({ alias: account.alias }, dbFile);
@@ -57,7 +68,7 @@ test("英文界面的账号也能读出余额与累计消耗", async (t) => {
   // Real page text from an account whose site UI renders in English.
   const english = "Agent Router Home Console Docs 15 G github_16350 CONSOLE Dashboard " +
     "Account Data Current balance $1187.41 Consumption $1412.59 Usage Statistics";
-  const result = await snapshotAccount(home, runner({ text: english }), account.alias, 45_000, { dbFile, ...fast });
+  const result = await snapshotOne(home, runner({ text: english }), account.alias, 45_000, { dbFile, ...fast });
   assert.equal(result.ok, true);
   assert.equal(result.balance, 1187.41);
   assert.equal(result.totalSpent, 1412.59);
@@ -66,7 +77,7 @@ test("英文界面的账号也能读出余额与累计消耗", async (t) => {
 
 test("未登录也写快照并记失败原因", async (t) => {
   const { home, dbFile } = await temporary(t);
-  const result = await snapshotAccount(home, runner({ text: LOGGED_OUT }), account.alias, 45_000, { dbFile, ...fast });
+  const result = await snapshotOne(home, runner({ text: LOGGED_OUT }), account.alias, 45_000, { dbFile, ...fast });
   assert.equal(result.ok, false);
   assert.equal(result.errorCode, "LOGGED_OUT");
   const rows = listSnapshots({ alias: account.alias }, dbFile);
@@ -77,7 +88,7 @@ test("未登录也写快照并记失败原因", async (t) => {
 
 test("身份不符时写失败快照，不记录余额", async (t) => {
   const { home, dbFile } = await temporary(t);
-  const result = await snapshotAccount(home, runner({ text: "控制台 当前余额 $900.00 G github_99999 chevron_down" }), account.alias, 45_000, { dbFile, ...fast });
+  const result = await snapshotOne(home, runner({ text: "控制台 当前余额 $900.00 G github_99999 chevron_down" }), account.alias, 45_000, { dbFile, ...fast });
   assert.equal(result.errorCode, "IDENTITY_MISMATCH");
   assert.equal(listSnapshots({ alias: account.alias }, dbFile)[0].balance, 900);
   assert.equal(listSnapshots({ alias: account.alias }, dbFile)[0].ok, false);
@@ -86,7 +97,7 @@ test("身份不符时写失败快照，不记录余额", async (t) => {
 test("离线时不开窗口，只留失败快照", async (t) => {
   const { home, dbFile } = await temporary(t);
   const calls: string[][] = [];
-  const result = await snapshotAccount(home, runner({ browsers: [], calls }), account.alias, 45_000, { dbFile, ...fast });
+  const result = await snapshotOne(home, runner({ browsers: [], calls }), account.alias, 45_000, { dbFile, ...fast });
   assert.equal(result.connection, "offline");
   assert.equal(result.errorCode, "OFFLINE");
   assert.ok(!calls.some((args) => args[0] === "session"));
@@ -97,7 +108,7 @@ test("页面读到 $0 时视为未渲染，快照记 null 而不是 0", async (t
   const { home, dbFile } = await temporary(t);
   // 窗口被遮挡/后台时页面渲染不出余额，站点给 $0 这类占位读数。
   // 0 若被当成真值，报表会把"隐藏窗口"当成"余额归零"，制造假到账/假归零。
-  const result = await snapshotAccount(home, runner({ text: "控制台 当前余额 $0 历史消耗 $0 G github_16350 chevron_down" }), account.alias, 45_000, { dbFile, ...fast });
+  const result = await snapshotOne(home, runner({ text: "控制台 当前余额 $0 历史消耗 $0 G github_16350 chevron_down" }), account.alias, 45_000, { dbFile, ...fast });
   assert.equal(result.balance, null, "0 不是可用的余额读数");
   assert.equal(result.totalSpent, 0, "消耗 0 是合法读数，站点确实没有消耗");
   assert.equal(listSnapshots({ alias: account.alias }, dbFile)[0].balance, null);
@@ -294,7 +305,12 @@ test("CLI：snapshot 单账号与 --all", async (t) => {
   const { home, dbFile } = await temporary(t);
   const lines: string[] = [];
   assert.equal(await main(["accounts", "snapshot", account.alias, "--json"], { home, run: runner({ text: LOGGED_IN }), snapshotDbFile: dbFile, output: (line) => lines.push(line) }), 0);
-  assert.equal(JSON.parse(lines[0]).balance, 1100);
+  // 单账号报告按站点分条：只绑了 AgentRouter，所以恰好一条。
+  const single = JSON.parse(lines[0]);
+  assert.equal(single.ok, true);
+  assert.equal(single.total, 1);
+  assert.equal(single.results[0].site, "agentrouter");
+  assert.equal(single.results[0].balance, 1100);
 
   const all: string[] = [];
   assert.equal(await main(["accounts", "snapshot", "--all", "--json"], { home, run: runner({ text: LOGGED_IN }), snapshotDbFile: dbFile, output: (line) => all.push(line) }), 0);

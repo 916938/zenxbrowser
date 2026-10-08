@@ -38,6 +38,18 @@ export type LaunchDependencies = {
  */
 export const MIN_FREE_MEMORY_BYTES = 1024 ** 3;
 
+/**
+ * 关闭后的**只读复核**预算与节奏。
+ *
+ * 关窗请求被响应 ≠ 窗口已关 ≠ 实例已离线：扩展在最后一个窗口真正关闭前就回包，
+ * 而进程退出还要几秒。所以只认回包会把"正在退出"误判成"没关掉"（或反过来把
+ * 请求当成功）。复核必须**有上限**：轮询次数与总时长都封顶，读不到在线列表时
+ * 一律按"未确认"处理，绝不因为查不到就宣称已释放。
+ */
+export const CLOSE_VERIFY_BUDGET_MS = 8_000;
+const CLOSE_VERIFY_POLL_MS = 500;
+const CLOSE_VERIFY_MAX_ATTEMPTS = 20;
+
 export function findAccount(store: Store, alias: string): Account {
   const account = store.accounts.find((item) => item.alias === alias);
   if (!account) throw new ZenxError("ACCOUNT_NOT_FOUND", "账号别名尚未绑定；请先核对并绑定精确实例 ID。");
@@ -288,7 +300,7 @@ export async function closeBrowser(
   const account = findAccount(store, alias);
   let result: CloseReply;
   try {
-    result = await closeOnlineInstance(run, account.instanceId, remaining, account.alias);
+    result = await closeOnlineInstance(run, account.instanceId, remaining, dependencies, account.alias);
   } catch (error) {
     // 失败也要如实回写追踪：离线 = 无可关，记录清除；其他失败 = 留下原因，close-leftover 还会再试。
     if (error instanceof ZenxError && error.code === "INSTANCE_OFFLINE") {
@@ -299,21 +311,83 @@ export async function closeBrowser(
     }
     throw error;
   }
-  // 关闭确认后顺带清掉遗留追踪（若这个实例是 zenx 之前拉起的）。
-  await clearLaunchedInstance(home, account.alias, account.instanceId);
+  if (result.outcome.instanceOffline) {
+    // 只有确认离线才算收尾：清掉遗留追踪（若这个实例是 zenx 之前拉起的）。
+    await clearLaunchedInstance(home, account.alias, account.instanceId);
+  } else {
+    // 请求已响应但没确认离线：不能当成功，留原因给 close-leftover 再试。
+    await markLeftoverCloseError(home, account.alias, account.instanceId, "CLOSE_UNCONFIRMED: 关闭请求已响应，但复核时实例仍在注册表。");
+  }
   return { ok: true, alias: account.alias, instanceId: account.instanceId, ...result, identity: "not_verified" };
 }
 
-type CloseReply = {
+/**
+ * 关闭后的三态结论。三者不可互相替代，只有第三态能支撑"资源已释放"的说法。
+ */
+export type CloseOutcome = {
+  /** ① 关窗请求已被响应（bsk 成功返回）。只说明请求被接受，不说明窗口已关。 */
+  requestAcked: boolean;
+  /**
+   * ② 扩展自报关闭的窗口数；`null` 表示未知。
+   *
+   * 断连路径下 daemon 会把计数归零并标注 disconnected（确实少报）。即便有数字
+   * 也不是证据：最后一个窗口是回包之后才关的，且关失败会被静默忽略。
+   */
+  windowsClosedReported: number | null;
+  /** ③ 实例确实离线：关闭后由本命令只读复核确认（有上限轮询）。 */
+  instanceOffline: boolean;
+};
+
+export type CloseReply = {
   browser_id: string;
   closed: boolean;
   windows_closed: number;
   sessions_stopped: number;
   disconnected: boolean;
+  outcome: CloseOutcome;
 };
 
+/**
+ * 关闭后复核"实例是否已离开注册表"，只读且有上限。
+ *
+ * 只在**确实看到它不在列表里**时返回 true；列表读不出来、或预算/次数用尽时
+ * 都返回 false——查不到不等于已关掉。
+ */
+async function verifyInstanceOffline(
+  run: Runner,
+  instanceId: string,
+  dependencies: LaunchDependencies,
+  budgetMs: number,
+): Promise<boolean> {
+  const sleep = dependencies.sleep ?? delay;
+  const now = dependencies.now ?? (() => performance.now());
+  const deadline = now() + Math.max(0, Math.min(budgetMs, CLOSE_VERIFY_BUDGET_MS));
+  for (let attempt = 0; attempt < CLOSE_VERIFY_MAX_ATTEMPTS; attempt += 1) {
+    let online: Browser[];
+    try {
+      online = await listBrowsers(run, {
+        timeoutMs: Math.min(60_000, Math.max(1000, Math.floor(deadline - now()))),
+        env: { BSK_BROWSER_WAIT_MS: "0" },
+      });
+    } catch {
+      return false;
+    }
+    if (!online.some((item) => item.instance_id === instanceId)) return true;
+    const left = Math.floor(deadline - now());
+    if (left <= 0) break;
+    await sleep(Math.min(CLOSE_VERIFY_POLL_MS, left));
+  }
+  return false;
+}
+
 /** closeBrowser 与 closeInstanceById 共用的关闭体：在线与兼容性检查 + 一次 close 调用。 */
-async function closeOnlineInstance(run: Runner, instanceId: string, remaining: () => number, alias?: string): Promise<CloseReply> {
+async function closeOnlineInstance(
+  run: Runner,
+  instanceId: string,
+  remaining: () => number,
+  dependencies: LaunchDependencies = {},
+  alias?: string,
+): Promise<CloseReply> {
   const browsers = await listBrowsers(run, {
     timeoutMs: Math.min(60_000, remaining()),
     env: { BSK_BROWSER_WAIT_MS: "0" },
@@ -342,7 +416,21 @@ async function closeOnlineInstance(run: Runner, instanceId: string, remaining: (
     }
     throw new ZenxError("BSK_FAILED", "bsk 未能确认浏览器已关闭；关闭可能已生效，不会自动重试，请用 zenx accounts check 核对。", detail ? { detail } : undefined);
   }
-  return parseCloseReply(reply.stdout, instanceId);
+  const parsed = parseCloseReply(reply.stdout, instanceId);
+  // 复核预算：优先用剩余时间，但不能超过封顶值；预算已耗尽就直接记为未确认。
+  let budget = 0;
+  try { budget = remaining(); } catch { budget = 0; }
+  const verified = budget > 0 ? await verifyInstanceOffline(run, instanceId, dependencies, budget) : false;
+  return {
+    ...parsed,
+    outcome: {
+      requestAcked: true,
+      // 断连路径的计数不可信（daemon 归零），标成未知而不是 0。
+      windowsClosedReported: parsed.disconnected ? null : parsed.windows_closed,
+      // disconnected 是 daemon 侧"已确认离开注册表"的兜底，等同于复核通过。
+      instanceOffline: verified || parsed.disconnected,
+    },
+  };
 }
 
 /**
@@ -357,14 +445,15 @@ export async function closeInstanceById(
   dependencies: LaunchDependencies = {},
 ): Promise<CloseReply & { ok: true }> {
   const remaining = deadlineBudget(timeoutMs, dependencies);
-  const result = await closeOnlineInstance(run, instanceId, remaining);
+  const result = await closeOnlineInstance(run, instanceId, remaining, dependencies);
   return { ok: true, ...result };
 }
 
 export type CloseAllOutcome = {
   alias: string;
   instanceId: string;
-  status: "closed" | "offline" | "failed";
+  /** `unconfirmed` = 关闭请求已响应，但复核时实例仍在注册表。 */
+  status: "closed" | "offline" | "failed" | "unconfirmed";
   windowsClosed?: number;
   sessionsStopped?: number;
   code?: string;
@@ -390,12 +479,12 @@ export async function closeAllBrowsers(
   for (const account of store.accounts) {
     try {
       const reply = await closeBrowser(home, run, account.alias, timeoutMs, dependencies);
-      if (reply.disconnected) {
+      if (reply.outcome.instanceOffline) {
         accounts.push({ alias: account.alias, instanceId: account.instanceId, status: "closed", windowsClosed: reply.windows_closed, sessionsStopped: reply.sessions_stopped });
-        onProgress(`${account.alias}: 已关闭（窗口 ${reply.windows_closed}，会话 ${reply.sessions_stopped}）`);
+        onProgress(`${account.alias}: 已关闭并复核离线（窗口 ${reply.windows_closed}，会话 ${reply.sessions_stopped}）`);
       } else {
-        accounts.push({ alias: account.alias, instanceId: account.instanceId, status: "failed", code: "STILL_CONNECTED", message: "实例仍处于连接状态；未关闭。" });
-        onProgress(`${account.alias}: 关闭未确认（实例仍在线）`);
+        accounts.push({ alias: account.alias, instanceId: account.instanceId, status: "unconfirmed", code: "CLOSE_UNCONFIRMED", message: "关闭请求已响应，但复核时实例仍在注册表；未确认释放。" });
+        onProgress(`${account.alias}: 关闭未确认（复核时仍在线）`);
       }
     } catch (error) {
       // 离线/失败的追踪回写已在 closeBrowser 内完成，这里只汇总。
@@ -413,7 +502,9 @@ export async function closeAllBrowsers(
   const closed = accounts.filter((item) => item.status === "closed").length;
   const offline = accounts.filter((item) => item.status === "offline").length;
   const failed = accounts.filter((item) => item.status === "failed").length;
-  return { ok: failed === 0, total: accounts.length, closed, offline, failed, accounts };
+  // 请求已响应但没确认离线的，既不是成功也不是失败：单独计数，且不能报 ok。
+  const unconfirmed = accounts.filter((item) => item.status === "unconfirmed").length;
+  return { ok: failed === 0 && unconfirmed === 0, total: accounts.length, closed, offline, failed, unconfirmed, accounts };
 }
 
 export type LeftoverOutcome = {
@@ -453,14 +544,15 @@ export async function closeLeftoverInstances(
     }
     try {
       const reply = await closeInstanceById(run, entry.instanceId, timeoutMs, dependencies);
-      if (reply.disconnected) {
+      if (reply.outcome.instanceOffline) {
         await clearLaunchedInstance(home, entry.alias, entry.instanceId);
         instances.push({ alias: entry.alias, instanceId: entry.instanceId, status: "closed" });
         onProgress(`${entry.alias}: 遗留实例已关闭（窗口 ${reply.windows_closed}，会话 ${reply.sessions_stopped}）`);
       } else {
-        await markLeftoverCloseError(home, entry.alias, entry.instanceId, "实例仍处于连接状态；未关闭。");
-        instances.push({ alias: entry.alias, instanceId: entry.instanceId, status: "failed", code: "STILL_CONNECTED", message: "实例仍处于连接状态；未关闭。" });
-        onProgress(`${entry.alias}: 遗留实例关闭未确认（仍在线）`);
+        const message = "关闭请求已响应，但复核时实例仍在注册表；未确认释放。";
+        await markLeftoverCloseError(home, entry.alias, entry.instanceId, `CLOSE_UNCONFIRMED: ${message}`);
+        instances.push({ alias: entry.alias, instanceId: entry.instanceId, status: "failed", code: "CLOSE_UNCONFIRMED", message });
+        onProgress(`${entry.alias}: 遗留实例关闭未确认（复核时仍在线）`);
       }
     } catch (error) {
       if (error instanceof ZenxError && error.code === "INSTANCE_OFFLINE") {
