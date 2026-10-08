@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { runInNewContext } from "node:vm";
 import { checkinAccount, labelOfRef } from "../src/checkin.ts";
-import { DEFAULT_DB_FILE, insertCheckin, listCheckins } from "../src/db.ts";
+import { DEFAULT_DB_FILE, insertCheckin, listCheckins, listSnapshots } from "../src/db.ts";
 import { main } from "../src/cli.ts";
 import type { Account, Browser, Runner, RunnerOptions, Result } from "../src/core.ts";
 import type { CheckinDependencies } from "../src/checkin.ts";
@@ -1490,6 +1490,50 @@ test("checkin 今日额度已在本次运行前发放 → 确认到账，不再�
   assert.equal(creditedRows[0].errorCode, null);
 });
 
+// 回归（2026-10-07 edge-9 实况）：当天发放 25、当天消耗 14.68，净增只剩 10.32。
+// 旧判据要求净增 ≥ 25（等于要求当天零消耗），10.32 永远够不到 —— 同一天连跑 4 次
+// 全部 CHECKIN_UNCONFIRMED，账本无到账记录、pending 清不掉，还白耗 4 次登录配额。
+// 基线是"今天开始前"，净增为正就说明今天发过钱：余额只有发放（+）与消耗（−）
+// 两个来源，消耗只会让余额变小。
+test("checkin 净增被当天消耗吃掉、不足每日额度 → 仍确认到账（edge-9 实况）", async (t) => {
+  const home = await fixture(t);
+  const d = deps();
+  seedBaseline(d.dbFile, 1732.71);           // 今天开始前的余额
+  const script = scriptRunner({ observes: [reply(observeDashboard("$1743.03"))] });
+  const report = await checkinAccount(home, script.run, "work", 180_000, d);
+  assert.equal(report.ok, true, "钱在账上，不该报失败");
+  assert.equal(report.checkinCredited, true, "净增 10.32 > 0，今天发过钱");
+  assert.equal((report as { code?: string }).code, undefined, "不得再报 CHECKIN_UNCONFIRMED");
+  assert.equal(report.balanceBefore, 1732.71);
+  assert.equal(report.balanceAfter, 1743.03, "如实记录余额，不粉饰");
+  assert.ok(!script.calls.some((args) => args[0] === "hover"), "已到账就不该再退出重登");
+  assert.ok(!script.calls.some((args) => args[0] === "click"), "不得点击退出");
+  assertStopped(script);
+});
+
+// 放宽后的护栏：不为正就不能放行。放宽的是"要满 25"，不是"有没有涨"。
+test("checkin 净增为 0 → 不走该判定，照常退出重登（不制造假到账）", async (t) => {
+  const home = await fixture(t);
+  const d = deps();
+  seedBaseline(d.dbFile, 1732.71);
+  const script = scriptRunner({ observes: [reply(observeDashboard("$1732.71")), reply(observeMenuOpen), reply(observeLoggedOut), reply(observeLanding), reply(observeDashboard("$1732.71"))] });
+  const report = await checkinAccount(home, script.run, "work", 180_000, d);
+  assert.ok(script.calls.some((args) => args[0] === "hover"), "余额没涨就该照常走完整流程");
+  assert.equal((report as { code?: string }).code, "CHECKIN_UNCONFIRMED", "没涨就不能算到账");
+  assertStopped(script);
+});
+
+test("checkin 余额低于基线（净增为负）→ 不走该判定，照常退出重登", async (t) => {
+  const home = await fixture(t);
+  const d = deps();
+  seedBaseline(d.dbFile, 1732.71);
+  const script = scriptRunner({ observes: [reply(observeDashboard("$1700.00")), reply(observeMenuOpen), reply(observeLoggedOut), reply(observeLanding), reply(observeDashboard("$1700.00"))] });
+  const report = await checkinAccount(home, script.run, "work", 180_000, d);
+  assert.ok(script.calls.some((args) => args[0] === "hover"), "净增为负只可能是消耗，必须照常签到");
+  assert.equal((report as { code?: string }).code, "CHECKIN_UNCONFIRMED");
+  assertStopped(script);
+});
+
 test("checkin 余额与基线持平 → 不走该判定，照常退出重登（不漏跑）", async (t) => {
   const home = await fixture(t);
   const d = deps();
@@ -1589,4 +1633,143 @@ test("checkin 读不到历史消耗时退化为裸余额差（宁可漏判，不
   assert.equal(report.checkinCredited, false, "缺一端消耗读数就不能加 Δ消耗，否则是凭空造账");
   assert.equal((report as { code?: string }).code, "CHECKIN_UNCONFIRMED");
   assertStopped(script);
+});
+
+// ---------------------------------------------------------------------------
+// 自动快照
+//
+// 每日快照是到账判定的前置依赖（Δ消耗基准来自 balance_snapshots 的配对观测点，
+// 且只有 48 小时保鲜期）。原先它靠日常脚本在整轮签到**之后**单独跑一遍，
+// 但那时 --close-after 已经把各个 Profile 关掉了，于是只能采到 OFFLINE
+// （实测 2026-10-02 / 10-04：18 和 22 条 OFFLINE），配对基准一停就是几周。
+// 现在改为在签到过程中就地采集：用的是判定到账那一次页面读取，
+// 余额与累计消耗天然同源配对，而且必定发生在关窗之前。
+// ---------------------------------------------------------------------------
+
+test("checkin 成功时就地落一笔配对快照（余额与消耗同源）", async (t) => {
+  const home = await fixture(t);
+  const d = deps();
+  const script = scriptRunner({
+    observes: [
+      reply(observeWithAnnouncement),
+      reply(observeConsole),
+      reply(observeMenuOpen),
+      reply(observeLoggedOut),
+      reply(observeLanding),
+      reply(observeWithSpent("$580.18", "$3104.82")),
+    ],
+  });
+  const report = await checkinAccount(home, script.run, "work", 180_000, d);
+  assert.equal(report.ok, true);
+  assert.equal(report.snapshot?.status, "saved");
+  const rows = listSnapshots({ alias: "work" }, d.dbFile);
+  assert.equal(rows.length, 1, "一次签到落一条快照");
+  assert.equal(rows[0].balance, 580.18);
+  assert.equal(rows[0].totalSpent, 3104.82, "消耗与余额取自同一次页面读取");
+  assert.equal(rows[0].ok, true);
+  // 同一时点：次日取基准时要求"配对快照就是最新的余额观测点"（db.lastPairedSnapshotBefore），
+  // 两条记录时间不一致的话这个配对条件永远不成立，Δ消耗会被整段丢弃。
+  assert.equal(rows[0].time, listCheckins({}, d.dbFile)[0].time, "快照与签到记录必须同一时点");
+  assertStopped(script);
+});
+
+test("checkin 的自动快照不额外开窗口（复用签到那次会话）", async (t) => {
+  const home = await fixture(t);
+  const d = deps();
+  const script = scriptRunner({
+    observes: [
+      reply(observeWithAnnouncement),
+      reply(observeConsole),
+      reply(observeMenuOpen),
+      reply(observeLoggedOut),
+      reply(observeLanding),
+      reply(observeWithSpent("$580.18", "$3104.82")),
+    ],
+  });
+  await checkinAccount(home, script.run, "work", 180_000, d);
+  const starts = script.calls.filter((args) => args[0] === "session" && args[1] === "start");
+  assert.equal(starts.length, 1, "快照不得再开一个隔离窗口；内存峰值按窗口数算");
+});
+
+// 未确认到账也要落快照：那条观测点本身是有效的（身份匹配、余额与消耗都读到了），
+// 恰恰是次日判定最需要的基准——签到失败的账号最容易缺基准。
+test("checkin 报 CHECKIN_UNCONFIRMED 时仍落有效快照", async (t) => {
+  const home = await fixture(t);
+  const d = deps();
+  const script = scriptRunner({
+    observes: [
+      reply(observeWithSpent("$1522.50", "$602.50")),
+      reply(observeMenuOpen),
+      reply(observeLoggedOut),
+      reply(observeLanding),
+      reply(observeWithSpent("$1015.79", "$1109.21")),   // 全是消耗，没有发放
+    ],
+  });
+  const report = await checkinAccount(home, script.run, "work", 180_000, d);
+  assert.equal((report as { code?: string }).code, "CHECKIN_UNCONFIRMED");
+  assert.equal(report.snapshot?.status, "saved", "判定失败不影响观测点的有效性");
+  const rows = listSnapshots({ alias: "work" }, d.dbFile);
+  assert.equal(rows[0].balance, 1015.79);
+  assert.equal(rows[0].totalSpent, 1109.21);
+  assert.equal(rows[0].ok, true);
+});
+
+// 窗口隐藏时页面渲染不出余额（站点给 $0 占位）。这条快照没有观测价值，
+// 必须记成 ok=false，否则次日会被当成可用基准，Δ消耗凭空错位。
+test("checkin 页面读不到余额时快照记为无效，不冒充可用基准", async (t) => {
+  const home = await fixture(t);
+  const d = deps();
+  const script = scriptRunner({
+    observes: [
+      reply(observeWithAnnouncement),
+      reply(observeConsole),
+      reply(observeMenuOpen),
+      reply(observeLoggedOut),
+      reply(observeLanding),
+      reply(observeDashboard("$0")),   // 余额读到 0 = 没渲染出来
+    ],
+  });
+  const lines: string[] = [];
+  const report = await checkinAccount(home, script.run, "work", 180_000, { ...d, onSnapshot: (line) => lines.push(line) });
+  assert.equal(report.snapshot?.status, "incomplete");
+  assert.equal(listSnapshots({ alias: "work" }, d.dbFile)[0].ok, false, "读不到就不能算有效观测点");
+  assert.match(lines[0] ?? "", /自动快照未落有效观测点/, "要让用户知道这天的基准没落下来");
+});
+
+// 跳过的语义是"这次什么都不做"：不开隔离窗口、不碰站点。
+// 补采要开窗口读页面，那就不再是跳过了（批量时还会推高内存峰值）。
+test("checkin 当天已到账跳过时不开窗补采，复用账本里已有的快照", async (t) => {
+  const home = await fixture(t);
+  const c = clock();
+  const now = new Date().toISOString();
+  insertCheckin({
+    time: now, alias: "work", instanceId: edge.instance_id, identity: account.expectedIdentity,
+    ok: true, balanceBefore: 555.18, balanceAfter: 580.18, credited: true, errorCode: null,
+  }, c.dbFile);
+  const { insertSnapshot } = await import("../src/db.ts");
+  insertSnapshot({
+    time: now, alias: "work", instanceId: edge.instance_id, identity: account.expectedIdentity,
+    balance: 580.18, totalSpent: 3104.82, ok: true, errorCode: null,
+  }, c.dbFile);
+  const { run, calls } = scriptRunner({ observes: happyObserves() });
+  const report = await checkinAccount(home, run, "work", 180_000, c);
+  assert.equal((report as { skipped?: string }).skipped, "already_credited_today");
+  assert.equal(report.snapshot?.status, "reused", "今天已有配对快照，直接复用");
+  assert.ok(!calls.some((args) => args[0] === "session"), "跳过不得启动 session");
+  assert.equal(listSnapshots({ alias: "work" }, c.dbFile).length, 1, "不得重复写快照");
+});
+
+test("checkin 当天已到账但缺快照时如实留空，交给收尾补采", async (t) => {
+  const home = await fixture(t);
+  const c = clock();
+  insertCheckin({
+    time: new Date().toISOString(), alias: "work", instanceId: edge.instance_id, identity: account.expectedIdentity,
+    ok: true, balanceBefore: 555.18, balanceAfter: 580.18, credited: true, errorCode: null,
+  }, c.dbFile);
+  const { run, calls } = scriptRunner({ observes: happyObserves() });
+  const report = await checkinAccount(home, run, "work", 180_000, c);
+  assert.equal((report as { skipped?: string }).skipped, "already_credited_today");
+  assert.equal(report.snapshot, undefined, "没有就是没有，不谎报已采集");
+  assert.ok(!calls.some((args) => args[0] === "session"), "仍然不得开窗口");
+  assert.equal(listSnapshots({ alias: "work" }, c.dbFile).length, 0);
 });

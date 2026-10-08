@@ -197,13 +197,19 @@ test("确认到账时补记的余额基准用配对快照，报表口径也对�
   assert.equal(today?.ok, true);
 });
 
-test("没有消耗增量时判据退化为裸余额差，不凭空加分", async (t) => {
+// 下面三条的护栏是"不臆造消耗"：spentDelta / baselineTotalSpent / creditDelta 必须如实，
+// 缺一端读数就是 0 或 null，绝不能凭空补一笔消耗把增量凑到 25。
+// verdict 不再要求凑满每日额度——基线是"今天开始前"，净增为正就说明今天发过钱，
+// 被消耗盖掉多少不改变这个结论（见 recheck.ts 的 netGain）。旧口径要求 ≥ 25 等于
+// 要求当天零消耗，正是 edge-9（2026-10-07 发放 25、消耗 14.68、净增 10.32）
+// 连跑 4 次全判 CHECKIN_UNCONFIRMED 的原因。
+test("没有消耗增量时不凭空加分，裸余额差为正即算到账", async (t) => {
   const { home, dbFile } = await temporary(t);
   snapshot(dbFile, YESTERDAY, 1100, 100);
   const result = await recheckAccount(home, runner({ text: "控制台 当前余额 $1120.00 历史消耗 $100.00 G github_16350 chevron_down" }), account.alias, 45_000, { dbFile, ...fast });
-  assert.equal(result.spentDelta, 0);
-  assert.equal(result.creditDelta, 20);
-  assert.equal(result.verdict, "not_credited", "20 < 25，确实没到账");
+  assert.equal(result.spentDelta, 0, "消耗没变就是 0，不许补");
+  assert.equal(result.creditDelta, 20, "如实报告 20，不凑成 25");
+  assert.equal(result.verdict, "credited", "净增 20 > 0，今天发过钱（其余 5 是消耗）");
 });
 
 test("站点不渲染消耗时只用余额差，不臆造消耗", async (t) => {
@@ -211,8 +217,8 @@ test("站点不渲染消耗时只用余额差，不臆造消耗", async (t) => {
   snapshot(dbFile, YESTERDAY, 1126.31, 673.69);
   const result = await recheckAccount(home, runner({ text: "控制台 当前余额 $1147.49 G github_16350 chevron_down" }), account.alias, 45_000, { dbFile, ...fast });
   assert.equal(result.spentDelta, null, "读不到消耗就不算增量");
-  assert.equal(result.creditDelta, 21.18);
-  assert.equal(result.verdict, "not_credited");
+  assert.equal(result.creditDelta, 21.18, "不加 Δ消耗，如实是 21.18");
+  assert.equal(result.verdict, "credited", "edge-8 实况：21.18 的净增就是被消耗盖过的 25");
 });
 
 test("没有快照（无消耗观测点）时退化为裸余额差，不臆造消耗", async (t) => {
@@ -222,7 +228,48 @@ test("没有快照（无消耗观测点）时退化为裸余额差，不臆造�
   assert.equal(result.spentDelta, null);
   assert.equal(result.baselineTotalSpent, null);
   assert.equal(result.creditDelta, 21.18);
+  assert.equal(result.verdict, "credited", "没有配对消耗也认净增，不因缺数据漏判真实到账");
+});
+
+// 新口径的护栏：净增不为正就绝不能判到账。放宽的是"要满 25"，不是"有没有涨"。
+test("余额与基线持平 → 未到账（净增为 0 不是发放）", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  snapshot(dbFile, YESTERDAY, 1100, 100);
+  const result = await recheckAccount(home, runner({ text: "控制台 当前余额 $1100.00 历史消耗 $100.00 G github_16350 chevron_down" }), account.alias, 45_000, { dbFile, ...fast });
+  assert.equal(result.balanceDelta, 0);
   assert.equal(result.verdict, "not_credited");
+});
+
+test("余额低于基线（只有消耗）→ 未到账，放宽判据不得放行", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  snapshot(dbFile, YESTERDAY, 1100, 100);
+  const result = await recheckAccount(home, runner({ text: "控制台 当前余额 $1080.00 历史消耗 $120.00 G github_16350 chevron_down" }), account.alias, 45_000, { dbFile, ...fast });
+  assert.equal(result.balanceDelta, -20);
+  assert.equal(result.verdict, "not_credited", "净增为负，只可能是消耗");
+});
+
+// 回归（2026-10-07 edge-9 实况）：当天发放 25、消耗 14.68，净增只剩 10.32。
+// 旧口径要求净增 ≥ 25 → verdict 判 not_credited，而钱确实在账上；
+// 账本因此没有到账记录、pending 清不掉，同一天连跑 4 次全部报 CHECKIN_UNCONFIRMED。
+test("净增远低于每日额度（被当天消耗吃掉）仍确认到账（edge-9 实况）", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  snapshot(dbFile, YESTERDAY, 1732.71, 1262.29);
+  const result = await recheckAccount(home, runner({ text: "控制台 当前余额 $1743.03 历史消耗 $1276.97 G github_16350 chevron_down" }), account.alias, 45_000, { dbFile, ...fast });
+  assert.equal(result.balanceDelta, 10.32, "裸余额差如实报告");
+  assert.equal(result.spentDelta, 14.68);
+  assert.equal(result.creditDelta, 25, "有配对消耗时还原出精确的 25");
+  assert.equal(result.verdict, "credited");
+  assert.equal(result.ok, true);
+});
+
+// 同上，但没有配对消耗可用（快照停更）：只剩 10.32 的裸差，也必须认到账。
+test("没有配对消耗、净增 10.32 低于额度时仍确认到账（edge-9 退化场景）", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  record(dbFile, { time: YESTERDAY, balanceBefore: null, balanceAfter: 1732.71, credited: false });
+  const result = await recheckAccount(home, runner({ text: "控制台 当前余额 $1743.03 G github_16350 chevron_down" }), account.alias, 45_000, { dbFile, ...fast });
+  assert.equal(result.spentDelta, null);
+  assert.equal(result.creditDelta, 10.32);
+  assert.equal(result.verdict, "credited", "净增为正即已发放，缺消耗读数不该漏判");
 });
 
 // 配对必须是"同一个观测点"：余额基准晚于消耗基准时，两者之间的那笔签到发放会被

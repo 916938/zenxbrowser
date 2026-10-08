@@ -329,3 +329,67 @@ test("CLI：--all 与别名互斥，且不接受签到参数", async (t) => {
   assert.equal(await main(["accounts", "snapshot", account.alias, "--force", "--json"], { home, run: runner(), snapshotDbFile: dbFile, output: (line) => other.push(line) }), 1);
   assert.match(other[0], /INVALID_ARGUMENT/);
 });
+
+// --missing 回答"今天还差谁"。自动快照已随签到落下（见 checkin.ts 的 finish），
+// 日常脚本靠这个只读清单补漏，而不是整轮重采——整轮重采在关窗之后只会采到 OFFLINE。
+test("CLI：snapshot --missing 只读账本，不碰 bsk 也不拉起 Edge", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  const calls: string[][] = [];
+  const lines: string[] = [];
+  const code = await main(["accounts", "snapshot", "--missing", "--json"], {
+    home, run: runner({ calls }), snapshotDbFile: dbFile, output: (line) => lines.push(line),
+  });
+  const report = JSON.parse(lines[0]);
+  assert.equal(report.ok, false, "一条快照都没有，覆盖率不达标");
+  assert.deepEqual(report.missing, [account.alias]);
+  assert.equal(report.total, 1);
+  assert.equal(report.saved, 0);
+  assert.equal(code, 1, "有缺失时退出码非 0，脚本才能据此补采");
+  assert.deepEqual(calls, [], "只读账本：一次 bsk 都不该调");
+});
+
+test("CLI：snapshot --missing 认同一时点的配对快照，已采的不再报缺", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  const { insertSnapshot } = await import("../src/db.ts");
+  const now = new Date();
+  // 签到时就地采的那种：余额与累计消耗同源，且是当天最新的余额观测点。
+  insertSnapshot({
+    time: now.toISOString(), alias: account.alias, instanceId: account.instanceId,
+    identity: account.expectedIdentity, balance: 1100, totalSpent: 125, ok: true, errorCode: null,
+  }, dbFile);
+  const lines: string[] = [];
+  const code = await main(["accounts", "snapshot", "--missing", "--json"], {
+    home, run: runner(), snapshotDbFile: dbFile, output: (line) => lines.push(line), now: () => now,
+  });
+  const report = JSON.parse(lines[0]);
+  assert.equal(report.ok, true);
+  assert.deepEqual(report.missing, []);
+  assert.equal(report.saved, 1);
+  assert.equal(code, 0);
+});
+
+// 只有余额、没有累计消耗的快照不算配对：Δ消耗基准配不上，判定会退化为裸余额差。
+test("CLI：snapshot --missing 不把缺消耗的快照当成已采集", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  const { insertSnapshot } = await import("../src/db.ts");
+  const now = new Date();
+  insertSnapshot({
+    time: now.toISOString(), alias: account.alias, instanceId: account.instanceId,
+    identity: account.expectedIdentity, balance: 1100, totalSpent: null, ok: true, errorCode: null,
+  }, dbFile);
+  const lines: string[] = [];
+  await main(["accounts", "snapshot", "--missing", "--json"], {
+    home, run: runner(), snapshotDbFile: dbFile, output: (line) => lines.push(line), now: () => now,
+  });
+  assert.deepEqual(JSON.parse(lines[0]).missing, [account.alias], "缺消耗就不是可用基准");
+});
+
+test("CLI：snapshot --missing 不接受别名，也不与 --all 同用", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  const withAlias: string[] = [];
+  assert.equal(await main(["accounts", "snapshot", "--missing", account.alias, "--json"], { home, run: runner(), snapshotDbFile: dbFile, output: (line) => withAlias.push(line) }), 1);
+  assert.match(withAlias[0], /--missing 只读账本/);
+  const withAll: string[] = [];
+  assert.equal(await main(["accounts", "snapshot", "--missing", "--all", "--json"], { home, run: runner(), snapshotDbFile: dbFile, output: (line) => withAll.push(line) }), 1);
+  assert.match(withAll[0], /不能同时使用/);
+});

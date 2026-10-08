@@ -1,7 +1,8 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { isEdge, listBrowsers, protocolSupported, readStore, withStoreLock, ZenxError } from "./core.ts";
 import type { Account, Runner } from "./core.ts";
-import { DEFAULT_DB_FILE, insertSnapshot, ledgerAliasOf } from "./db.ts";
+import { DEFAULT_DB_FILE, insertSnapshot, lastBalancePointBefore, lastPairedSnapshotBefore, ledgerAliasOf, todayRange } from "./db.ts";
+import type { SnapshotRecord } from "./db.ts";
 import { readConsoleState } from "./console.ts";
 import { findAccount } from "./launch.ts";
 import { agentRouter } from "./sites/agentrouter.ts";
@@ -43,6 +44,47 @@ export type SnapshotResult = {
   errorCode?: string;
   note?: string;
 };
+
+export type AutomaticSnapshotResult = {
+  status: "saved" | "reused" | "incomplete" | "failed";
+  time?: string;
+  errorCode?: string;
+  note?: string;
+};
+
+export function saveAutomaticSnapshot(record: SnapshotRecord, dbFile?: string): AutomaticSnapshotResult {
+  const complete = record.ok && record.balance !== null && Number.isFinite(record.balance) && record.balance > 0 &&
+    record.totalSpent !== null && Number.isFinite(record.totalSpent) && record.totalSpent >= 0;
+  const errorCode = record.errorCode ?? (complete ? null : "SNAPSHOT_INCOMPLETE");
+  try {
+    insertSnapshot({ ...record, ok: complete, errorCode }, dbFile);
+    return complete
+      ? { status: "saved", time: record.time }
+      : { status: "incomplete", time: record.time, errorCode: errorCode ?? "SNAPSHOT_INCOMPLETE", note: "未取得身份匹配的完整余额与累计消耗；未计为有效快照。" };
+  } catch {
+    return { status: "failed", errorCode: "SNAPSHOT_WRITE_FAILED", note: "自动快照写入失败；签到结果不受影响。" };
+  }
+}
+
+export function existingDailySnapshot(alias: string, at: Date, dbFile?: string): AutomaticSnapshotResult | undefined {
+  try {
+    const { start, end } = todayRange(at);
+    const latest = lastBalancePointBefore(alias, end, dbFile);
+    const paired = lastPairedSnapshotBefore(alias, end, dbFile);
+    if (paired && latest && paired.time >= start && paired.time === latest.time && paired.balance === latest.balance) {
+      return { status: "reused", time: paired.time };
+    }
+  } catch {
+    // 无法读取账本不应阻止签到，但不能声称已有有效快照。
+  }
+  return undefined;
+}
+
+export function dailySnapshotSummary(aliases: string[], at: Date, dbFile?: string) {
+  const unique = [...new Set(aliases)];
+  const missing = unique.filter((alias) => existingDailySnapshot(alias, at, dbFile) === undefined);
+  return { ok: missing.length === 0, total: unique.length, saved: unique.length - missing.length, missing };
+}
 
 function deadlineBudget(timeoutMs: number, now: () => number): () => number {
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000) {

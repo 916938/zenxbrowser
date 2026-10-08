@@ -255,14 +255,38 @@ if (0 -ne $anyrouter) {
   $failed += "anyrouter(incomplete)"
 }
 
-# Daily snapshot: record each account's balance and cumulative site spend.
-# This is what makes week/month comparison possible - a checkin only records the
-# balance at the moment of signing in, so spend between two checkins would be
-# invisible. One observation point per account per day is enough for the deltas.
-Add-Content -Path $log -Encoding UTF8 -Value "`n===== $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') daily snapshot ====="
-$snap = Invoke-Zenx @("accounts", "snapshot", "--all")
-if (0 -ne $snap) {
-  Add-Content -Path $log -Encoding UTF8 -Value "--- snapshot incomplete (some accounts offline or logged out); ok=false rows still stored"
+# Daily snapshot: now taken automatically DURING each checkin, while that account's
+# browser is still up and the console page has already been verified (same page read
+# that decides the credit, so balance and cumulative spend are a matched pair).
+# That ordering is the whole point: this script closes each profile right after its
+# checkin, so a snapshot pass at the end of the run only ever found OFFLINE profiles
+# (observed 2026-10-02 and 10-04: 18 and 22 OFFLINE rows, leaving the credit check
+# with no spend baseline for weeks).
+# What remains here is a sweep for whatever the automatic pass could not record -
+# accounts that failed before reaching the console, or were skipped as already
+# credited today. ensure-online brings them back up only if needed; the sweep is
+# read-only and never costs a login.
+Add-Content -Path $log -Encoding UTF8 -Value "`n===== $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') daily snapshot sweep ====="
+$missing = @()
+try {
+  $snapOut = & node $cli accounts snapshot --missing --json 2>&1 | Out-String
+  Add-Content -Path $log -Encoding UTF8 -Value $snapOut
+  $snapReport = $snapOut | ConvertFrom-Json
+  if ($null -ne $snapReport.missing) { $missing = @($snapReport.missing) }
+  if ($missing.Count -eq 0) {
+    Add-Content -Path $log -Encoding UTF8 -Value "--- every account already has a paired snapshot today (taken during checkin)"
+  }
+} catch {
+  Add-Content -Path $log -Encoding UTF8 -Value "--- snapshot sweep unavailable: $($_.Exception.Message)"
+}
+foreach ($alias in $missing) {
+  if (0 -ne (Invoke-Zenx @("accounts", "ensure-online", $alias))) {
+    Add-Content -Path $log -Encoding UTF8 -Value "--- ${alias}: offline, cannot sweep snapshot"
+    continue
+  }
+  if (0 -ne (Invoke-Zenx @("accounts", "snapshot", $alias))) {
+    Add-Content -Path $log -Encoding UTF8 -Value "--- ${alias}: snapshot sweep incomplete (ok=false row still stored)"
+  }
 }
 
 # Always leave a clean desktop, even when a checkin failed part-way through.

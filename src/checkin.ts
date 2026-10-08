@@ -7,12 +7,20 @@ import { extractBalance as consoleExtractBalance, extractTotalSpent as consoleEx
 import { closeBrowser, findAccount } from "./launch.ts";
 import type { LaunchDependencies } from "./launch.ts";
 import { agentRouter } from "./sites/agentrouter.ts";
+import { existingDailySnapshot, saveAutomaticSnapshot } from "./snapshot.ts";
+import type { AutomaticSnapshotResult } from "./snapshot.ts";
 
 export type CheckinDependencies = {
   now?: () => number;
+  wallNow?: () => Date;
   sleep?: (ms: number) => Promise<void>;
   /** 用于报告清理阶段的问题（不覆盖签到主结果）。 */
   report?: (error: ZenxError) => void;
+  /**
+   * 自动快照的提示通道。刻意与 report 分开：report 专指"隔离窗口可能残留"
+   * 这类需要人工关窗的清理问题，把快照提示混进去会让调用方分不清该做什么。
+   */
+  onSnapshot?: (line: string) => void;
   /** 签到数据库；默认项目根 zenxbrowser/checkin.db。 */
   dbFile?: string;
   /** 忽略"今天已到账"的短路判断，强制执行一次退出重登（人工重试用）。 */
@@ -46,8 +54,12 @@ const MENU_OPEN_BUDGET_MS = 5_000;
  */
 const NAVIGATE_ATTEMPTS = 3;
 const NAVIGATE_RETRY_MS = 2_000;
-/** 站点每日签到发放的额度：登出态自救后用它判断"本次登录是否已发放"（与 recheck 同源）。 */
-const DAILY_CREDIT = 25;
+/**
+ * 站点每日签到发放的额度：登出态自救后用它判断"本次登录是否已发放"（与 recheck 同源）。
+ * 站点每天只在登录时发这一笔、金额固定，因此"相对今天开始前的正净增"只能来自它
+ * （见 hasCreditSince）——判据不要求净增达到这个数，那等于要求当天零消耗。
+ */
+const DAILY_CREDIT = agentRouter.dailyCredit;
 /**
  * 配对消耗基准的最大年龄（与 recheck.ts 的 MAX_BASELINE_AGE_MS 同源同值）。
  *
@@ -439,13 +451,13 @@ function deadlineBudget(timeoutMs: number, deps: CheckinDependencies): () => num
  */
 async function recordCheckin(
   account: Account,
-  result: { ok: boolean; balanceBefore: number | null; balanceAfter: number | null; checkinCredited: boolean; code?: string } | null,
+  result: CheckinResult | null,
   error: unknown,
   dbFile?: string,
 ): Promise<void> {
   try {
     insertCheckin({
-      time: new Date().toISOString(),
+      time: result?.observedAt ?? new Date().toISOString(),
       alias: account.alias,
       instanceId: account.instanceId,
       identity: account.expectedIdentity,
@@ -469,6 +481,9 @@ export type CheckinResult = {
   identity: string;
   balanceBefore: number | null;
   balanceAfter: number | null;
+  totalSpent?: number | null;
+  observedAt?: string;
+  snapshot?: AutomaticSnapshotResult;
   checkinCredited: boolean;
   /** 流程跑完但未确认到账（余额未增长且无提示）。 */
   code?: string;
@@ -489,6 +504,7 @@ export async function checkinAccount(
 ) {
   const remaining = deadlineBudget(timeoutMs, dependencies);
   const sleep = dependencies.sleep ?? delay;
+  const wallNow = dependencies.wallNow ?? (() => new Date());
   return withStoreLock(home, async () => {
     const store = await readStore(home);
     const account = findAccount(store, alias);
@@ -512,11 +528,16 @@ export async function checkinAccount(
     // （约 10 次连续登录就会触发站点限流），且拿不到钱。判据用账本里"今天已确认到账"的
     // 记录：credited 现在只在余额真实增长时才置位，可信。--force 用于人工重跑。
     if (dependencies.force !== true) {
-      const { start, end } = todayUtcRange(new Date());
+      const { start, end } = todayUtcRange(wallNow());
       let creditedToday = false;
       try { creditedToday = hasCreditedBetween(account.alias, start, end, dependencies.dbFile); }
       catch { creditedToday = false; }  // 账本读不了就照常签到，宁可多跑也不漏跑
       if (creditedToday) {
+        // 跳过的语义是"这次什么都不做"：不开隔离窗口、不碰站点。
+        // 因此这里只复用账本里今天已有的配对快照，缺了也不在这条路径上补采——
+        // 补采要开窗口读页面，那就不再是"跳过"了（会多开一个 Edge 窗口，
+        // 批量时还会推高内存峰值）。缺失由批量收尾的覆盖率汇总统一报出来。
+        const existing = existingDailySnapshot(account.alias, wallNow(), dependencies.dbFile);
         return {
           ok: true,
           alias: account.alias,
@@ -526,6 +547,7 @@ export async function checkinAccount(
           balanceAfter: null,
           checkinCredited: true,
           skipped: "already_credited_today" as const,
+          ...(existing ? { snapshot: existing } : {}),
         };
       }
     }
@@ -558,8 +580,11 @@ export async function checkinAccount(
     try {
       result = await runCheckinSteps(
         run, sessionId, account, remaining, sleep,
-        dependencies.now ?? (() => performance.now()), dependencies.force === true, dependencies.dbFile,
+        dependencies.now ?? (() => performance.now()), dependencies.force === true, dependencies.dbFile, wallNow,
       );
+      if (result.snapshot?.errorCode) {
+        dependencies.onSnapshot?.(`${account.alias}: 自动快照未落有效观测点（${result.snapshot.errorCode}）——${result.snapshot.note}`);
+      }
       // 跳过不入账：它不构成一次签到，记进账本只会虚增打卡次数与成功率。
       if (result.skipped === undefined) await recordCheckin(account, result, null, dependencies.dbFile);
     } catch (error) {
@@ -619,7 +644,21 @@ async function runCheckinSteps(
   force: boolean,
   /** 账本路径：登出态自救时用它取"今天开始前"的余额基准。 */
   dbFile?: string,
+  wallNow: () => Date = () => new Date(),
 ): Promise<CheckinResult> {
+  const finish = (result: CheckinResult, observedPage: SessionPage): CheckinResult => {
+    const observedAt = wallNow().toISOString();
+    const totalSpent = extractTotalSpent(observedPage);
+    const identityMatch = agentRouter.identityMatches(observedPage.text, account.expectedIdentity) && !isLoggedOut(observedPage);
+    const snapshot = saveAutomaticSnapshot({
+      time: observedAt, alias: account.alias, instanceId: account.instanceId, identity: account.expectedIdentity,
+      balance: identityMatch ? extractBalance(observedPage) : null,
+      totalSpent: identityMatch ? totalSpent : null, ok: identityMatch,
+      errorCode: identityMatch ? null : "IDENTITY_MISMATCH",
+    }, dbFile);
+    return { ...result, totalSpent, observedAt, snapshot };
+  };
+
   // 用户菜单按钮形如 `@e11 button "G github_16350 chevron_down [has-submenu]"`。
   // 首字母是登录来源标识（G=GitHub、L=LinuxDO 等），同一个站点账号可能通过多种方式登录，
   // 因此不固定前缀，只要求单个非空白字符后紧跟身份。
@@ -776,10 +815,11 @@ async function runCheckinSteps(
    */
   const readBaseline = (): { balance: number | null; totalSpent: number | null } => {
     try {
-      const { start } = todayUtcRange(new Date());
+      const at = wallNow();
+      const { start } = todayUtcRange(at);
       const latest = lastBalancePointBefore(account.alias, start, dbFile);
       const paired = lastPairedSnapshotBefore(account.alias, start, dbFile);
-      const fresh = paired !== null && Date.now() - Date.parse(paired.time) <= MAX_BASELINE_AGE_MS;
+      const fresh = paired !== null && at.getTime() - Date.parse(paired.time) <= MAX_BASELINE_AGE_MS;
       const usable = paired !== null && fresh && latest !== null && paired.time === latest.time;
       return { balance: latest?.balance ?? null, totalSpent: usable ? paired.totalSpent : null };
     } catch {
@@ -807,6 +847,21 @@ async function runCheckinSteps(
       : 0;
     return Math.round((balance - baseline.balance + spentDelta) * 100) / 100;
   };
+
+  /**
+   * 相对"今天开始前"的基线有没有拿到当日额度。
+   *
+   * 判据是**净增 > 0**，不是"净增 ≥ 每日额度"。基线取的是今天开始前，区间内余额
+   * 只有两个来源：发放（+）与消耗（−），而消耗只能减不能增。所以净增为正就说明
+   * 今天发过钱，金额被消耗盖掉了多少并不影响这个结论。
+   * 反过来，要求净增满 DAILY_CREDIT 等于要求"当天一分钱都没花"——实测 edge-9
+   * （2026-10-07）：发放 25、当天消耗 14.68、净增只剩 10.32，够不到 25，
+   * 同一天连跑 4 次全部报 CHECKIN_UNCONFIRMED，pending 一直清不掉。
+   * 误判上限仍是"当天有人手动充过值"，与 recheck 的口径一致。
+   */
+  const hasCreditSince = (baselineBalance: number | null, balance: number | null): boolean =>
+    baselineBalance !== null && balance !== null &&
+    Math.round((balance - baselineBalance) * 100) / 100 > 0;
 
   let page = await preparePage(clickTarget);
 
@@ -840,16 +895,19 @@ async function runCheckinSteps(
   const balanceBefore = restoredByLogin ? baselineBalance : extractBalance(page);
   const totalSpentBefore = restoredByLogin ? baseline.totalSpent : extractTotalSpent(page);
 
-  // ⑤d 今日额度在本次运行之前就已发放（到账增量相对"今天开始前"的基线 ≥ 每日额度）
-  // → 收工：不退出重登，也不判 CHECKIN_UNCONFIRMED。
+  // ⑤d 今日额度在本次运行之前就已发放 → 收工：不退出重登，也不判 CHECKIN_UNCONFIRMED。
   // 站点是"登录即发放"：当天早些时候任何一次登录（哪怕是半途失败的 LOGIN_TIMEOUT /
   // LOGOUT_FAILED）都会把额度发掉。等 zenx 再跑"退出→重登"，重登不会二次发放，本次
   // 运行内余额必然纹丝不动——只认"本次运行期间增长"的话，这类账号会永远
   // CHECKIN_UNCONFIRMED、pending 永远清不掉，还要白白再耗一次站点登录配额
-  // （连续约 10 次就触发共享限流）。判据与 recheck 一致，误判上限是"当天有人充过值"。
-  if (force !== true && !restoredByLogin &&
-      (creditDeltaFrom(baseline, balanceBefore, extractTotalSpent(page)) ?? -1) >= DAILY_CREDIT) {
-    return {
+  // （连续约 10 次就触发共享限流）。
+  // 判据是"相对今天开始前的基线有正的净增"，不是"净增 ≥ 每日额度"：
+  // 余额只有发放（+）和消耗（−）两个来源，基线是今天开始前，所以任何正净增都只能
+  // 来自今天那笔发放——要求净增满 25 等于要求当天零消耗。实测 edge-9（2026-10-07）：
+  // 发放 25、当天消耗 14.68、净增只剩 10.32，够不到 25 就连跑 4 次全判
+  // CHECKIN_UNCONFIRMED。误判上限仍是"当天有人手动充过值"，与 recheck 同源。
+  if (force !== true && !restoredByLogin && hasCreditSince(baseline.balance, balanceBefore)) {
+    return finish({
       ok: true,
       alias: account.alias,
       instanceId: account.instanceId,
@@ -857,7 +915,7 @@ async function runCheckinSteps(
       balanceBefore: baselineBalance,
       balanceAfter: balanceBefore,
       checkinCredited: true,
-    };
+    }, page);
   }
 
   // ⑤b 站点自己显示"今日已签到" → 不必再退出重登，直接跳过（--force 可强制）。
@@ -865,7 +923,7 @@ async function runCheckinSteps(
     // 登出态自救走到这里：站点显示已签到，说明本次登录已发放——是一次真实签到，
     // 不是"跳过"（跳过的语义是这次什么都没做，不该入账）。
     if (restoredByLogin) {
-      return {
+      return finish({
         ok: true,
         alias: account.alias,
         instanceId: account.instanceId,
@@ -873,9 +931,9 @@ async function runCheckinSteps(
         balanceBefore,
         balanceAfter: extractBalance(page),
         checkinCredited: true,
-      };
+      }, page);
     }
-    return {
+    return finish({
       ok: true,
       alias: account.alias,
       instanceId: account.instanceId,
@@ -884,15 +942,16 @@ async function runCheckinSteps(
       balanceAfter: balanceBefore,
       checkinCredited: true,
       skipped: "already_checked_in" as const,
-    };
+    }, page);
   }
 
-  // ⑤c 登出态自救已能确认额度到账（到账增量相对"今天开始前"≥ 每日额度）→ 收工。
+  // ⑤c 登出态自救已能确认额度到账（余额相对"今天开始前"有正净增）→ 收工。
+  // 判据与 ⑤d 同源（净增 > 0 即可，不要求满 DAILY_CREDIT），理由见 hasCreditSince。
   // 不再走退出重登：那会多消耗一次站点登录配额（约 10 次连续登录就触发限流）。
   if (restoredByLogin) {
     const afterRestore = extractBalance(page);
-    if ((creditDeltaFrom(baseline, afterRestore, extractTotalSpent(page)) ?? -1) >= DAILY_CREDIT) {
-      return {
+    if (hasCreditSince(baseline.balance, afterRestore)) {
+      return finish({
         ok: true,
         alias: account.alias,
         instanceId: account.instanceId,
@@ -900,7 +959,7 @@ async function runCheckinSteps(
         balanceBefore: baselineBalance,
         balanceAfter: afterRestore,
         checkinCredited: true,
-      };
+      }, page);
     }
   }
 
@@ -987,7 +1046,7 @@ async function runCheckinSteps(
   );
   const checkinCredited = creditDelta !== null ? creditDelta > 0 : hasCheckinSuccess;
   if (!checkinCredited) {
-    return {
+    return finish({
       ok: false,
       alias: account.alias,
       instanceId: account.instanceId,
@@ -996,9 +1055,9 @@ async function runCheckinSteps(
       balanceAfter,
       checkinCredited: false,
       code: "CHECKIN_UNCONFIRMED",
-    };
+    }, page);
   }
-  return {
+  return finish({
     ok: true,
     alias: account.alias,
     instanceId: account.instanceId,
@@ -1006,5 +1065,5 @@ async function runCheckinSteps(
     balanceBefore,
     balanceAfter,
     checkinCredited: true,
-  };
+  }, page);
 }

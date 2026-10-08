@@ -5,6 +5,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { readStore, ZenxError } from "./core.ts";
 import type { Account, Runner } from "./core.ts";
 import { creditedTodayAliases } from "./db.ts";
+import { dailySnapshotSummary } from "./snapshot.ts";
+import type { AutomaticSnapshotResult } from "./snapshot.ts";
 import type { LaunchDependencies } from "./launch.ts";
 import { checkinAccount } from "./checkin.ts";
 import type { CheckinResult } from "./checkin.ts";
@@ -69,6 +71,8 @@ export type AccountOutcome = {
   /** 签到成功后是否已关闭该实例释放内存（未开 --close-after 时为 false）。 */
   closed: boolean;
   closureError?: string;
+  /** 本次自动快照的结果（saved/reused/incomplete/failed）；未采集时为 undefined。 */
+  snapshot?: AutomaticSnapshotResult;
   /**
    * 该账号的 Edge 是否由本轮（含前面的轮次）拉起、且尚未关闭。
    * false 表示它本来就在跑（用户自己的）——只关自己拉起的实例是硬约束。
@@ -94,6 +98,12 @@ export type CheckinBatchReport = {
   skippedAlreadyCredited: number;
   accounts: AccountOutcome[];
   stateFile: string;
+  /**
+   * 当日快照覆盖率：每个处理过的账号今天是否已有**配对**观测点（余额 + 累计消耗）。
+   * 到账判定依赖它（见 recheck 的 Δ消耗基准），所以覆盖不全必须显式报出来，
+   * 而不是等第二天判定静默退化成裸余额差。
+   */
+  snapshots: { ok: boolean; total: number; saved: number; missing: string[] };
   /** 开跑前的遗留实例清理汇总（仅 --close-leftover 时存在）。 */
   leftoverCleanup?: { tracked: number; closed: number; dropped: number; failed: number };
 };
@@ -169,6 +179,8 @@ export type CheckinBatchOptions = {
   windowSize?: number;
   force?: boolean;
   now?: () => number;
+  /** 墙钟（测试替身）：快照观测时间与日界用它；now 是计时器，不能混用。 */
+  wallNow?: () => Date;
   sleep?: (ms: number) => Promise<void>;
   /** 冷却时长的随机源（测试替身）；默认 Math.random。 */
   random?: () => number;
@@ -292,6 +304,7 @@ function chunkAccounts(accounts: Account[], size: number): Account[][] {
  */
 export async function checkinAll(home: string, run: Runner, options: CheckinBatchOptions = {}): Promise<CheckinBatchReport> {
   const now = options.now ?? (() => Date.now());
+  const wallNow = options.wallNow ?? (() => new Date());
   const sleep = options.sleep ?? delay;
   const random = options.random ?? Math.random;
   // 显式 --wait 是用户算好的时长，原样使用；走默认值才在 15–18 分钟之间随机取。
@@ -321,7 +334,7 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
   // Edge 进程——实例是这一轮最贵的资源。这也是续跑中断批次时不至于从头重来的原因。
   const preCredited = options.force === true
     ? new Set<string>()
-    : creditedTodayAliases(new Date(now()), options.dbFile);
+    : creditedTodayAliases(wallNow(), options.dbFile);
   const todo: Account[] = [];
   for (const account of wanted) {
     if (preCredited.has(account.alias)) {
@@ -582,6 +595,16 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
     closed: false,
   });
   const failed = accounts.filter((item) => !item.ok).length;
+  // 快照覆盖率在**关窗之后**才汇总：这里只读账本，不再碰浏览器。
+  // 采集本身已经在每个账号签到时就地完成（见 checkin.ts 的 finish），
+  // 所以这一步看到的就是"今天实际落了多少配对观测点"。
+  const snapshots = dailySnapshotSummary(accounts.map((item) => item.alias), wallNow(), options.dbFile);
+  if (!snapshots.ok) {
+    onProgress(
+      `当日快照缺 ${snapshots.missing.length}/${snapshots.total} 个账号：${snapshots.missing.join(", ")}。` +
+        `到账判定依赖配对快照，缺的账号明天会退化为裸余额差——可用 zenx accounts snapshot <别名> 单独补采（只读，不耗登录配额）。`,
+    );
+  }
   return {
     ok: failed === 0,
     total: accounts.length,
@@ -599,6 +622,7 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
     skippedAlreadyCredited: accounts.filter((item) => item.skipped === "already_credited_today" && item.attempts === 0).length,
     accounts,
     stateFile: file,
+    snapshots,
     ...(leftoverCleanup ? { leftoverCleanup } : {}),
   };
 }
@@ -626,6 +650,8 @@ async function runOne(
      * "上一轮拉起、这一轮签到成功"的实例。
      */
     ours: Set<string>;
+    /** 墙钟（测试替身）：快照观测时间与"今天"的日界都用它，不能用 now（那是计时器）。 */
+    wallNow?: () => Date;
   },
 ): Promise<AccountOutcome> {
   const retryCodes = new Set(context.retryCodes ?? DEFAULT_RETRY_CODES);
@@ -665,7 +691,9 @@ async function runOne(
         force: context.force === true,
         dbFile: context.dbFile,
         now: context.now,
+        wallNow: context.wallNow,
         sleep: context.sleep,
+        onSnapshot: context.onProgress,
         // 只关 zenx 自己拉起的实例：账号本来就在线时，那个 Edge 是用户自己的，
         // 共用同一个 Profile —— 关掉会连标签页与未保存内容一起带走。
         // 用跨轮的 launched：上一轮拉起、这一轮才签到成功的实例同样要回收。
@@ -682,7 +710,9 @@ async function runOne(
         force: context.force === true,
         dbFile: context.dbFile,
         now: context.now,
+        wallNow: context.wallNow,
         sleep: context.sleep,
+        onSnapshot: context.onProgress,
         closeAfter: context.closeAfter && launched,
       });
     }
@@ -700,6 +730,7 @@ async function runOne(
       // 签到成功时 --close-after 已经关掉了实例：如实回传，免得收尾再关一次
       // 然后报一堆 INSTANCE_OFFLINE。
       closed: result.closed === true,
+      ...(result.snapshot === undefined ? {} : { snapshot: result.snapshot }),
       ...(result.closureError === undefined ? {} : { closureError: result.closureError }),
     };
   } catch (error) {

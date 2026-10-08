@@ -305,7 +305,18 @@ async function runAnyRouterSteps(
   const spentDelta = baselineTotalSpent !== null && totalSpent !== null && totalSpent >= baselineTotalSpent
     ? Math.round((totalSpent - baselineTotalSpent) * 100) / 100 : null;
   const creditDelta = balanceDelta === null ? null : Math.round((balanceDelta + (spentDelta ?? 0)) * 100) / 100;
-  const checkinCredited = creditDelta !== null && creditDelta >= anyRouter.dailyCredit;
+  /**
+   * 裸余额差为正即可确认到账，不必凑到每日额度。
+   *
+   * 基线是**今天开始前**的余额，区间内余额只有发放（+）与消耗（−）两个来源，
+   * 消耗只减不增，因此净增 > 0 只可能来自今天的发放。要求净增 ≥ dailyCredit
+   * 等于要求当天零消耗——实测 edge-9（2026-10-07，AgentRouter 同口径问题）：
+   * 发放 25、当天消耗 14.68、净增只剩 10.32，够不到 25 就被判没到账。
+   * 保留 creditDelta ≥ dailyCredit 这条：有配对消耗时它给出的是更精确的发放额，
+   * 两者取"或"，前者是保守下限，后者是精确值。
+   */
+  const netGain = balanceDelta !== null && balanceDelta > 0;
+  const checkinCredited = creditDelta !== null && (creditDelta >= anyRouter.dailyCredit || netGain);
 
   // 先读取历史基线再写本轮观测；两张表共用观测时间，次日仍能严格配对。
   await recordObservation(account, balanceAfter, totalSpent, observedAt, dbFile);

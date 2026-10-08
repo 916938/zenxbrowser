@@ -42,6 +42,9 @@ function clock(start = 0) {
   const sleeps: number[] = [];
   return {
     now: () => (now += 100),
+    // 墙钟与计时器共用同一条时间线，但读它不推进时钟：日界（"今天"是哪天）
+    // 必须稳定，否则同一轮里前后两次读到的日期可能不一致。
+    wallNow: () => new Date(now),
     sleep: async (ms: number) => { sleeps.push(ms); now += ms; },
     sleeps,
     dbFile: join(tmpdir(), `zenx-batch-db-${randomUUID()}.db`),
@@ -320,6 +323,65 @@ test("checkin-all: 今天已到账的账号开跑前就跳过，不进分组也�
   assert.equal(byAlias.get("alpha")?.attempts, 0, "跳过的账号不该有尝试记录");
   assert.equal(byAlias.get("alpha")?.credited, true, "已到账仍计入到账数，报表才不会少算");
   assert.equal(closeCalls.includes("aaaa1111"), false, "跳过的账号没有实例可关");
+});
+
+// 快照覆盖率：到账判定的 Δ消耗基准来自 balance_snapshots 的配对观测点。
+// 以前它靠整轮签到之后单独跑一遍 snapshot --all，而那时 --close-after 已经把
+// Profile 关了，只能采到 OFFLINE（实测 2026-10-02 / 10-04：18 和 22 条），
+// 基准一断就是几周、判定静默退化成裸余额差。现在采集并入签到，收尾只核对覆盖率。
+test("checkin-all: 汇总当日快照覆盖率，缺失的账号要点名", async (t) => {
+  const home = await fixture(t);
+  const dbFile = tempDb(t);
+  const day = new Date("2026-09-21T10:00:00+08:00").getTime();
+  const time = clock(day);
+  const lines: string[] = [];
+  const report = await checkinAll(home, runner, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    waitMs: 60_000,
+    maxRetries: 1,
+    onProgress: (line) => lines.push(line),
+    ...time,
+    dbFile,
+  });
+  // 这两个账号都以 CHECKIN_TIMEOUT 失败（没走到读页面那一步），所以都没有快照。
+  assert.equal(report.snapshots.ok, false);
+  assert.equal(report.snapshots.total, 2);
+  assert.equal(report.snapshots.saved, 0);
+  assert.deepEqual(report.snapshots.missing, ["alpha", "beta"]);
+  const warn = lines.find((line) => line.includes("当日快照缺"));
+  assert.match(warn ?? "", /alpha, beta/, "缺哪些账号要写明");
+  assert.match(warn ?? "", /snapshot/, "要给出补采的办法");
+});
+
+test("checkin-all: 已有当日配对快照的账号计入覆盖率，不再报缺", async (t) => {
+  const home = await fixture(t);
+  const dbFile = tempDb(t);
+  const day = new Date("2026-09-21T10:00:00+08:00");
+  // alpha 当天已到账并落过配对快照（签到时就地采的那种）：两条记录同一时点，
+  // 才满足 db.lastPairedSnapshotBefore 要求的"配对快照就是最新余额观测点"。
+  seedCredited(dbFile, "alpha", "aaaa1111", day);
+  const db = openDatabase(dbFile);
+  try {
+    db.prepare(
+      "INSERT INTO balance_snapshots (time, alias, instance_id, identity, balance, total_spent, ok) VALUES (?, ?, ?, ?, 125, 70, 1)",
+    ).run(day.toISOString(), "alpha", "aaaa1111", "github_1");
+    db.prepare("UPDATE checkins SET time = ? WHERE alias = 'alpha'").run(day.toISOString());
+  } finally {
+    db.close();
+  }
+  const time = clock(day.getTime());
+  const report = await checkinAll(home, runner, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    waitMs: 60_000,
+    maxRetries: 1,
+    ...time,
+    dbFile,
+  });
+  assert.equal(report.snapshots.total, 2);
+  assert.deepEqual(report.snapshots.missing, ["beta"], "alpha 已有配对快照，只剩 beta 缺");
+  assert.equal(report.snapshots.saved, 1);
 });
 
 /**

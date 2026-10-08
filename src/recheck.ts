@@ -235,6 +235,19 @@ export async function recheckAccount(
     const creditDelta = balanceDelta === null
       ? null
       : Math.round((balanceDelta + (spentDelta ?? 0)) * 100) / 100;
+    /**
+     * 裸余额差为正，本身就是"今天发过钱"的证据。
+     *
+     * 基线取的是**今天开始前**，区间内余额只有两个来源：发放（+）与消耗（−），
+     * 而消耗只会让余额变小。所以净增 > 0 只可能来自今天的发放，被消耗盖掉多少
+     * 并不改变这个结论——不需要凑到每日额度。
+     * 站点每天只发固定一笔（site.dailyCredit），因此"发了"就等于"今日额度已到账"。
+     * 实测 edge-9（2026-10-07）：发放 25、当天消耗 14.68、净增只剩 10.32，
+     * 按"必须 ≥ 25"判就是 not_credited，而钱确实在账上。
+     * 误判上限是"当天有人手动充过值"，那时账本同样会记成今日到账——与"签到发放"
+     * 在余额口径上本就不可区分，可接受。
+     */
+    const netGain = balanceDelta !== null && balanceDelta > 0;
 
     if (state.login === "manual_intervention") {
       return {
@@ -266,7 +279,9 @@ export async function recheckAccount(
       };
     }
 
-    const gained = creditDelta !== null && creditDelta >= site.dailyCredit;
+    // 三条证据任一成立即算到账。gained 放宽为"净增为正"：要求净增达到每日额度
+    // 等于要求当天零消耗（见 netGain 的说明），会把真实到账判成未到账。
+    const gained = creditDelta !== null && (creditDelta >= site.dailyCredit || netGain);
     if (creditedToday || siteCheckedIn || gained) {
       const source = creditedToday ? "账本今日已有到账记录" : siteCheckedIn ? "站点显示今日已签到" : "余额相对基线已增长";
       return {
@@ -284,7 +299,7 @@ export async function recheckAccount(
       verdict: "not_credited",
       note: balanceDelta === null
         ? "未发现到账证据（缺少发放前余额基准，无法比较增量）；可重试签到，或次日再看余额趋势。"
-        : "未发现到账证据：账本今日无到账记录、站点未显示已签到、余额与消耗合计也无增长。可重试签到。",
+        : "未发现到账证据：账本今日无到账记录、站点未显示已签到，余额相对今天开始前也没有净增（只有消耗没有发放）。可重试签到。",
     };
   });
 }

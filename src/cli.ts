@@ -3,7 +3,7 @@ import { parseArgs } from "node:util";
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { bindAccount, bindAnyRouterIdentity, checkAccounts, createRunner, doctor, isEdge, listBrowsers, ZenxError } from "./core.ts";
+import { bindAccount, bindAnyRouterIdentity, checkAccounts, createRunner, doctor, isEdge, listBrowsers, readStore, ZenxError } from "./core.ts";
 import type { Runner } from "./core.ts";
 import { closeAllBrowsers, closeBrowser, closeLeftoverInstances, configureLaunch, ensureOnline, inspectSite, openSite, relinkAccount } from "./launch.ts";
 import { enrichBskTimeout } from "./diagnose.ts";
@@ -13,7 +13,7 @@ import { checkinAll, pendingCheckins } from "./checkin-batch.ts";
 import { recheckAccount } from "./recheck.ts";
 import { anyrouterCheckin } from "./anyrouter-checkin.ts";
 import { anyrouterCheckinAll } from "./anyrouter-batch.ts";
-import { snapshotAccount, snapshotAll } from "./snapshot.ts";
+import { snapshotAccount, snapshotAll, dailySnapshotSummary } from "./snapshot.ts";
 import { startReportServer } from "./report.ts";
 import { isTabId } from "./site.ts";
 import { DEFAULT_BATCH_INHIBIT_TIMEOUT_MS, withSleepInhibit } from "./power-save.ts";
@@ -51,6 +51,7 @@ const help = `ZenX Browser — Windows Edge 多账号连接台
   zenx accounts recheck <别名> [--timeout 45s] [--record yes|no] [--site agentrouter|anyrouter]
   zenx accounts snapshot <别名> [--timeout 45s] [--site agentrouter|anyrouter]
   zenx accounts snapshot --all [--timeout 45s] [--site agentrouter|anyrouter]
+  zenx accounts snapshot --missing
   zenx report [--port 8787] [--open]
 
 全局选项：
@@ -87,7 +88,10 @@ inspect-site 只读采集既有 AgentRouter 标签当前视口可见正文，核
   不启动 Edge、不切换/新建/刷新标签、不执行签到；离线直接报告，不等待。
   页面在扩展更新前已加载时没有只读接收器，需人工刷新该标签后重试。
 snapshot 采集一次"当前余额 + 站点累计消耗"写入账本（只读：不退出、不重登录、不消耗登录配额）；
-  与 checkin 只记录签到那一刻不同，它提供连续观测点，供周/月对比到账与消耗；
+  **通常不必手动跑**：checkin / checkin-all / anyrouter-checkin 会在签到时就地落一笔快照
+  （用的是判定到账那一次页面读取，余额与消耗天然配对，且在关窗之前完成）。
+  这个命令留给补漏：签到前就失败、或当天已到账被跳过的账号不会有自动快照。
+  --missing 只读账本列出"今天还缺配对快照"的账号（不碰 bsk、不拉起 Edge），供日常脚本按需补采；
   --all 依次采集全部已绑定账号，单个失败不中断；失败也留一条（ok=false + 错误码）。
   **按站点各采一次**：账号在哪些站点绑了身份就采哪些（AgentRouter 用 expected-identity、
   AnyRouter 用 bind-anyrouter 的身份），各写一条独立记录；--site 只采指定站点。
@@ -336,6 +340,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
         site: { type: "string" },
         window: { type: "string" },
         all: { type: "boolean" },
+        missing: { type: "boolean" },
         "tab-id": { type: "string" },
         port: { type: "string" },
         open: { type: "boolean" },
@@ -376,7 +381,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     if (configuring) for (const key of ["edge-path", "user-data-dir", "profile-directory", "confirm"]) allowed.add(key);
     if (ensuring || opening || inspecting || relinking || closing || rechecking || snapshotting) allowed.add("timeout");
     if (rechecking) for (const key of ["record", "site"]) allowed.add(key);
-    if (snapshotting) for (const key of ["all", "site"]) allowed.add(key);
+    if (snapshotting) for (const key of ["all", "missing", "site"]) allowed.add(key);
     if (loggingIn) allowed.add("timeout");
     if (bindingAnyRouter) for (const key of ["identity", "confirm"]) allowed.add(key);
     if (checkingInAnyRouter || checkingInAnyRouterAll) for (const key of ["timeout", "force"]) allowed.add(key);
@@ -391,6 +396,8 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     }
     if (values.home !== undefined && !values.home.trim()) throw new ZenxError("INVALID_ARGUMENT", "--home 不能为空。");
     if (snapshotting && values.all === true && alias !== undefined) throw new ZenxError("INVALID_ARGUMENT", "--all 会采集全部账号，不能再指定别名。");
+    if (snapshotting && values.missing === true && alias !== undefined) throw new ZenxError("INVALID_ARGUMENT", "--missing 只读账本列出缺快照的账号，不接受别名。");
+    if (snapshotting && values.missing === true && values.all === true) throw new ZenxError("INVALID_ARGUMENT", "--missing 与 --all 不能同时使用。");
     const home = resolveHome(values.home, dependencies.home);
     const run = dependencies.run ?? createRunner(process.env.ZENX_BSK_PATH);
     // 防休眠配置：返回 null 表示整段不启用。日志走与进度相同的出口，JSON 模式下不打印。
@@ -499,6 +506,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
           ...dependencies.checkinDependencies,
           force: values.force === true,
           closeAfter: values["close-after"] === true,
+          onSnapshot: (line) => { if (!asJson) output(line); },
         }).catch(async (error: unknown) => {
           // BSK_TIMEOUT 追加卡死诊断（实例卡死 vs daemon 卡死的下一步完全不同）。
           throw await enrichBskTimeout(error, run, { home, alias });
@@ -510,6 +518,17 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
         record: parseRecordFlag(values.record),
         siteId: parseSiteId(values.site),
       });
+    } else if (snapshotting && values.missing === true && positionals.length === 2) {
+      // 只读账本：列出今天还缺**配对**观测点（余额 + 累计消耗）的账号。
+      // 自动快照已在签到时就地采集，这里只回答"还差谁"，不碰 bsk、不拉起 Edge。
+      const store = await readStore(home);
+      report = {
+        ...dailySnapshotSummary(
+          store.accounts.map((item) => item.alias),
+          (dependencies.now ?? (() => new Date()))(),
+          dependencies.snapshotDbFile,
+        ),
+      };
     } else if (snapshotting && values.all === true && positionals.length === 2) {
       report = await snapshotAll(home, run, parseTimeout(values.timeout), {
         dbFile: dependencies.snapshotDbFile,
