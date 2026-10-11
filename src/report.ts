@@ -86,9 +86,10 @@ const page = `<!doctype html>
 <script>
 const RECENT_DAYS = ${RECENT_SPENT_DAYS};
 const COLORS = ["#58a6ff","#3fb950","#f0883e","#a371f7","#f85149","#39c5cf","#e3b341","#db61a2"];
-// 站点：账本 alias 形如 "edge-6" / "edge-6@anyrouter"。同一个 Edge Profile 可以在
+// 站点：账本 alias 形如 "edge-6" / "edge-6@<站点键>"。同一个 Edge Profile 可以在
 // 多个站点上各有一个账号，两边的余额独立（不能互转），所以处处按站点分开显示。
-const SITE_NAMES = { agentrouter: "AgentRouter", anyrouter: "AnyRouter" };
+// 前台只显示脱敏代号（router-A / router-B），真实平台名不出现在页面与注释里。
+const SITE_NAMES = { agentrouter: "router-A", anyrouter: "router-B" };
 const SITE_ORDER = ["agentrouter", "anyrouter"];
 const siteOf = a => { const s = String(a ?? ""); const i = s.lastIndexOf("@"); return i > 0 ? s.slice(i + 1) : "agentrouter"; };
 const baseOf = a => { const s = String(a ?? ""); const i = s.lastIndexOf("@"); return i > 0 ? s.slice(0, i) : s; };
@@ -397,7 +398,7 @@ function table(rows, footer) {
 function drawChart(series) {
   const data = series.filter(s => s.points.length > 0);
   if (!data.length) return '<div class="empty">暂无余额数据</div>';
-  // 按站点分图：两站余额差一个数量级（AgentRouter $800~2000、AnyRouter $5000+），
+  // 按站点分图：两站余额差一个数量级（router-A 的余额远低于 router-B），
   // 共用一根 Y 轴会把低值那组压成一条直线，看不出趋势。
   const bySite = new Map();
   for (const s of data) {
