@@ -271,6 +271,18 @@ AgentRouter 的限流要等 15 分钟，这边的钱已经落袋了。`--close-l
 AnyRouter 阶段的汇总写在报告的 `anyrouter` 字段里，它失败会让整轮 `ok=false`（今天该签的没签上，
 不能以 0 收尾）。`anyrouter-checkin-all` 仍然是独立命令，随时可单独手动跑。
 
+**默认只打印汇总**：二十个账号各打一行会把"钱领到了吗、谁要人处理"冲出屏幕，
+而"今天已到账"本来就是同一件事重复二十遍。屏幕上留的是这种几行结论：
+
+```
+AnyRouter：2 个账号，到账 2，失败 0，释放实例 2
+AgentRouter：共 20 个账号，到账 19，今天已到账而跳过 18，失败 1，释放实例 5
+需要处理的账号：edge-2（LOGIN_RATE_LIMITED）
+结论：有账号没签上，见上面需处理的名单。
+```
+
+要逐账号明细（谁跳过、余额多少）加 `--json`；脚本照旧用 `--json` 解析，不受影响。
+
 ### 每日自动跑：`daily-checkin.ps1`
 
 [`scripts/daily-checkin.ps1`](file:///d:/916938/zenxbrowser/scripts/daily-checkin.ps1) 在 AgentRouter 签到之后、每日快照之前，会调用一次 `anyrouter-checkin-all`。所以计划任务不用改——每天自动把两个站点都签完。

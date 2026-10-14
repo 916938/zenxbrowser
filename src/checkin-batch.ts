@@ -35,6 +35,8 @@ export const DEFAULT_RETRY_CODES = ["LOGIN_RATE_LIMITED", "LOGIN_TIMEOUT"];
 
 const STATE_VERSION = 1;
 const DEFAULT_CLOSE_TIMEOUT_MS = 45_000;
+/** 跳过名单最多点名几个别名；超出的只报数量。 */
+const PRE_CREDITED_NAME_LIMIT = 5;
 /**
  * BSK_TIMEOUT 即时重试的等待时间。首次 bsk 调用常因扩展/守护进程冷启动而超时
  * （edge-1 这类长期运行的用户自己的 Edge 尤其明显），短暂等待后重试通常成功。
@@ -111,6 +113,48 @@ export type CheckinBatchReport = {
   /** 前置的 AnyRouter 阶段汇总（--anyrouter no 时不存在）。 */
   anyrouter?: AnyRouterBatchReport;
 };
+
+/**
+ * 给人看的收尾汇总。
+ *
+ * 为什么需要它：批量报告有二十个账号，逐条 JSON 打出来几百行，真正要回答的
+ * 问题只有三个——钱领到了吗、谁出问题了、要不要人工处理。逐账号明细仍然留在
+ * JSON 里（加 --json），屏幕上只留结论。
+ */
+export function summarizeBatchReport(report: CheckinBatchReport): string[] {
+  const lines: string[] = [];
+  const anyrouter = report.anyrouter;
+
+  if (anyrouter && anyrouter.total > 0) {
+    const skipped = anyrouter.skipped > 0 ? `，跳过 ${anyrouter.skipped}` : "";
+    const released = anyrouter.released > 0 ? `，释放实例 ${anyrouter.released}` : "";
+    lines.push(`AnyRouter：${anyrouter.total} 个账号，到账 ${anyrouter.credited}${skipped}，失败 ${anyrouter.failed}${released}`);
+  }
+
+  const parts = [`共 ${report.total} 个账号，到账 ${report.credited}`];
+  if (report.skippedAlreadyCredited > 0) parts.push(`今天已到账而跳过 ${report.skippedAlreadyCredited}`);
+  if (report.failed > 0) parts.push(`失败 ${report.failed}`);
+  if (report.released > 0) parts.push(`释放实例 ${report.released}`);
+  if (report.waitedMs > 0) parts.push(`限流冷却 ${(report.waitedMs / 60_000).toFixed(1)} 分钟`);
+  lines.push(`AgentRouter：${parts.join("，")}`);
+
+  // 失败必须点名：它是唯一需要人动手的部分，混在汇总数字里等于没说。
+  const failures = report.accounts.filter((item) => !item.ok);
+  if (failures.length > 0) {
+    lines.push(`需要处理的账号：${failures.map((item) => `${item.alias}（${item.code ?? "UNKNOWN"}）`).join("、")}`);
+  }
+  if (anyrouter && anyrouter.failed > 0) {
+    const failedNames = anyrouter.accounts.filter((item) => !item.ok).map((item) => `${item.alias}（${item.code ?? "UNKNOWN"}）`);
+    if (failedNames.length > 0) lines.push(`AnyRouter 需处理：${failedNames.join("、")}`);
+  }
+
+  if (!report.snapshots.ok) {
+    lines.push(`当日快照缺 ${report.snapshots.missing.length}/${report.snapshots.total} 个：${report.snapshots.missing.join(", ")}；可用 zenx accounts snapshot <别名> 补采（只读）。`);
+  }
+
+  lines.push(report.ok ? "结论：今天该签的都签上了。" : "结论：有账号没签上，见上面需处理的名单。");
+  return lines;
+}
 
 /**
  * 签到前的预判结果：今天还要签哪些、哪些已经签过了。
@@ -380,6 +424,7 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
     ? new Set<string>()
     : creditedTodayAliases(wallNow(), options.dbFile);
   const todo: Account[] = [];
+  const preCreditedNames: string[] = [];
   for (const account of wanted) {
     if (preCredited.has(account.alias)) {
       outcomes.set(account.alias, {
@@ -393,10 +438,23 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
         balanceAfter: null,
         closed: false,
       });
-      onProgress(`${account.alias}: 跳过（账本显示今天已到账，不拉起 Edge）`);
+      preCreditedNames.push(account.alias);
       continue;
     }
     todo.push(account);
+  }
+  /**
+   * 跳过的账号**聚合成一行**再报：二十个账号各打一行会把真正要看的东西
+   * （谁签上了、谁失败了）冲出屏幕，而"今天已到账"本来就是同一件事重复二十遍。
+   * 名单在点名前截断：它只是核对用，撑爆一行反而更难看。
+   */
+  if (preCreditedNames.length > 0) {
+    const shown = preCreditedNames.slice(0, PRE_CREDITED_NAME_LIMIT);
+    const rest = preCreditedNames.length - shown.length;
+    onProgress(
+      `跳过 ${preCreditedNames.length} 个账号（账本显示今天已到账，不拉起 Edge）：${shown.join(", ")}` +
+        (rest > 0 ? ` 等（另有 ${rest} 个）` : ""),
+    );
   }
 
   const plan = windowSize > 0 ? chunkAccounts(todo, windowSize) : [todo];

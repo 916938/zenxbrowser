@@ -106,6 +106,7 @@ node src/cli.ts accounts checkin-all --window 8            # 同时在线不超�
 node src/cli.ts accounts checkin-all --close-after         # 不分组也逐个账号关掉 Edge，释放内存
 node src/cli.ts accounts checkin-all --window 8 --close-after   # 两者可叠加：成功的账号签完即关，失败的由组结束时的释放兜底
 node src/cli.ts accounts checkin-all --anyrouter no        # 只签 AgentRouter，跳过前置的 AnyRouter 阶段
+node src/cli.ts accounts checkin-all --json                # 逐账号明细（默认只打印汇总，见下）
 node src/cli.ts accounts pending                          # 签到前先预判：只读账本，列出今天还要签谁（不拉起任何 Edge）
 node src/cli.ts accounts checkin-all --retry-codes LOGIN_RATE_LIMITED,LOGIN_TIMEOUT
 node src/cli.ts accounts checkin-all --inhibit-sleep no         # 不阻止系统休眠
@@ -120,6 +121,19 @@ node src/cli.ts accounts checkin-all --inhibit-timeout 2h       # 防休眠上�
 - `--close-leftover` 排在 AnyRouter 阶段**之前**：那段同样会按需拉起 Edge，清晚了就会和
   新拉起的实例混在一起，遗留实例会被误认成"用户自己的 Edge"而继续占着内存。
 - AnyRouter 阶段的汇总在报告的 `anyrouter` 字段；它失败会让整轮 `ok=false`（今天该签的没签上）。
+
+**默认只打印汇总，不打印逐账号明细**：二十个账号各打一行会把"钱领到了吗、谁要人处理"
+冲出屏幕，而"今天已到账"本来就是同一件事重复二十遍。屏幕上只留结论：
+
+```
+AnyRouter：2 个账号，到账 2，失败 0，释放实例 2
+AgentRouter：共 20 个账号，到账 19，今天已到账而跳过 18，失败 1，释放实例 5，限流冷却 16.0 分钟
+需要处理的账号：edge-2（LOGIN_RATE_LIMITED）
+结论：有账号没签上，见上面需处理的名单。
+```
+
+想知道谁具体跳过、余额多少，加 `--json` 拿完整报告（脚本照旧用 `--json` 解析，
+不受影响）。
 
 ### 防休眠（签到期间）
 

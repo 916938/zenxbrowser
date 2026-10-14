@@ -9,7 +9,7 @@ import { closeAllBrowsers, closeBrowser, closeLeftoverInstances, configureLaunch
 import { enrichBskTimeout } from "./diagnose.ts";
 import { checkinAccount } from "./checkin.ts";
 import { loginAccount } from "./login.ts";
-import { checkinAll, pendingCheckins } from "./checkin-batch.ts";
+import { checkinAll, pendingCheckins, summarizeBatchReport } from "./checkin-batch.ts";
 import { recheckAccount } from "./recheck.ts";
 import { anyrouterCheckin } from "./anyrouter-checkin.ts";
 import { anyrouterCheckinAll } from "./anyrouter-batch.ts";
@@ -20,6 +20,7 @@ import { DEFAULT_BATCH_INHIBIT_TIMEOUT_MS, withSleepInhibit } from "./power-save
 import type { SleepInhibitOptions, SpawnLike } from "./power-save.ts";
 import type { LaunchDependencies } from "./launch.ts";
 import type { CheckinDependencies } from "./checkin.ts";
+import type { CheckinBatchReport } from "./checkin-batch.ts";
 
 export const DEFAULT_HOME = fileURLToPath(new URL("../.zenx/", import.meta.url));
 
@@ -55,7 +56,7 @@ const help = `ZenX Browser — Windows Edge 多账号连接台
   zenx report [--port 8787] [--open]
 
 全局选项：
-  --json          输出 JSON
+  --json          输出 JSON（checkin-all 不加它时只打印汇总，不打印逐账号明细）
   --home <目录>   账号数据目录（优先于 ZENX_HOME；默认 CLI 所在项目的 .zenx，不随工作目录变化）
   --port <端口>   report 监听端口（默认 8787）
   --open          report 启动后自动打开浏览器
@@ -570,6 +571,13 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
       throw new ZenxError("INVALID_ARGUMENT", "命令或参数不正确；运行 zenx --help 查看用法。");
     }
     if (!asJson && !checkingIn && !checkingInAll && !closing && !closingAll && !closingLeftover && !rechecking && !snapshotting && !loggingIn && !checkingInAnyRouter && !checkingInAnyRouterAll) output("连接在线或打开站点不等于登录身份验证；未执行签到。");
+    if (!asJson && checkingInAll) {
+      // 批量报告有二十个账号，整段 JSON 几百行会把"钱领到了吗"淹掉：
+      // 屏幕上给结论，明细留给 --json。
+      for (const line of summarizeBatchReport(report as unknown as CheckinBatchReport)) output(line);
+      output("（逐账号明细加 --json）");
+      return report.ok === false ? 1 : 0;
+    }
     output(JSON.stringify(report, null, 2));
     // 单实例关闭：回包只说明"请求已响应"。没复核到实例离线就不能以 0 收尾，
     // 否则脚本会把"窗口还在退出"当成"资源已释放"。

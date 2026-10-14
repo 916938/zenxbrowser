@@ -641,6 +641,42 @@ test("CLI checkin-all 接受 --close-leftover 并在报告里汇总", async (t) 
   assert.deepEqual(report.leftoverCleanup, { tracked: 0, closed: 0, dropped: 0, failed: 0 });
 });
 
+// 二十个账号各打一行"跳过"会把真正要看的东西冲出屏幕；屏幕上只该有结论。
+test("CLI checkin-all 非 JSON 模式只打汇总，不打整段 JSON", async (t) => {
+  const home = await temporary(t);
+  await writeFile(join(home, "accounts.json"), JSON.stringify({ version: 1, accounts: [] }));
+  const lines: string[] = [];
+  const inhibit = fakeInhibit();
+  const code = await main(["accounts", "checkin-all"], {
+    home,
+    output: (line) => lines.push(line),
+    run: async () => ({ stdout: "[]", exitCode: 0 }),
+    inhibitSpawn: inhibit.spawn,
+  });
+  assert.equal(code, 0);
+  assert.ok(!lines.some((line) => line.trim().startsWith("{")), "不该再打整段 JSON");
+  assert.ok(lines.some((line) => line.includes("AgentRouter")), "要有 AgentRouter 汇总行");
+  assert.ok(lines.some((line) => line.includes("结论：")), "最后一行给结论");
+});
+
+// 明细不能消失，只是换个开关拿。
+test("CLI checkin-all --json 仍然给出完整报告", async (t) => {
+  const home = await temporary(t);
+  await writeFile(join(home, "accounts.json"), JSON.stringify({ version: 1, accounts: [] }));
+  const lines: string[] = [];
+  const inhibit = fakeInhibit();
+  const code = await main(["accounts", "checkin-all", "--json"], {
+    home,
+    output: (line) => lines.push(line),
+    run: async () => ({ stdout: "[]", exitCode: 0 }),
+    inhibitSpawn: inhibit.spawn,
+  });
+  assert.equal(code, 0);
+  const report = JSON.parse(lines[0]);
+  assert.equal(Array.isArray(report.accounts), true, "--json 下逐账号明细仍在");
+  assert.equal(report.ok, true);
+});
+
 // checkin-all 默认带上 AnyRouter 阶段：两个站点一条命令签完，不用记两条。
 test("CLI checkin-all 默认带 AnyRouter 阶段的汇总", async (t) => {
   const home = await temporary(t);

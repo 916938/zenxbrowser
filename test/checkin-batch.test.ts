@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { DEFAULT_RETRY_CODES, checkinAll, pendingCheckins, readState, writeState } from "../src/checkin-batch.ts";
+import { DEFAULT_RETRY_CODES, checkinAll, pendingCheckins, readState, summarizeBatchReport, writeState } from "../src/checkin-batch.ts";
 import { openDatabase } from "../src/db.ts";
 import { readLeftovers, recordLaunchedInstance } from "../src/leftover.ts";
 import type { Account, Browser, Result, Runner } from "../src/core.ts";
@@ -580,6 +580,76 @@ test("checkin-all: --close-leftover 开跑前清理遗留实例，不碰账号�
   assert.deepEqual(closed, ["zzzz9999"], "只清追踪里的遗留实例，账号自己的实例一下都不碰");
   assert.deepEqual(report.leftoverCleanup, { tracked: 2, closed: 1, dropped: 1, failed: 0 });
   assert.deepEqual((await readLeftovers(home)).instances, [], "两条记录都应有归宿");
+});
+
+// --- 输出：跳过的账号聚合成一行，别把屏幕刷满 ---
+
+test("checkin-all: 跳过的账号聚合成一行，不逐账号刷屏", async (t) => {
+  const many: Account[] = Array.from({ length: 12 }, (_, index) => ({
+    alias: `a${index}`, instanceId: `i${index}`, expectedIdentity: `g${index}`, boundAt: "2026-09-13T00:00:00Z",
+  }));
+  const home = await fixture(t, many);
+  const dbFile = tempDb(t);
+  const day = new Date("2026-09-21T10:00:00+08:00").getTime();
+  for (const account of many) seedCredited(dbFile, account.alias, account.instanceId, new Date(day));
+  const time = clock(day);
+  const lines: string[] = [];
+  const report = await checkinAll(home, runner, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    maxRetries: 0,
+    onProgress: (line) => lines.push(line),
+    ...time,
+    dbFile,
+  });
+  assert.equal(report.skippedAlreadyCredited, 12);
+  const skipLines = lines.filter((line) => line.includes("跳过"));
+  assert.equal(skipLines.length, 1, `十二个只该报一行，实际 ${skipLines.length} 行`);
+  assert.match(skipLines[0], /跳过 12 个账号/);
+  assert.match(skipLines[0], /另有 \d+ 个/, "点名要有上限，超出只报数量");
+});
+
+test("checkin-all: 汇总只留结论与需处理的账号", () => {
+  const report = {
+    ok: false,
+    total: 20,
+    credited: 18,
+    failed: 2,
+    rounds: 1,
+    waitedMs: 60_000,
+    windowSize: 8,
+    groups: 3,
+    released: 4,
+    skippedAlreadyCredited: 15,
+    accounts: [
+      { alias: "ok-1", ok: true, credited: true, attempts: 1, rateLimited: false, balanceBefore: null, balanceAfter: null, closed: false },
+      { alias: "bad-1", ok: false, code: "LOGIN_RATE_LIMITED", credited: false, attempts: 2, rateLimited: true, balanceBefore: null, balanceAfter: null, closed: false },
+      { alias: "bad-2", ok: false, code: "IDENTITY_MISMATCH", credited: false, attempts: 1, rateLimited: false, balanceBefore: null, balanceAfter: null, closed: false },
+    ],
+    stateFile: "x",
+    snapshots: { ok: true, total: 20, saved: 20, missing: [] },
+    anyrouter: { ok: true, total: 2, credited: 2, skipped: 0, failed: 0, released: 2, accounts: [] },
+  };
+  const lines = summarizeBatchReport(report as never);
+  assert.equal(lines.length <= 5, true, `汇总要短，实际 ${lines.length} 行`);
+  assert.ok(lines.some((line) => line.includes("AgentRouter") && line.includes("到账 18")));
+  assert.ok(lines.some((line) => line.includes("bad-1（LOGIN_RATE_LIMITED）")), "失败的要点名带错误码");
+  assert.ok(lines.some((line) => line.includes("bad-2")), "同时列出第二个失败");
+  assert.ok(!lines.some((line) => line.includes("ok-1")), "成功的账号不必逐个出现");
+  assert.ok(lines.some((line) => line.includes("限流冷却 1.0 分钟")));
+  assert.match(lines[lines.length - 1], /没签上/);
+});
+
+test("checkin-all: 全签上时汇总给出肯定结论", () => {
+  const lines = summarizeBatchReport({
+    ok: true, total: 20, credited: 20, failed: 0, rounds: 0, waitedMs: 0, windowSize: 8, groups: 0,
+    released: 0, skippedAlreadyCredited: 20,
+    accounts: [], stateFile: "x", snapshots: { ok: true, total: 20, saved: 20, missing: [] },
+    anyrouter: { ok: true, total: 2, credited: 2, skipped: 0, failed: 0, released: 2, accounts: [] },
+  } as never);
+  assert.ok(lines.some((line) => line.includes("AnyRouter") && line.includes("到账 2")));
+  assert.match(lines[lines.length - 1], /都签上了/);
+  assert.equal(lines.filter((line) => line.includes("需")).length, 0, "没有失败就不该出现需处理名单");
 });
 
 // --- AnyRouter 阶段：checkin-all 默认先跑它，再跑 AgentRouter ---

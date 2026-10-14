@@ -103,6 +103,9 @@ function Disable-SleepGuard {
 
 function Invoke-Zenx {
   param([string[]]$Arguments)
+  # --json is REQUIRED here: checkin-all prints only a human summary by default
+  # (twenty per-account lines drowned out the result). Do not drop it - the
+  # parsing below reads $script:LastOutput as JSON.
   $lines = & node $cli @Arguments --json 2>&1 | ForEach-Object { "$_" }
   $lines | Add-Content -Path $log -Encoding UTF8
   $script:LastOutput = ($lines | Out-String)   # callers may need to inspect the JSON report
