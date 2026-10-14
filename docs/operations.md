@@ -95,7 +95,7 @@ node src/cli.ts accounts anyrouter-checkin-all --force
 - **首次签到 `checkinCredited` 会是 `false`**：没有"今天开始前"的余额基线，无法确认到账——那是"无法证明"，不是"没签上"。第一次跑建立基线，之后每天跑就能对比确认了。
 - 只有 edge-6 和 edge-p16 两个账号需要打卡 AnyRouter。
 - **签到脚本分开，但 snapshot / recheck 两站共用**：`accounts snapshot edge-6` 会按站点各采一条观测点，`accounts recheck edge-6 --site anyrouter` 可复查 AnyRouter。身份按站点自动取（拿错站点的身份会误判成 `IDENTITY_MISMATCH`）。
-- 与 AgentRouter 的签到**互不干扰**：`checkin` / `checkin-all` 只管 AgentRouter，AnyRouter 用 `anyrouter-checkin*`。
+- 与单账号命令**互不干扰**：`checkin`（单账号）只管 AgentRouter；`checkin-all` 会先带上 AnyRouter 阶段（见下），`--anyrouter no` 可只跑 AgentRouter。AnyRouter 单独跑用 `anyrouter-checkin*`。
 
 ### 批量签到（推荐替代 PowerShell 脚本）
 
@@ -105,11 +105,21 @@ node src/cli.ts accounts checkin-all --wait 16m --retries 1
 node src/cli.ts accounts checkin-all --window 8            # 同时在线不超过 8 个（默认），一组签完即关再拉下一组
 node src/cli.ts accounts checkin-all --close-after         # 不分组也逐个账号关掉 Edge，释放内存
 node src/cli.ts accounts checkin-all --window 8 --close-after   # 两者可叠加：成功的账号签完即关，失败的由组结束时的释放兜底
+node src/cli.ts accounts checkin-all --anyrouter no        # 只签 AgentRouter，跳过前置的 AnyRouter 阶段
 node src/cli.ts accounts pending                          # 签到前先预判：只读账本，列出今天还要签谁（不拉起任何 Edge）
 node src/cli.ts accounts checkin-all --retry-codes LOGIN_RATE_LIMITED,LOGIN_TIMEOUT
 node src/cli.ts accounts checkin-all --inhibit-sleep no         # 不阻止系统休眠
 node src/cli.ts accounts checkin-all --inhibit-timeout 2h       # 防休眠上限（默认 4h，最长 24h）
 ```
+
+**两个站点一条命令签完**：`checkin-all` 默认**先跑 AnyRouter 阶段**（`anyrouter-checkin-all` 那一段），
+再跑 AgentRouter 那二十个号。顺序不是随意的——AnyRouter 只有两个账号、刷新不消耗站点登录配额，
+先把它签完，后面万一撞上 AgentRouter 的限流要等 15 分钟，这边的钱已经落袋了。
+
+- `--close-after` 对两个阶段都生效：AnyRouter 那两个号也只关本轮由 zenx 拉起的实例。
+- `--close-leftover` 排在 AnyRouter 阶段**之前**：那段同样会按需拉起 Edge，清晚了就会和
+  新拉起的实例混在一起，遗留实例会被误认成"用户自己的 Edge"而继续占着内存。
+- AnyRouter 阶段的汇总在报告的 `anyrouter` 字段；它失败会让整轮 `ok=false`（今天该签的没签上）。
 
 ### 防休眠（签到期间）
 
@@ -283,6 +293,7 @@ node src/cli.ts accounts recheck edge-1   # 用余额增量确认今天到账没
 - `checkin <别名> --close-after`：签到成功后立刻关掉整个实例（**不只是 session 窗口**）。只在成功时关——失败的账号常停在登出态，留着窗口便于人工处理。
 - `checkin-all --close-after`：本轮拉起的实例签到成功后立刻关（内存峰值降到 ≈1）。两条路径都**只关本轮由 zenx 拉起的实例**，你自己开着的 Edge 一律保留。
 - `checkin-all --window N`：分组在线上限（默认 8），每组结束时释放该组**本轮拉起的**实例，内存峰值压在窗口大小内。
+- `checkin-all --close-after` 现在也覆盖**前置的 AnyRouter 阶段**（`--anyrouter no` 可跳过该阶段）：它拉起的 Edge 同样会在那个账号结束后立刻释放。
 - 每日脚本 `daily-checkin.ps1`：对本轮 `ensure-online` 拉起的账号自动加 `--close-after`（你自己开着的 Edge 不关，见第 1 节）。
 - **开跑前先预判**（`checkin-all` 与 `daily-checkin.ps1` 都内置）：`zenx accounts pending` 只读账本就知道今天还差谁，已到账的账号**连 Edge 都不拉起**。中断后续跑因此不会从头再花一遍实例和登录配额。`--force` 可跳过预判强行重跑。
 

@@ -582,6 +582,130 @@ test("checkin-all: --close-leftover 开跑前清理遗留实例，不碰账号�
   assert.deepEqual((await readLeftovers(home)).instances, [], "两条记录都应有归宿");
 });
 
+// --- AnyRouter 阶段：checkin-all 默认先跑它，再跑 AgentRouter ---
+
+/** 带 AnyRouter 身份的账号；AgentRouter 侧仍然走通用的 fake runner。 */
+const anyAccounts: Account[] = [
+  { alias: "alpha", instanceId: "aaaa1111", expectedIdentity: "github_1", boundAt: "2026-09-13T00:00:00Z", anyrouterIdentity: "linuxdo_1" },
+  { alias: "beta", instanceId: "bbbb2222", expectedIdentity: "github_2", boundAt: "2026-09-13T00:00:00Z" },
+];
+
+const ANY_CONSOLE = `Any Router\n控制台\nL\nlinuxdo_1\n晚上好，linuxdo_1\n账户数据\n当前余额\n$100.00\n历史消耗\n$10.00`;
+
+/** AnyRouter 会 navigate + evaluate，AgentRouter 那条路径继续用通用 runner。 */
+function anyRunner(): Runner {
+  return (args, options) => {
+    if (args[0] === "navigate") return Promise.resolve({ stdout: "reached=load", exitCode: 0 });
+    if (args[0] === "evaluate") {
+      return Promise.resolve({ stdout: JSON.stringify({ ok: true, tab_id: 7, value: ANY_CONSOLE }), exitCode: 0 });
+    }
+    return runner(args, options);
+  };
+}
+
+/** 按导航目标区分两个站点：AnyRouter 走 anyrouter.top，AgentRouter 走 agentrouter.org。 */
+const siteOf = (args: string[]): string | undefined => {
+  if (args[0] !== "navigate") return undefined;
+  const url = args[1] ?? "";
+  return url.includes("anyrouter.top") ? "anyrouter" : "agentrouter";
+};
+
+test("checkin-all: 默认先跑 AnyRouter 阶段，再跑 AgentRouter", async (t) => {
+  const home = await fixture(t, anyAccounts);
+  const time = clock();
+  const order: string[] = [];
+  const lines: string[] = [];
+  const spy: Runner = (args, options) => {
+    const site = siteOf(args);
+    if (site) order.push(site);
+    return anyRunner()(args, options);
+  };
+  const report = await checkinAll(home, spy, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    maxRetries: 0,
+    windowSize: 0,
+    onProgress: (line) => lines.push(line),
+    ...time,
+    dbFile: tempDb(t),
+  });
+  // AnyRouter 的控制台导航必须排在 AgentRouter 的之前
+  assert.equal(order[0], "anyrouter", `AnyRouter 要先跑，实际顺序：${order.join(" > ")}`);
+  assert.ok(order.includes("agentrouter"), "AgentRouter 阶段也要跑");
+  assert.equal(report.anyrouter?.total, 1, "只有 alpha 绑了 AnyRouter 身份");
+  assert.ok(lines.some((line) => line.includes("AnyRouter 阶段")), "要有一行阶段汇总，便于事后看日志");
+});
+
+test("checkin-all: --anyrouter no 跳过 AnyRouter 阶段", async (t) => {
+  const home = await fixture(t, anyAccounts);
+  const time = clock();
+  const order: string[] = [];
+  const spy: Runner = (args, options) => {
+    if (siteOf(args) === "anyrouter") order.push("anyrouter");
+    return anyRunner()(args, options);
+  };
+  const report = await checkinAll(home, spy, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    maxRetries: 0,
+    windowSize: 0,
+    anyrouter: false,
+    ...time,
+    dbFile: tempDb(t),
+  });
+  assert.deepEqual(order, [], "不该有任何 AnyRouter 动作");
+  assert.equal(report.anyrouter, undefined);
+});
+
+// AnyRouter 失败也是"今天该签的没签上"：整轮 ok 不能是 true，否则脚本会当成全签完了。
+test("checkin-all: AnyRouter 失败让整轮 ok=false", async (t) => {
+  const home = await fixture(t, anyAccounts);
+  const time = clock();
+  const spy: Runner = (args, options) => {
+    // 身份不符 = 签到失败（页面正文不含绑定的 linuxdo_1）
+    if (args[0] === "evaluate") {
+      return Promise.resolve({ stdout: JSON.stringify({ ok: true, tab_id: 7, value: "Any Router 控制台 别人" }), exitCode: 0 });
+    }
+    return anyRunner()(args, options);
+  };
+  const report = await checkinAll(home, spy, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    maxRetries: 0,
+    windowSize: 0,
+    ...time,
+    dbFile: tempDb(t),
+  });
+  assert.equal(report.anyrouter?.failed, 1);
+  assert.equal(report.anyrouter?.ok, false);
+  assert.equal(report.ok, false, "AnyRouter 没签上就不能以 0 收尾");
+});
+
+test("checkin-all: --close-after 传到 AnyRouter 阶段，拉起的实例照样释放", async (t) => {
+  const home = await fixture(t, anyAccounts);
+  const time = clock();
+  const closed: string[] = [];
+  const spy: Runner = (args, options) => {
+    if (args[0] === "browsers" && args[1] === "close") {
+      closed.push(args[3]);
+      return Promise.resolve({ stdout: JSON.stringify({ browser_id: args[3], closed: true, windows_closed: 1, sessions_stopped: 0, disconnected: true }), exitCode: 0 });
+    }
+    return anyRunner()(args, options);
+  };
+  const report = await checkinAll(home, spy, {
+    retryCodes: ["CHECKIN_TIMEOUT"],
+    checkinTimeoutMs: 600,
+    maxRetries: 0,
+    windowSize: 0,
+    closeAfter: true,
+    ...time,
+    dbFile: tempDb(t),
+  });
+  // 两个账号本来就在线（用户自己的 Edge），一个都不该关
+  assert.equal(report.anyrouter?.released, 0);
+  assert.deepEqual(closed, []);
+});
+
 // --- 失败账号的补签：冷却顺带重试 + 收尾补一轮 ---
 
 /**

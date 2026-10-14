@@ -13,6 +13,8 @@ import type { CheckinResult } from "./checkin.ts";
 import { closeBrowser, closeLeftoverInstances, ensureOnline } from "./launch.ts";
 import { recordLaunchedInstance } from "./leftover.ts";
 import { enrichBskTimeout } from "./diagnose.ts";
+import { anyrouterCheckinAll } from "./anyrouter-batch.ts";
+import type { AnyRouterBatchReport } from "./anyrouter-batch.ts";
 
 /**
  * 站点登录限流后的默认冷却区间：15–18 分钟。
@@ -106,6 +108,8 @@ export type CheckinBatchReport = {
   snapshots: { ok: boolean; total: number; saved: number; missing: string[] };
   /** 开跑前的遗留实例清理汇总（仅 --close-leftover 时存在）。 */
   leftoverCleanup?: { tracked: number; closed: number; dropped: number; failed: number };
+  /** 前置的 AnyRouter 阶段汇总（--anyrouter no 时不存在）。 */
+  anyrouter?: AnyRouterBatchReport;
 };
 
 /**
@@ -146,6 +150,13 @@ export async function pendingCheckins(
 }
 
 export type CheckinBatchOptions = {
+  /**
+   * 在 AgentRouter 之前先跑一遍 AnyRouter 签到（默认开启，`false` 可关闭）。
+   *
+   * 顺序不是随意的：AnyRouter 只有两个账号而 AgentRouter 有二十个，先跑便宜的
+   * 那一段，即使后面撞上站点限流要等 15 分钟，钱也已经落袋了。
+   */
+  anyrouter?: boolean;
   /** 限定账号；缺省为 store 里的全部账号。 */
   aliases?: string[];
   checkinTimeoutMs?: number;
@@ -320,6 +331,39 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
   const outcomes = new Map<string, AccountOutcome>();
   const state = await readState(file);
 
+  // 开跑前先清上一轮遗留：那些实例是 zenx 拉起的，只是上次没关掉——不清的话，
+  // 本轮它们会被认成"用户自己的 Edge"而继续占着内存（还可能是卡死超时的根源）。
+  // 必须排在 AnyRouter 阶段之前：那段也会按需拉起 Edge，清晚了就会和它拉起的实例混在一起。
+  let leftoverCleanup: CheckinBatchReport["leftoverCleanup"];
+  if (options.closeLeftover === true) {
+    const cleanup = await closeLeftoverInstances(home, run, DEFAULT_CLOSE_TIMEOUT_MS, options.launchDependencies, onProgress);
+    leftoverCleanup = { tracked: cleanup.tracked, closed: cleanup.closed, dropped: cleanup.dropped, failed: cleanup.failed };
+    if (cleanup.tracked > 0) {
+      onProgress(`遗留实例清理：追踪 ${cleanup.tracked} 个，关闭 ${cleanup.closed} 个，移除记录 ${cleanup.dropped} 个，失败 ${cleanup.failed} 个`);
+    }
+  }
+
+  // AnyRouter 阶段前置：账号少（2 个）、又不消耗站点登录配额，先把这段跑完再动
+  // 那 20 个号——万一后面撞上限流要等 15 分钟，这边的钱已经落袋了。
+  let anyrouterReport: AnyRouterBatchReport | undefined;
+  if (options.anyrouter !== false) {
+    anyrouterReport = await anyrouterCheckinAll(home, run, {
+      timeoutMs: options.checkinTimeoutMs,
+      dbFile: options.dbFile,
+      force: options.force,
+      closeAfter,
+      launchDependencies: options.launchDependencies,
+      onProgress,
+    });
+    if (anyrouterReport.total > 0) {
+      onProgress(
+        `AnyRouter 阶段：共 ${anyrouterReport.total} 个，到账 ${anyrouterReport.credited}，` +
+          `跳过 ${anyrouterReport.skipped}，失败 ${anyrouterReport.failed}` +
+          (closeAfter ? `，释放实例 ${anyrouterReport.released} 个` : ""),
+      );
+    }
+  }
+
   const store = await readStore(home);
   const wanted = options.aliases && options.aliases.length > 0
     ? options.aliases.map((alias) => {
@@ -353,17 +397,6 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
       continue;
     }
     todo.push(account);
-  }
-
-  // 开跑前先清上一轮遗留：那些实例是 zenx 拉起的，只是上次没关掉——不清的话，
-  // 本轮它们会被认成"用户自己的 Edge"而继续占着内存（还可能是卡死超时的根源）。
-  let leftoverCleanup: CheckinBatchReport["leftoverCleanup"];
-  if (options.closeLeftover === true) {
-    const cleanup = await closeLeftoverInstances(home, run, DEFAULT_CLOSE_TIMEOUT_MS, options.launchDependencies, onProgress);
-    leftoverCleanup = { tracked: cleanup.tracked, closed: cleanup.closed, dropped: cleanup.dropped, failed: cleanup.failed };
-    if (cleanup.tracked > 0) {
-      onProgress(`遗留实例清理：追踪 ${cleanup.tracked} 个，关闭 ${cleanup.closed} 个，移除记录 ${cleanup.dropped} 个，失败 ${cleanup.failed} 个`);
-    }
   }
 
   const plan = windowSize > 0 ? chunkAccounts(todo, windowSize) : [todo];
@@ -605,8 +638,11 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
         `到账判定依赖配对快照，缺的账号明天会退化为裸余额差——可用 zenx accounts snapshot <别名> 单独补采（只读，不耗登录配额）。`,
     );
   }
+  // AnyRouter 也是"今天该签的号"，它的失败同样不能让整轮以 0 收尾——否则脚本
+  // 会把"AnyRouter 没签上"当成"全部签完了"。
+  const anyrouterFailed = anyrouterReport?.failed ?? 0;
   return {
-    ok: failed === 0,
+    ok: failed === 0 && anyrouterFailed === 0,
     total: accounts.length,
     credited: accounts.filter((item) => item.credited).length,
     failed,
@@ -624,6 +660,7 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
     stateFile: file,
     snapshots,
     ...(leftoverCleanup ? { leftoverCleanup } : {}),
+    ...(anyrouterReport ? { anyrouter: anyrouterReport } : {}),
   };
 }
 

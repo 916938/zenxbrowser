@@ -640,3 +640,62 @@ test("CLI checkin-all 接受 --close-leftover 并在报告里汇总", async (t) 
   const report = JSON.parse(lines[0]);
   assert.deepEqual(report.leftoverCleanup, { tracked: 0, closed: 0, dropped: 0, failed: 0 });
 });
+
+// checkin-all 默认带上 AnyRouter 阶段：两个站点一条命令签完，不用记两条。
+test("CLI checkin-all 默认带 AnyRouter 阶段的汇总", async (t) => {
+  const home = await temporary(t);
+  await writeFile(join(home, "accounts.json"), JSON.stringify({ version: 1, accounts: [] }));
+  const lines: string[] = [];
+  const inhibit = fakeInhibit();
+  const code = await main(["accounts", "checkin-all", "--json"], {
+    home,
+    output: (line) => lines.push(line),
+    run: async () => ({ stdout: "[]", exitCode: 0 }),
+    inhibitSpawn: inhibit.spawn,
+  });
+  assert.equal(code, 0);
+  const report = JSON.parse(lines[0]);
+  assert.equal(report.anyrouter.total, 0, "没绑 AnyRouter 身份时是空汇总，不是缺字段");
+});
+
+test("CLI checkin-all --anyrouter no 不跑 AnyRouter 阶段", async (t) => {
+  const home = await temporary(t);
+  await writeFile(join(home, "accounts.json"), JSON.stringify({ version: 1, accounts: [] }));
+  const lines: string[] = [];
+  const inhibit = fakeInhibit();
+  const code = await main(["accounts", "checkin-all", "--anyrouter", "no", "--json"], {
+    home,
+    output: (line) => lines.push(line),
+    run: async () => ({ stdout: "[]", exitCode: 0 }),
+    inhibitSpawn: inhibit.spawn,
+  });
+  assert.equal(code, 0);
+  assert.equal(JSON.parse(lines[0]).anyrouter, undefined);
+});
+
+test("CLI checkin-all --anyrouter 只接受 yes / no", async (t) => {
+  const home = await temporary(t);
+  await writeFile(join(home, "accounts.json"), JSON.stringify({ version: 1, accounts: [] }));
+  const lines: string[] = [];
+  const code = await main(["accounts", "checkin-all", "--anyrouter", "maybe", "--json"], {
+    home,
+    output: (line) => lines.push(line),
+    run: async () => ({ stdout: "[]", exitCode: 0 }),
+  });
+  assert.equal(code, 1);
+  assert.equal(JSON.parse(lines[0]).error.code, "INVALID_ARGUMENT");
+});
+
+// 单账号的 anyrouter-checkin-all 不接受 --anyrouter：它是 CLI 层的参数门禁，
+// 拼错了要立刻报错，不能静默忽略。
+test("CLI 其他命令不接受 --anyrouter", async (t) => {
+  const home = await temporary(t);
+  const lines: string[] = [];
+  const code = await main(["accounts", "anyrouter-checkin-all", "--anyrouter", "no", "--json"], {
+    home,
+    output: (line) => lines.push(line),
+    run: async () => ({ stdout: "[]", exitCode: 0 }),
+  });
+  assert.equal(code, 1);
+  assert.equal(JSON.parse(lines[0]).error.code, "INVALID_ARGUMENT");
+});

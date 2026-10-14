@@ -71,7 +71,7 @@ node src/cli.ts --help    # 查看全部用法；也可 npm start -- --help
 | `zenx accounts inspect-site <别名>` | 只读核对登录身份与签到信号 |
 | `zenx accounts checkin <别名>` | 执行完整退出重登签到流程（支持无人值守/计划任务）；`--close-after` 在签到成功后连浏览器实例一起释放 |
 | `zenx accounts login <别名>` | 只补“登录”这一步：把重登失败后停在登出态的账号拉回登录态（不退出、不签到） |
-| `zenx accounts checkin-all` | 批量签到：自动处理站点登录限流（冷却 `--wait`，默认 15–18 分钟随机、且从首次限流起算只补足剩余时间，后重试 `--retries` 次），失败账号顺冷却或收尾再补签一次，`--window`（默认 8）限制同时在线账号数，`--close-after` 逐个释放实例内存；全程开启防休眠（`--inhibit-sleep no` 关闭，`--inhibit-timeout` 设上限） |
+| `zenx accounts checkin-all` | 批量签到：**先跑 AnyRouter 阶段**（默认开，`--anyrouter no` 关闭）再跑 AgentRouter 那二十个号；自动处理站点登录限流（冷却 `--wait`，默认 15–18 分钟随机、且从首次限流起算只补足剩余时间，后重试 `--retries` 次），失败账号顺冷却或收尾再补签一次，`--window`（默认 8）限制同时在线账号数，`--close-after` 逐个释放实例内存（两个阶段都生效）；全程开启防休眠（`--inhibit-sleep no` 关闭，`--inhibit-timeout` 设上限） |
 | `zenx accounts bind-anyrouter <别名> --identity <站点用户名> --confirm` | 给已绑定账号补记 AnyRouter（anyrouter.top）的站点身份 |
 | `zenx accounts anyrouter-checkin <别名>` | AnyRouter 签到：刷新页面即打卡（详见下文） |
 | `zenx accounts anyrouter-checkin-all` | AnyRouter 批量签到：依次处理所有绑定了 AnyRouter 身份的账号（离线按需拉起、已到账的连 Edge 都不拉起、单个失败不中断） |
@@ -252,6 +252,24 @@ node src/cli.ts accounts anyrouter-checkin-all --force    # 已到账的也强�
 - **今天已到账的连 Edge 都不拉起**：预判在拉起之前，省一个 Edge 进程（批量 AgentRouter 刚跑完时内存正紧）。
 - **单个失败不中断后续账号**，最后汇总成功/跳过/失败；`ok` 为 false 表示至少有一个失败。
 - **不做限流冷却与 `--window` 分组**：AnyRouter 刷新不消耗站点登录配额，且账号很少，这两套机制用不上。
+- **`--close-after` 同样有效**（多半是被 `checkin-all` 传下来的）：只关本轮由 zenx 拉起的实例，用户自己的 Edge 保留。
+
+### 一条命令签完两个站点：`zenx accounts checkin-all`
+
+`checkin-all` **默认先跑一遍 AnyRouter 阶段**，再跑 AgentRouter 那二十个号：
+
+```powershell
+node src/cli.ts accounts checkin-all                  # AnyRouter 先签，再签 AgentRouter
+node src/cli.ts accounts checkin-all --anyrouter no   # 只签 AgentRouter
+node src/cli.ts accounts checkin-all --close-after    # 两个阶段都只关自己拉起的实例
+```
+
+顺序是刻意的：AnyRouter 只有两个账号、刷新不消耗站点登录配额，先把它签完，后面万一撞上
+AgentRouter 的限流要等 15 分钟，这边的钱已经落袋了。`--close-leftover` 也排在 AnyRouter
+阶段之前——那段同样会按需拉起 Edge，清晚了就会和新拉起的实例混在一起。
+
+AnyRouter 阶段的汇总写在报告的 `anyrouter` 字段里，它失败会让整轮 `ok=false`（今天该签的没签上，
+不能以 0 收尾）。`anyrouter-checkin-all` 仍然是独立命令，随时可单独手动跑。
 
 ### 每日自动跑：`daily-checkin.ps1`
 

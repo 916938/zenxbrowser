@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { anyrouterCheckinAll } from "../src/anyrouter-batch.ts";
 import { insertCheckin, insertSnapshot } from "../src/db.ts";
+import { readLeftovers } from "../src/leftover.ts";
 import type { Browser, Runner } from "../src/core.ts";
 
 const edge6: Browser = {
@@ -54,6 +55,9 @@ function runner(options: ScriptOptions = {}): Runner {
   let currentInstance = "";
   return async (args) => {
     options.calls?.push(args);
+    if (args[0] === "browsers" && args[1] === "close") {
+      return { stdout: JSON.stringify({ browser_id: args[3], closed: true, windows_closed: 1, sessions_stopped: 0, disconnected: true }), exitCode: 0 };
+    }
     if (args[0] === "browsers") {
       const online = (options.browsers ?? [edge6, edgeP16])
         .filter((b) => !(options.offlineInstanceIds ?? []).includes(b.instance_id));
@@ -196,4 +200,73 @@ test("批量：没有绑定任何 AnyRouter 身份时给出提示而非报错", 
   const report = await anyrouterCheckinAll(home, runner(), { dbFile, onProgress: (l) => lines.push(l) });
   assert.equal(report.total, 0);
   assert.ok(lines.some((l) => l.includes("bind-anyrouter")));
+});
+
+// checkin-all 会把 --close-after 传下来：AnyRouter 那两个号也不能留着占内存。
+// 但这些账号本来就在线（= 用户自己的 Edge），一个都不该关。
+test("批量：--close-after 不关闭本来就在跑的 Edge", async (t) => {
+  const { home, dbFile } = await temporary(t, [account6, accountP16]);
+  const calls: string[][] = [];
+  const report = await anyrouterCheckinAll(home, runner({ calls }), { dbFile, closeAfter: true });
+  assert.equal(report.released, 0);
+  assert.ok(!calls.some((c) => c[0] === "browsers" && c[1] === "close"), "没有本轮拉起的实例可关");
+  assert.equal(report.accounts.every((a) => a.closed === false), true);
+});
+
+// 本轮拉起的实例必须关掉，且关闭后遗留追踪要清除（否则事后会被当成"用户自己的 Edge"）。
+// 给自己开着的那个（edge-p16）保留——关掉它会连标签页和未保存内容一起带走。
+test("批量：--close-after 关掉自己拉起的实例，别人的保留", async (t) => {
+  const { home, dbFile } = await temporary(t, [account6, accountP16]);
+  const userDataDir = join(home, "User Data");
+  const profile = join(userDataDir, "Profile-6");
+  await mkdir(profile, { recursive: true });
+  const edgePath = join(home, "msedge.exe");
+  await writeFile(edgePath, "fake");
+  await writeFile(join(profile, "Preferences"), "{}");
+  await writeFile(join(home, "accounts.json"), JSON.stringify({
+    version: 1,
+    accounts: [
+      { ...account6, launch: { edgePath, userDataDir, profileDirectory: "Profile-6" } },
+      accountP16,
+    ],
+  }));
+  // edge-6 靠 injected launch 拉起；edge-p16 一直在线（= 用户自己的 Edge）。
+  const state = { launched: false, currentInstance: "" };
+  const spy: Runner = (args) => {
+    if (args[0] === "browsers" && args[1] === "close") {
+      state.launched = false;   // 关掉后复核要能看到它离线
+      return Promise.resolve({ stdout: JSON.stringify({ browser_id: args[3], closed: true, windows_closed: 1, sessions_stopped: 0, disconnected: true }), exitCode: 0 });
+    }
+    if (args[0] === "browsers") {
+      const list = [edgeP16];
+      if (state.launched) list.unshift(edge6);
+      return Promise.resolve({ stdout: JSON.stringify(list), exitCode: 0 });
+    }
+    if (args[0] === "session" && args[1] === "start") {
+      const index = args.indexOf("--browser-id");
+      state.currentInstance = index >= 0 ? args[index + 1] : "";
+      return Promise.resolve({ stdout: JSON.stringify({ session_id: "abcd" }), exitCode: 0 });
+    }
+    if (args[0] === "session" && args[1] === "stop") return Promise.resolve({ stdout: "", exitCode: 0 });
+    if (args[0] === "navigate") return Promise.resolve({ stdout: "reached=load", exitCode: 0 });
+    if (args[0] === "evaluate") {
+      return Promise.resolve({ stdout: JSON.stringify({ ok: true, tab_id: 7, value: pageByInstance[state.currentInstance] ?? "" }), exitCode: 0 });
+    }
+    throw new Error(`unexpected args: ${args.join(" ")}`);
+  };
+  const lines: string[] = [];
+  const report = await anyrouterCheckinAll(home, spy, {
+    dbFile,
+    closeAfter: true,
+    launchDependencies: { launch: async () => { state.launched = true; }, platform: "win32", sleep: async () => {} },
+    onProgress: (l) => lines.push(l),
+  });
+  assert.equal(report.released, 1, "只关 edge-6（本轮拉起的那个）");
+  const closed = report.accounts.find((a) => a.alias === "edge-6");
+  assert.equal(closed?.launched, true);
+  assert.equal(closed?.closed, true);
+  assert.equal(report.accounts.find((a) => a.alias === "edge-p16")?.closed, false, "用户自己的 Edge 保留");
+  assert.ok(lines.some((l) => l.includes("非本轮拉起")), "保留要明确说清原因");
+  // 关闭确认后不该再留下遗留记录
+  assert.deepEqual((await readLeftovers(home)).instances, []);
 });

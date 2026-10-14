@@ -47,7 +47,7 @@ const help = `ZenX Browser — Windows Edge 多账号连接台
   zenx accounts anyrouter-checkin <别名> [--timeout 60s] [--force]
   zenx accounts anyrouter-checkin-all [--timeout 60s] [--force]
   zenx accounts checkin <别名> [--timeout 3m] [--force] [--close-after] [--inhibit-sleep yes|no] [--inhibit-timeout 4m]
-  zenx accounts checkin-all [--timeout 3m] [--wait 16m] [--retries 1] [--window 8] [--close-after] [--close-leftover] [--retry-codes CODES] [--inhibit-sleep yes|no] [--inhibit-timeout 4h]
+  zenx accounts checkin-all [--timeout 3m] [--wait 16m] [--retries 1] [--window 8] [--close-after] [--close-leftover] [--retry-codes CODES] [--anyrouter yes|no] [--force] [--inhibit-sleep yes|no] [--inhibit-timeout 4h]
   zenx accounts recheck <别名> [--timeout 45s] [--record yes|no] [--site agentrouter|anyrouter]
   zenx accounts snapshot <别名> [--timeout 45s] [--site agentrouter|anyrouter]
   zenx accounts snapshot --all [--timeout 45s] [--site agentrouter|anyrouter]
@@ -80,7 +80,8 @@ close-all 逐个关闭全部绑定账号的 Edge 实例：离线的跳过，单�
   browser.close）不中断后续账号，最后统一汇总；同样需要 --confirm。
 close-leftover 只清理由 zenx 拉起但没关掉的遗留实例（记录在 .zenx/leftover-instances.json）：
   实例已离线、或实例 ID 已改绑给其他账号的记录直接移除，绝不误关；关闭失败的保留记录并
-  写明原因，下次重跑还会再试。checkin-all 加 --close-leftover 可在开跑前自动做这次清理。
+  写明原因，下次重跑还会再试。checkin-all 加 --close-leftover 可在开跑前自动做这次清理
+  （在 AnyRouter 阶段之前：那段也会按需拉起 Edge，清晚了就会和新拉起的实例混在一起）。
 不显式打开空白窗口；Edge 自身启动设置仍可能恢复窗口或新标签，无法保证消除。
 open-site 本期仅支持 https://agentrouter.org/；先查找并切换用户已有标签，无匹配才新建。
 多个候选仅在唯一 active 匹配时自动选择，否则用 --tab-id 明确选择；错误候选不新建。
@@ -136,6 +137,11 @@ anyrouter-checkin-all 依次给**所有绑定了 AnyRouter 身份**的账号签�
   不做限流冷却与分组——刷新不消耗登录配额，且账号很少。--force 强制刷新已到账的账号。
 login 只补"登录"这一步（不退出、不签到）：用于 checkin 在重登阶段失败后账号停在登出态、
   因而连 checkin 都无法再启动的自救；已登录则原样返回，不动账号状态。
+checkin-all **先跑 AnyRouter 阶段**（anyrouter.top，默认开，--anyrouter no 关闭），再跑
+  AgentRouter 那二十个号；顺序是刻意的：AnyRouter 只有两个账号、刷新不消耗登录配额，
+  先把它签完，后面万一撞上限流要等 15 分钟，这边的钱已经落袋了。AnyRouter 阶段同样
+  受 --close-after 约束（只关它自己拉起的实例），汇总写在报告的 anyrouter 字段里，
+  它失败会让整轮 ok=false。--force 对两个阶段同时生效。
 checkin-all 依次处理全部账号，并自动处理站点登录限流：命中限流/登录超时的账号记录等待起点，
   冷却 --wait（默认 15–18 分钟随机）后自动重试 --retries 次（默认 1）；冷却从首次限流起算，
   中途再撞限流只补足剩下的时间，已经等够就直接重试。失败的账号还会再补签一次：
@@ -225,13 +231,18 @@ function parseWindow(value?: string): number | undefined {
   return size;
 }
 
-/** recheck 是否补记账本：`--record yes`（默认）/ `--record no`。 */
-function parseRecordFlag(value?: string): boolean {
-  if (value === undefined) return true;
+/** 通用 yes/no 开关解析；缺省由调用方给出。 */
+function parseYesNo(value: string | undefined, label: string, noValues: string[] = ["no", "n", "false", "off", "0"]): boolean | undefined {
+  if (value === undefined) return undefined;
   const normalized = value.trim().toLowerCase();
   if (["yes", "y", "true", "on", "1"].includes(normalized)) return true;
-  if (["no", "n", "false", "off", "0", "skip"].includes(normalized)) return false;
-  throw new ZenxError("INVALID_ARGUMENT", "--record 只接受 yes / no。");
+  if (noValues.includes(normalized)) return false;
+  throw new ZenxError("INVALID_ARGUMENT", `${label} 只接受 yes / no。`);
+}
+
+/** recheck 是否补记账本：`--record yes`（默认）/ `--record no`。 */
+function parseRecordFlag(value?: string): boolean {
+  return parseYesNo(value, "--record", ["no", "n", "false", "off", "0", "skip"]) ?? true;
 }
 
 function parseRetryCodes(value?: string): string[] | undefined {
@@ -346,6 +357,8 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
         open: { type: "boolean" },
         "inhibit-sleep": { type: "string" },
         "inhibit-timeout": { type: "string" },
+        /** checkin-all 是否先跑 AnyRouter 阶段：`--anyrouter no` 关闭。 */
+        anyrouter: { type: "string" },
       },
     });
     const { values, positionals, tokens } = parsed;
@@ -385,7 +398,7 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     if (loggingIn) allowed.add("timeout");
     if (bindingAnyRouter) for (const key of ["identity", "confirm"]) allowed.add(key);
     if (checkingInAnyRouter || checkingInAnyRouterAll) for (const key of ["timeout", "force"]) allowed.add(key);
-    if (checkingInAll) for (const key of ["timeout", "wait", "retries", "retry-codes", "close-after", "close-leftover", "window", "inhibit-sleep", "inhibit-timeout"]) allowed.add(key);
+    if (checkingInAll) for (const key of ["timeout", "wait", "retries", "retry-codes", "close-after", "close-leftover", "window", "inhibit-sleep", "inhibit-timeout", "anyrouter", "force"]) allowed.add(key);
     if (checkingIn) for (const key of ["timeout", "force", "inhibit-sleep", "inhibit-timeout", "close-after"]) allowed.add(key);
     if (relinking || closing) allowed.add("confirm");
     if (closingAll || closingLeftover) for (const key of ["confirm", "timeout"]) allowed.add(key);
@@ -492,6 +505,9 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
           closeAfter: values["close-after"] === true,
           closeLeftover: values["close-leftover"] === true,
           windowSize: parseWindow(values.window),
+          // 默认先跑 AnyRouter 那两个号，再跑 AgentRouter 这二十个。
+          anyrouter: parseYesNo(values.anyrouter as string | undefined, "--anyrouter") ?? true,
+          force: values.force === true,
           launchDependencies: dependencies.launchDependencies,
           dbFile: dependencies.snapshotDbFile,
           onProgress: progress,

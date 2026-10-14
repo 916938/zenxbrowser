@@ -240,9 +240,11 @@ for ($i = 0; $i -lt $aliases.Count; $i++) {
 
 # AnyRouter (anyrouter.top) - a DIFFERENT site from AgentRouter above.
 # Same Edge profiles, but different site accounts and a separate balance pool,
-# so it is tracked under "<alias>@anyrouter" in the ledger and signed in with its
-# own command. Signing in here is just a page refresh: it does NOT consume the
-# AgentRouter login quota, so none of the cool-down logic above applies.
+# so it is tracked under "<alias>@anyrouter" in the ledger.
+# This script drives each AgentRouter account itself (it needs its own login-quota
+# cool-down and failed-list bookkeeping), so the AnyRouter stage is invoked here
+# separately. `zenx accounts checkin-all` runs it inline now, first thing before
+# the AgentRouter accounts - keep this call so the script's own flow is unchanged.
 # Accounts come from accounts.json (whichever are bound with bind-anyrouter),
 # not from a parallel list, so binding a new account is all it takes to add one.
 Add-Content -Path $log -Encoding UTF8 -Value "`n===== $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') anyrouter checkin ====="
