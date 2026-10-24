@@ -78,6 +78,12 @@ export type AccountOutcome = {
   /** 本次自动快照的结果（saved/reused/incomplete/failed）；未采集时为 undefined。 */
   snapshot?: AutomaticSnapshotResult;
   /**
+   * 这次记为到账，但**没有增量凭证**：余额/消耗读不出来，只凭页面的"签到成功"
+   * 提示判定。钱大概率到了（站点每天只在登录时发这一笔），但没核对过——
+   * 汇总要点名，让人一眼看出该复核，而不是混在"到账 N 个"里。
+   */
+  unconfirmed?: boolean;
+  /**
    * 该账号的 Edge 是否由本轮（含前面的轮次）拉起、且尚未关闭。
    * false 表示它本来就在跑（用户自己的）——只关自己拉起的实例是硬约束。
    */
@@ -142,6 +148,15 @@ export function summarizeBatchReport(report: CheckinBatchReport): string[] {
   const failures = report.accounts.filter((item) => !item.ok);
   if (failures.length > 0) {
     lines.push(`需要处理的账号：${failures.map((item) => `${item.alias}（${item.code ?? "UNKNOWN"}）`).join("、")}`);
+  }
+  // 疑似到账单列：它算在"到账"里，但没有增量凭证（页面余额读不到，只凭提示判定）。
+  // 混在到账数字里等于告诉人"签上了"，实际这几个恰恰是要人工复核的。
+  const unconfirmed = report.accounts.filter((item) => item.unconfirmed === true && item.ok);
+  if (unconfirmed.length > 0) {
+    lines.push(
+      `未确认到账（凭页面提示判定，未核对到增量）：${unconfirmed.map((item) => item.alias).join("、")}` +
+        `；用 zenx accounts recheck <别名> 复核，确要重签用 zenx accounts checkin <别名> --force。`,
+    );
   }
   if (anyrouter && anyrouter.failed > 0) {
     const failedNames = anyrouter.accounts.filter((item) => !item.ok).map((item) => `${item.alias}（${item.code ?? "UNKNOWN"}）`);
@@ -486,6 +501,18 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
    * 会被算成已经等够了，一次都不等就再撞一次墙。
    */
   let limitedSince: number | null = null;
+  /**
+   * 整轮兜底名单：**一次都没真正尝试过**的账号。
+   *
+   * 为什么不能只靠 retryPool：限流会把同组剩下的账号整批推迟，若之后又赶上重试
+   * 上限（`round > maxRetries` 直接 break），它们连一条失败记录都没有就被整轮丢下——
+   * 汇总里只是"未尝试"，既不像失败那样点名，也没有任何尝试痕迹，只能靠人手工再跑。
+   * 反复失败且已用尽重试次数的账号**不**在这里补：maxRetries 是调用方设的上限，
+   * 收尾再悄悄加一轮等于把它架空。
+   */
+  const unresolved = new Map<string, Account>();
+  /** 兜底只做一次：补签组自己再失败时不能无限追加新组。 */
+  let sweepDone = false;
 
   /** 从补签队列取出最多 limit 个账号；exclude 里已有的（本组剩余账号）跳过。 */
   const takeFromPool = (limit: number, exclude: Account[]): Account[] => {
@@ -527,6 +554,9 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
 
   for (let groupIndex = 0; groupIndex < plan.length; groupIndex++) {
     const group = plan[groupIndex];
+    // 兜底组是"最后再试一次"，不再为它等一轮限流冷却——本轮已经为这些账号等过一次，
+    // 再等十几分钟换来的通常还是同一个结果，而整轮时长会翻倍。
+    const isSweepGroup = sweepDone;
     if (plan.length > 1) {
       onProgress(`[组 ${groupIndex + 1}/${plan.length}] ${group.length} 个账号（同时在线上限 ${windowSize}）`);
     }
@@ -555,7 +585,15 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
           // 真拿到当日额度= 站点的共享配额确实已经恢复：限流窗口就此结束，
           // 之后再来一次限流就从那一刻重新计冷却。
           if (outcome.credited) limitedSince = null;
-          onProgress(`${account.alias}: ${outcome.skipped ? `跳过（${outcome.skipped}）` : `已到账 ${outcome.balanceBefore} → ${outcome.balanceAfter}`}`);
+          // 疑似到账必须和确认到账分开说：两者在汇总里都是"到账"，但前者没有凭证，
+          // 屏幕上都写成"已到账"的话，真正要人工核对的那几个会被淹没。
+          onProgress(
+            outcome.skipped
+              ? `${account.alias}: 跳过（${outcome.skipped}）`
+              : outcome.unconfirmed === true
+                ? `${account.alias}: 疑似到账，未确认（读不到余额/消耗，${outcome.balanceBefore} → ${outcome.balanceAfter}）——建议 recheck 复核`
+                : `${account.alias}: 已到账 ${outcome.balanceBefore} → ${outcome.balanceAfter}`,
+          );
           continue;
         }
         onProgress(`${account.alias}: 失败 ${outcome.code ?? "UNKNOWN"} — ${outcome.message ?? ""}`);
@@ -590,6 +628,10 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
           );
           break;
         }
+      }
+      if (isSweepGroup && deferred.length > 0) {
+        onProgress(`收尾补签再撞站点限流，不再等待冷却：${deferred.map((item) => item.alias).join(", ")}`);
+        break;
       }
       if (deferred.length === 0 || round > maxRetries) break;
       const coolStart = now();
@@ -663,13 +705,33 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
       }
     }
 
-    // 收尾补签：所有账号都跑完了，还有失败过且重试次数没用完的账号，就再给它们一轮。
+    // 这组结束时把**一次都没真正尝试过**的账号收进兜底名单：前序账号撞上限流会把
+    // 同组剩下的账号整批推迟，若之后又赶上重试上限（`round > maxRetries`），它们连
+    // 一条失败记录都没有就被整轮丢下——既不在失败名单里，也没有任何尝试痕迹。
+    // 反复失败但已用尽重试次数的账号不在这里补：maxRetries 是调用方设的上限，
+    // 收尾再悄悄加一轮等于把它架空。
+    for (const account of handled) {
+      if (!outcomes.has(account.alias)) unresolved.set(account.alias, account);
+      else if (outcomes.get(account.alias)?.ok === true) unresolved.delete(account.alias);
+    }
+
+    // 收尾补签：所有账号都跑完了，还有没签上的账号就再给它们一轮。
     // 撞上限流的在冷却时已经顺带重试过（那时已从队列取走）；这里兜住的是"整轮都没限流"
     // 的情形——例如开头几个账号卡在 BSK_TIMEOUT，后面一路顺利，它们本该再试一次。
-    if (groupIndex === plan.length - 1 && retryPool.size > 0) {
-      const extra = takeFromPool(Number.POSITIVE_INFINITY, []);
-      onProgress(`收尾补签：${extra.length} 个账号本轮失败过，再试一次：${extra.map((item) => item.alias).join(", ")}`);
-      plan.push(...(windowSize > 0 ? chunkAccounts(extra, windowSize) : [extra]));
+    // 名单 = 补签队列里剩下的，加上那些一次都没轮到的账号。
+    if (groupIndex === plan.length - 1 && !sweepDone) {
+      const extra = new Map<string, Account>();
+      for (const [alias, account] of retryPool) extra.set(alias, account);
+      for (const [alias, account] of unresolved) extra.set(alias, account);
+      for (const alias of [...extra.keys()]) {
+        if (outcomes.get(alias)?.ok === true) extra.delete(alias);
+      }
+      if (extra.size > 0) {
+        sweepDone = true;
+        const list = [...extra.values()];
+        onProgress(`收尾补签：${list.length} 个账号仍未签上，最后再试一次：${list.map((item) => item.alias).join(", ")}`);
+        plan.push(...(windowSize > 0 ? chunkAccounts(list, windowSize) : [list]));
+      }
     }
   }
 
@@ -812,6 +874,8 @@ async function runOne(
       });
     }
     if (result.closed === true) context.ours.delete(account.alias);
+    // 走到文本信号判"到账"的那条路径：算已到账，但没有增量凭证（余额读不出来）。
+    const unconfirmed = result.unconfirmed === true;
     return {
       ...base(),
       launched,
@@ -821,7 +885,12 @@ async function runOne(
       balanceBefore: result.balanceBefore,
       balanceAfter: result.balanceAfter,
       code: result.code,
-      message: result.code === "CHECKIN_UNCONFIRMED" ? "流程跑完但未确认到账；用 zenx accounts recheck 核对。" : undefined,
+      ...(unconfirmed ? { unconfirmed: true } : {}),
+      message: unconfirmed
+        ? "已入账但未确认：余额/消耗读不出来，只凭页面提示判定；用 zenx accounts recheck 复核。"
+        : result.code === "CHECKIN_UNCONFIRMED"
+          ? "流程跑完但未确认到账；用 zenx accounts recheck 核对。"
+          : undefined,
       // 签到成功时 --close-after 已经关掉了实例：如实回传，免得收尾再关一次
       // 然后报一堆 INSTANCE_OFFLINE。
       closed: result.closed === true,

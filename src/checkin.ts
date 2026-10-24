@@ -487,6 +487,12 @@ export type CheckinResult = {
   checkinCredited: boolean;
   /** 流程跑完但未确认到账（余额未增长且无提示）。 */
   code?: string;
+  /**
+   * 记为到账，但**没有增量凭证**：余额/消耗读不出来算不出 Δ，只凭页面的
+   * "签到成功"提示判定。钱大概率到了（站点每天只在登录时发这一笔），
+   * 但没人核对过——汇总要点名，让人能一眼看出该用 recheck 复核。
+   */
+  unconfirmed?: boolean;
   /** 当天已到账/已签到而跳过退出重登；跳过不入账（不是一次签到）。 */
   skipped?: "already_credited_today" | "already_checked_in";
   /** --close-after 是否真的关掉了浏览器实例（未开该选项时为 undefined）。 */
@@ -741,7 +747,19 @@ async function runCheckinSteps(
 
   // 按输入通道分发：cdp 用 ref + bsk 命令，dom 用标签文本 + 页面内事件。
   const clickTarget = async (page: SessionPage, ref: string) => {
-    if (mode === "cdp") return clickRef(run, sessionId, ref, remaining);
+    if (mode === "cdp") {
+      try {
+        return await clickRef(run, sessionId, ref, remaining);
+      } catch (error) {
+        // ref 点击失败最常见的原因是页面重渲染后 ref 失效（实测 edge-9：整轮两次都
+        // 卡在点 @e4，最后只能靠人手工再跑一遍）。此时按钮还在页面上，按标签文本
+        // 直接派发事件即可——两条路都不通才算真的失败。预算耗尽的超时不重试。
+        if (!(error instanceof ZenxError) || error.code !== "SESSION_CLICK_FAILED") throw error;
+        const label = labelOfRef(page, ref);
+        if (!label) throw error;
+        return domInteract(run, sessionId, "click", label, remaining);
+      }
+    }
     const label = labelOfRef(page, ref);
     if (!label) throw new ZenxError("DOM_INTERACT_FAILED", `无法取得 ${ref} 的标签文本；停止，不重试。`);
     return domInteract(run, sessionId, "click", label, remaining);
@@ -812,18 +830,24 @@ async function runCheckinSteps(
    * 最新的余额观测点、且足够新（≤ MAX_BASELINE_AGE_MS）时才采用，否则丢弃、退化为
    * 只比余额。理由见 db.lastPairedSnapshotBefore：基准错配会把别的时段的发放
    * 重复计进 Δ消耗，凭空凑出一笔不存在的到账。
+   *
+   * `fresh` 说的是**余额基准本身**够不够新（同一条年龄线）。它单独返回是因为
+   * "相对基线有正净增"这条判据同样受基准年龄支配：基准停更几天后，窗口里裹进的
+   * 是这几天的全部发放，净增照样为正——拿它判定"今天的额度已经发过了"会让账号
+   * 当天什么动作都不做就记为已到账（见 ⑤d）。
    */
-  const readBaseline = (): { balance: number | null; totalSpent: number | null } => {
+  const readBaseline = (): { balance: number | null; totalSpent: number | null; fresh: boolean } => {
     try {
       const at = wallNow();
       const { start } = todayUtcRange(at);
       const latest = lastBalancePointBefore(account.alias, start, dbFile);
       const paired = lastPairedSnapshotBefore(account.alias, start, dbFile);
-      const fresh = paired !== null && at.getTime() - Date.parse(paired.time) <= MAX_BASELINE_AGE_MS;
-      const usable = paired !== null && fresh && latest !== null && paired.time === latest.time;
-      return { balance: latest?.balance ?? null, totalSpent: usable ? paired.totalSpent : null };
+      const pairedFresh = paired !== null && at.getTime() - Date.parse(paired.time) <= MAX_BASELINE_AGE_MS;
+      const usable = paired !== null && pairedFresh && latest !== null && paired.time === latest.time;
+      const fresh = latest !== null && at.getTime() - Date.parse(latest.time) <= MAX_BASELINE_AGE_MS;
+      return { balance: latest?.balance ?? null, totalSpent: usable ? paired.totalSpent : null, fresh };
     } catch {
-      return { balance: null, totalSpent: null };
+      return { balance: null, totalSpent: null, fresh: false };
     }
   };
 
@@ -906,7 +930,13 @@ async function runCheckinSteps(
   // 来自今天那笔发放——要求净增满 25 等于要求当天零消耗。实测 edge-9（2026-10-07）：
   // 发放 25、当天消耗 14.68、净增只剩 10.32，够不到 25 就连跑 4 次全判
   // CHECKIN_UNCONFIRMED。误判上限仍是"当天有人手动充过值"，与 recheck 同源。
-  if (force !== true && !restoredByLogin && hasCreditSince(baseline.balance, balanceBefore)) {
+  // 基线必须新鲜（≤ MAX_BASELINE_AGE_MS）才敢走这条短路：判据是"相对基线的正净增"，
+  // 而净增只说明**这段窗口里发过钱**，不说明是今天发的。基准停更三天后，那三天的
+  // 发放都会落进窗口里，净值照样为正——此时收工等于当天根本不做签到动作却记已到账，
+  // 第二天再被"今天已到账"跳过，账号连着几天静默漏签（它既不会出现在失败名单里，
+  // 也不会被重新尝试）。基准不新鲜就老老实实走退出重登：真做一次签到，⑧ 用页面读数
+  // 核对，不依赖基线。
+  if (force !== true && !restoredByLogin && baseline.fresh && hasCreditSince(baseline.balance, balanceBefore)) {
     return finish({
       ok: true,
       alias: account.alias,
@@ -1057,6 +1087,10 @@ async function runCheckinSteps(
       code: "CHECKIN_UNCONFIRMED",
     }, page);
   }
+  // 走文本信号判的"到账"必须如实标未确认：它在账本里与核对过增量的到账长得
+  // 一模一样（credited=1、无错误码），屏幕上却都写成"已到账"，真正要人工核对的
+  // 那几个就混在数字里看不见了。标记只落在本次结果上——账本仍照常入账，否则
+  // 这类账号会一直挂在"今天还没签"里被反复重登，直到撞上站点登录限流。
   return finish({
     ok: true,
     alias: account.alias,
@@ -1065,5 +1099,6 @@ async function runCheckinSteps(
     balanceBefore,
     balanceAfter,
     checkinCredited: true,
+    ...(creditDelta === null ? { unconfirmed: true } : {}),
   }, page);
 }
