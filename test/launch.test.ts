@@ -228,6 +228,30 @@ test("同名标签或其他实例在线仍超时，保留浏览器且不重复�
   assert.equal((await readStore(home)).accounts[0].instanceId, edge.instance_id);
 });
 
+// 回归（2026-11-05 edge-3 实况）：拉起 Edge 后实例一直连不上时，ensureOnline 只会抛
+// PROFILE_CONNECT_TIMEOUT，调用方拿不到返回值里的 launched=true。钩子必须在抛错前
+// 把"这个 Edge 是 zenx 拉起的"交出去，否则它会被当成用户自己的、永远不关。
+test("拉起后连接超时仍触发 onLaunched，本来就在线则不触发", windows, async (t) => {
+  const { home, config } = await fixture(t);
+  await configureLaunch(home, "work", config, true);
+  const time = clock();
+  const launched: string[] = [];
+  await assert.rejects(
+    ensureOnline(home, offline, "work", 700, {
+      ...time,
+      launch: async () => undefined,
+      onLaunched: (id) => { launched.push(id); },
+    }),
+    { code: "PROFILE_CONNECT_TIMEOUT" },
+  );
+  assert.deepEqual(launched, [edge.instance_id], "连接超时前必须交出拉起事实");
+
+  const none: string[] = [];
+  const result = await ensureOnline(home, online, "work", 1000, { onLaunched: (id) => none.push(id) });
+  assert.equal(result.launched, false);
+  assert.deepEqual(none, [], "实例本来就在线，不算 zenx 拉起");
+});
+
 test("初次查询耗尽预算不启动，迟到的在线响应也不成功", windows, async (t) => {
   const { home, config } = await fixture(t);
   await configureLaunch(home, "work", config, true);

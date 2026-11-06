@@ -4,7 +4,9 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { DEFAULT_RETRY_CODES, checkinAll, pendingCheckins, readState, summarizeBatchReport, writeState } from "../src/checkin-batch.ts";
+import { DEFAULT_RETRY_CODES, applyUnconfirmedReview, checkinAll, pendingCheckins, readState, summarizeBatchReport, writeState } from "../src/checkin-batch.ts";
+import type { AccountOutcome, UnconfirmedReview } from "../src/checkin-batch.ts";
+import type { CheckinDependencies } from "../src/checkin.ts";
 import { openDatabase } from "../src/db.ts";
 import { readLeftovers, recordLaunchedInstance } from "../src/leftover.ts";
 import type { Account, Browser, Result, Runner } from "../src/core.ts";
@@ -993,4 +995,206 @@ test("checkin-all: 上一轮拉起、这一轮仍在线的实例照常回收", a
   assert.equal(report.accounts.find((item) => item.alias === "alpha")?.launched, true, "alpha 的 Edge 是本轮拉起的");
   assert.deepEqual(closeCalls, ["aaaa1111"], "alpha 是 zenx 拉起的，重试轮结束照样关掉");
   assert.equal(report.released, 1);
+});
+
+// ---------------------------------------------------------------------------
+// 未确认到账的只读复核（2026-11-05 实测）：账本断档 6 天让 ⑤d 的 48h 新鲜度
+// 门槛整体失效；当天早些时候登录已经发过额度时，本次重登余额必然纹丝不动，
+// 于是几个号反复报 CHECKIN_UNCONFIRMED，被收尾补签一遍遍重登直到撞限流。
+// ---------------------------------------------------------------------------
+
+/** 只产出"流程跑完但未确认到账"的签到替身，并记下收到的依赖。 */
+function fakeUnconfirmedCheckin(seen: CheckinDependencies[]): typeof checkinAccount {
+  return (async (
+    _home: string, _run: Runner, alias: string, _timeout: number, deps: CheckinDependencies,
+  ) => {
+    seen.push(deps);
+    return {
+      ok: false, alias, instanceId: "aaaa1111", identity: "github_1",
+      balanceBefore: 1291.39, balanceAfter: 1291.39,
+      checkinCredited: false, code: "CHECKIN_UNCONFIRMED",
+    };
+  }) as unknown as typeof checkinAccount;
+}
+
+const unconfirmedOutcome = (overrides: Partial<AccountOutcome> = {}): AccountOutcome => ({
+  alias: "alpha", ok: false, code: "CHECKIN_UNCONFIRMED", credited: false,
+  attempts: 1, rateLimited: false, balanceBefore: 1291.39, balanceAfter: 1291.39,
+  closed: false, ...overrides,
+});
+
+test("applyUnconfirmedReview: 只纠偏 CHECKIN_UNCONFIRMED 且复核判 credited 的结果", () => {
+  const base = unconfirmedOutcome();
+  const fixed = applyUnconfirmedReview(base, { verdict: "credited", balanceDelta: 25, baselineBalance: 1266.39 });
+  assert.equal(fixed.ok, true);
+  assert.equal(fixed.credited, true);
+  assert.equal(fixed.recoveredByRecheck, true);
+  assert.equal(fixed.code, undefined);
+  assert.equal(fixed.balanceAfter, 1291.39, "余额读数如实保留，不粉饰");
+  assert.equal(base.ok, false, "不得就地改写原结果");
+
+  assert.equal(applyUnconfirmedReview(base, { verdict: "not_credited" }), base, "复核未确认要保留原判");
+  assert.equal(applyUnconfirmedReview(base, { verdict: "unknown" }), base, "复核不可用要保留原判");
+  const identity = unconfirmedOutcome({ code: "IDENTITY_MISMATCH" });
+  assert.equal(applyUnconfirmedReview(identity, { verdict: "credited" }), identity, "别的故障不能被复核洗掉");
+  const ok = unconfirmedOutcome({ ok: true, code: undefined, credited: true });
+  assert.equal(applyUnconfirmedReview(ok, { verdict: "credited" }), ok, "成功结果不动");
+});
+
+test("checkin-all: CHECKIN_UNCONFIRMED 复核确认到账后纠偏，不再补签重登", async (t) => {
+  const home = await fixture(t, [accounts[0]]);
+  const time = clock();
+  const seen: string[] = [];
+  const deps: CheckinDependencies[] = [];
+  const progress: string[] = [];
+  const report = await checkinAll(home, runner, {
+    ...time,
+    dbFile: tempDb(t),
+    anyrouter: false,
+    windowSize: 0,
+    maxRetries: 0,
+    runCheckin: fakeUnconfirmedCheckin(deps),
+    reviewUnconfirmed: async (alias): Promise<UnconfirmedReview> => {
+      seen.push(alias);
+      return { verdict: "credited", balanceDelta: 25, baselineBalance: 1266.39 };
+    },
+    onProgress: (line) => progress.push(line),
+  });
+  assert.deepEqual(seen, ["alpha"], "只对未确认到账的账号复核一次");
+  const alpha = report.accounts[0];
+  assert.equal(alpha.ok, true);
+  assert.equal(alpha.credited, true);
+  assert.equal(alpha.recoveredByRecheck, true);
+  assert.equal(alpha.attempts, 1, "确认到账后不得再进收尾补签重复登录");
+  assert.equal(report.rounds, 1);
+  assert.equal(report.failed, 0);
+  assert.equal(report.ok, true);
+  assert.ok(summarizeBatchReport(report).some((line) => line.includes("复核确认到账") && line.includes("alpha")));
+  assert.ok(progress.some((line) => line.includes("只读复核确认今日已到账")));
+  assert.equal(deps[0]?.deferCloseOnUnconfirmed, true, "复核前不能抢先关掉实例");
+});
+
+test("checkin-all: 复核未确认到账时保留原判，仍按原逻辑补签", async (t) => {
+  const home = await fixture(t, [accounts[0]]);
+  const time = clock();
+  const progress: string[] = [];
+  const report = await checkinAll(home, runner, {
+    ...time,
+    dbFile: tempDb(t),
+    anyrouter: false,
+    windowSize: 0,
+    maxRetries: 1,
+    runCheckin: fakeUnconfirmedCheckin([]),
+    reviewUnconfirmed: async (): Promise<UnconfirmedReview> => ({ verdict: "not_credited", balanceDelta: 0 }),
+    onProgress: (line) => progress.push(line),
+  });
+  const alpha = report.accounts[0];
+  assert.equal(alpha.ok, false);
+  assert.equal(alpha.code, "CHECKIN_UNCONFIRMED");
+  assert.equal(alpha.recoveredByRecheck, undefined);
+  assert.ok(alpha.attempts >= 2, "未确认仍要按原逻辑补签一次");
+  assert.ok(progress.some((line) => line.includes("复核未确认到账")));
+  assert.ok(summarizeBatchReport(report).some((line) => line.includes("需要处理的账号")));
+});
+
+test("checkin-all: 复核自身抛错不能改变签到结论", async (t) => {
+  const home = await fixture(t, [accounts[0]]);
+  const time = clock();
+  const report = await checkinAll(home, runner, {
+    ...time,
+    dbFile: tempDb(t),
+    anyrouter: false,
+    windowSize: 0,
+    maxRetries: 0,
+    runCheckin: fakeUnconfirmedCheckin([]),
+    reviewUnconfirmed: async () => { throw new Error("bsk offline"); },
+  });
+  assert.equal(report.accounts[0]?.ok, false);
+  assert.equal(report.accounts[0]?.code, "CHECKIN_UNCONFIRMED");
+  assert.equal(report.failed, 1);
+});
+
+// 回归（2026-11-05 edge-3 实况）：ensure-online 拉起 Edge 后实例一直连不上，
+// 抛 PROFILE_CONNECT_TIMEOUT。旧代码只在 ensureOnline 成功返回时登记 ours / leftover，
+// 于是这个刚拉起的 Edge 被报成"用户自己的"保留不关，每失败一轮就多留一个进程。
+test("checkin-all: 连接超时但已拉起 Edge 时仍登记为本轮实例", async (t) => {
+  const home = await fixture(t, [accounts[0]]);
+  const launch = await launchable(home, "alpha");
+  await writeFile(
+    join(home, "accounts.json"),
+    JSON.stringify({ version: 1, accounts: [{ ...accounts[0], launch }] }),
+  );
+  const launchedIds: string[] = [];
+  // 实例永远不在线：ensure-online 只拉起一次，然后一直等到预算耗尽。
+  const spy: Runner = (args, options) => {
+    if (args[0] === "browsers") return Promise.resolve({ stdout: "[]", exitCode: 0 });
+    return runner(args, options);
+  };
+  const time = clock();
+  const report = await checkinAll(home, spy, {
+    ...time,
+    dbFile: tempDb(t),
+    anyrouter: false,
+    windowSize: 0,
+    maxRetries: 0,
+    ensureTimeoutMs: 700,
+    launchDependencies: {
+      launch: async () => {},
+      platform: "win32",
+      now: time.now,
+      sleep: time.sleep,
+      onLaunched: (id) => { launchedIds.push(id); },
+    },
+  });
+  const alpha = report.accounts[0];
+  assert.equal(alpha.code, "PROFILE_CONNECT_TIMEOUT");
+  assert.equal(alpha.launched, true, "本轮确实拉起过 Edge，必须如实标出");
+  assert.deepEqual(launchedIds, ["aaaa1111"], "调用方注入的拉起钩子也要被链式触发");
+  assert.deepEqual(
+    (await readLeftovers(home)).instances.map((item) => item.alias),
+    ["alpha"],
+    "拉起事实必须落盘，事后 close-leftover 才认得出",
+  );
+});
+
+// 回归（2026-11-05 实况）：账本 10-31~11-04 五天空白，所有账号的余额基准停在
+// 10-30（约 138 小时前），⑤d 的 48h 门槛对全部 20 个账号失效。旧日志只说
+// "当日快照缺 5 个"，看不出真正让判定降级的是基线断档。
+test("checkin-all: 余额基线停更超过 48 小时时收尾点名并给出恢复办法", async (t) => {
+  const home = await fixture(t, [accounts[0]]);
+  const dbFile = tempDb(t);
+  seedCredited(dbFile, "alpha", "aaaa1111", new Date("2026-10-30T16:00:00Z"));
+  const time = clock(Date.parse("2026-11-05T10:00:00Z"));
+  const progress: string[] = [];
+  await checkinAll(home, runner, {
+    ...time,
+    dbFile,
+    anyrouter: false,
+    windowSize: 0,
+    maxRetries: 0,
+    checkinTimeoutMs: 600,
+    onProgress: (line) => progress.push(line),
+  });
+  const line = progress.find((item) => item.includes("余额基线已停更"));
+  assert.ok(line, "基线断档必须显式报出来");
+  assert.match(line, /alpha/);
+  assert.match(line, /snapshot --all/);
+});
+
+test("checkin-all: 余额基线新鲜时不误报断档", async (t) => {
+  const home = await fixture(t, [accounts[0]]);
+  const dbFile = tempDb(t);
+  seedCredited(dbFile, "alpha", "aaaa1111", new Date("2026-11-04T10:00:00Z"));
+  const time = clock(Date.parse("2026-11-05T10:00:00Z"));
+  const progress: string[] = [];
+  await checkinAll(home, runner, {
+    ...time,
+    dbFile,
+    anyrouter: false,
+    windowSize: 0,
+    maxRetries: 0,
+    checkinTimeoutMs: 600,
+    onProgress: (line) => progress.push(line),
+  });
+  assert.ok(!progress.some((item) => item.includes("余额基线已停更")), "24 小时内的基线不该报警");
 });

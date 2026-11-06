@@ -26,6 +26,14 @@ export type LaunchDependencies = {
   readProfileAccount?: (userDataDir: string, profileDirectory: string) => Promise<{ accountId: string; profileName: string }>;
   /** 可用物理内存（字节）的读取钩子；默认 `os.freemem()`，测试据此注入。 */
   freeMemory?: () => number;
+  /**
+   * Edge 已拉起但还没等实例连上时触发（拿到的是账号当前绑定的实例 ID）。
+   *
+   * 调用方据此登记"这是 zenx 拉起的实例"。必须在拉起之后、等待连接之前通知：
+   * 连接可能超时（扩展被禁用/实例 ID 变化），此时 ensureOnline 只会抛错、拿不到
+   * 返回值 launched=true，这个 Edge 就会被当成"用户自己的"永远保留。
+   */
+  onLaunched?: (instanceId: string) => void | Promise<void>;
 };
 
 /**
@@ -219,6 +227,9 @@ async function ensureOnlineLocked(store: Store, account: Account, run: Runner, r
       try { await (dependencies.launch ?? launchEdge)({ ...account.launch }); }
       catch { throw new ZenxError("EDGE_LAUNCH_FAILED", "无法启动已配置的 Edge；请检查可执行文件和系统权限，不会重复启动。"); }
       launched = true;
+      // 先通知再等连接：接下来这一步可能一直等到预算耗尽并抛 PROFILE_CONNECT_TIMEOUT，
+      // 那时调用方拿不到 launched=true，若不提前登记，这个刚拉起的 Edge 就再也没人关。
+      await dependencies.onLaunched?.(account.instanceId);
       remaining();
     } else {
       await sleep(Math.min(500, remaining()));

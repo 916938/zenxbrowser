@@ -170,7 +170,16 @@ export async function anyrouterCheckinAll(
     }
 
     try {
-      const online = await ensureOnline(home, run, account.alias, options.timeoutMs ?? 45_000, options.launchDependencies);
+      // 与 AgentRouter 同一条不变量：拉起事实要在 ensureOnline 返回**之前**登记。
+      // 连接超时时它只抛错，下面的成功路径走不到，实例会被当成"用户自己的"漏关。
+      const online = await ensureOnline(home, run, account.alias, options.timeoutMs ?? 45_000, {
+        ...options.launchDependencies,
+        onLaunched: async (instanceId) => {
+          await options.launchDependencies?.onLaunched?.(instanceId);
+          ours.add(account.alias);
+          await recordLaunchedInstance(home, account.alias, instanceId);
+        },
+      });
       if (online.launched === true) {
         ours.add(account.alias);
         // 与 AgentRouter 同一套遗留追踪：拉起事实落盘，事后 close-leftover 才认得出。

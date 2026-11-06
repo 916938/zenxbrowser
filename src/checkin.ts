@@ -32,6 +32,14 @@ export type CheckinDependencies = {
   closeAfter?: boolean;
   /** closeAfter 用的依赖注入（测试替身）。 */
   closeDependencies?: LaunchDependencies;
+  /**
+   * CHECKIN_UNCONFIRMED 时保留实例，把关闭交给调用方。
+   *
+   * 批量层在这种结果上会用 recheck 复核（读账本基线 + 站点状态），复核必须连同一个
+   * 浏览器实例；签到内部若抢先 --close-after，复核只能拿到 offline，永远纠不了偏。
+   * 收尾仍按"本轮拉起"记录回收实例，不会漏关。单账号命令不设此项，行为不变。
+   */
+  deferCloseOnUnconfirmed?: boolean;
 };
 
 const siteUrl = agentRouter.consoleUrl;
@@ -614,6 +622,10 @@ export async function checkinAccount(
     // 只放在成功路径：失败的账号常停在登出态，留着窗口便于人工处理；
     // 且 session stop 已经先跑完，不会因为实例先退出而误报 CLEANUP_INCOMPLETE。
     if (dependencies.closeAfter !== true) return result;
+    // 流程跑完但没核对到增量：批量层还要拿这个实例做一次只读复核（见 checkin-batch.ts
+    // 的 reviewUnconfirmed）。复核连不上就必然判 unknown，误报会一直留在失败名单里。
+    // 实例不在这里关，收尾的 releaseInstance 会照常按 ours 回收。
+    if (result.code === "CHECKIN_UNCONFIRMED" && dependencies.deferCloseOnUnconfirmed === true) return result;
     const closure = await closeInstanceAfterCheckin(home, run, alias, dependencies);
     return { ...result, closed: closure.closed, closureError: closure.error };
   });

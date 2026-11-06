@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { readStore, ZenxError } from "./core.ts";
 import type { Account, Runner } from "./core.ts";
-import { creditedTodayAliases } from "./db.ts";
+import { creditedTodayAliases, lastBalancePointBefore } from "./db.ts";
 import { dailySnapshotSummary } from "./snapshot.ts";
 import type { AutomaticSnapshotResult } from "./snapshot.ts";
 import type { LaunchDependencies } from "./launch.ts";
@@ -12,6 +12,7 @@ import { checkinAccount } from "./checkin.ts";
 import type { CheckinResult } from "./checkin.ts";
 import { closeBrowser, closeLeftoverInstances, ensureOnline } from "./launch.ts";
 import { recordLaunchedInstance } from "./leftover.ts";
+import { recheckAccount, todayUtcRange } from "./recheck.ts";
 import { enrichBskTimeout } from "./diagnose.ts";
 import { anyrouterCheckinAll } from "./anyrouter-batch.ts";
 import type { AnyRouterBatchReport } from "./anyrouter-batch.ts";
@@ -88,6 +89,11 @@ export type AccountOutcome = {
    * false 表示它本来就在跑（用户自己的）——只关自己拉起的实例是硬约束。
    */
   launched?: boolean;
+  /**
+   * 本次结果原本是 CHECKIN_UNCONFIRMED，经只读复核确认今日额度已到账后纠偏。
+   * 与 unconfirmed 相反：那个是"记了到账但没凭证"，这个是"报了失败但复核有凭证"。
+   */
+  recoveredByRecheck?: boolean;
 };
 
 export type CheckinBatchReport = {
@@ -119,6 +125,85 @@ export type CheckinBatchReport = {
   /** 前置的 AnyRouter 阶段汇总（--anyrouter no 时不存在）。 */
   anyrouter?: AnyRouterBatchReport;
 };
+
+/**
+ * "流程跑完但未确认到账"的只读复核结论。
+ *
+ * 站点是登录即发放、一天一次：当天早些时候（哪怕半途失败的）登录已经把额度发掉时，
+ * 本次退出→重登不会二次发放，⑧ 的 "本次运行内 Δ余额 + Δ消耗" 必然为 0，于是报
+ * CHECKIN_UNCONFIRMED —— 钱其实在账上。基线断档（>48h）时 ⑤d 的"今日已发放"短路
+ * 又会因新鲜度门槛失效，这类误报会集中出现，并把账号推回收尾补签反复重登，
+ * 直到撞上站点共享登录限流。
+ *
+ * 不放宽 ⑤d 的门槛：那会重新引入 10-24 修掉的静默漏签（基准停更几天后，几天的
+ * 发放都落进窗口，什么都没做就记已到账）。改为在批量层用 recheck 的第二套口径
+ * 独立复核：只读、不登录、不消耗登录配额，确认到账时补记账本，让明天有新鲜基线。
+ */
+export type UnconfirmedReview = {
+  verdict: "credited" | "not_credited" | "unknown";
+  /** 当前余额相对"今天开始前"基线的增量，仅供诊断。 */
+  balanceDelta?: number | null;
+  baselineBalance?: number | null;
+};
+
+/** 复核预算：只读一次控制台，不该比一次完整签到更久。 */
+const REVIEW_TIMEOUT_MS = 45_000;
+/** 与 checkin.ts / recheck.ts 同源：余额基准超过这个年龄，⑤d「今日已发放」短路就失效。 */
+const BASELINE_MAX_AGE_MS = 48 * 60 * 60_000;
+
+/**
+ * 找出"今天开始前的最后余额观测点"已经停更超过两天的账号。
+ *
+ * 连续几天没跑时账本没有新观测点，⑤d 的新鲜度门槛会对**全部**账号失效：
+ * 当天早些时候登录已发过额度的账号不会被短路放过，而是照常退出重登、余额不涨、
+ * 报 CHECKIN_UNCONFIRMED。只报"当日快照缺 N 个"看不出这层因果（缺快照是结果，
+ * 基线断档才是开关），所以单独点名，并给出恢复办法。从没有基线的是新绑账号，不算断档。
+ */
+function staleBaselineAliases(aliases: string[], at: Date, dbFile?: string): string[] {
+  const { start } = todayUtcRange(at);
+  const stale: string[] = [];
+  for (const alias of aliases) {
+    try {
+      const point = lastBalancePointBefore(alias, start, dbFile);
+      if (point !== null && at.getTime() - Date.parse(point.time) > BASELINE_MAX_AGE_MS) stale.push(alias);
+    } catch { /* 账本读不了就不告警，别让诊断打断收尾 */ }
+  }
+  return stale;
+}
+
+async function defaultReviewUnconfirmed(
+  home: string,
+  run: Runner,
+  alias: string,
+  dbFile?: string,
+): Promise<UnconfirmedReview> {
+  // record=true：确认到账但账本今天没记录时补记一条，否则明天它还会被当成待签到。
+  const result = await recheckAccount(home, run, alias, REVIEW_TIMEOUT_MS, { dbFile, record: true });
+  return {
+    verdict: result.verdict === "credited" ? "credited" : result.verdict === "not_credited" ? "not_credited" : "unknown",
+    balanceDelta: result.balanceDelta,
+    baselineBalance: result.baselineBalance,
+  };
+}
+
+/**
+ * 复核确认到账时把 CHECKIN_UNCONFIRMED 纠偏为成功。
+ *
+ * 只认三个条件同时成立：原结果是失败、错误码正是 CHECKIN_UNCONFIRMED、复核判 credited。
+ * 其它失败码一律不动——IDENTITY_MISMATCH / LOGOUT_FAILED 之类不是"没法证明到账"，
+ * 拿复核去洗掉它们会把真实故障藏起来。复核自身不可用（unknown / 抛错）时保持原判。
+ */
+export function applyUnconfirmedReview(outcome: AccountOutcome, review: UnconfirmedReview): AccountOutcome {
+  if (outcome.ok || outcome.code !== "CHECKIN_UNCONFIRMED" || review.verdict !== "credited") return outcome;
+  return {
+    ...outcome,
+    ok: true,
+    credited: true,
+    code: undefined,
+    message: "流程内未观测到增量；只读复核确认今日额度已到账，不再重签。",
+    recoveredByRecheck: true,
+  };
+}
 
 /**
  * 给人看的收尾汇总。
@@ -157,6 +242,12 @@ export function summarizeBatchReport(report: CheckinBatchReport): string[] {
       `未确认到账（凭页面提示判定，未核对到增量）：${unconfirmed.map((item) => item.alias).join("、")}` +
         `；用 zenx accounts recheck <别名> 复核，确要重签用 zenx accounts checkin <别名> --force。`,
     );
+  }
+  // 复核纠偏单列：它们原本在失败名单里，纠偏后不再出现，但人得知道这几个曾经判错、
+  // 以及账本已被补记——否则会以为今天压根没跑过这些账号。
+  const recovered = report.accounts.filter((item) => item.recoveredByRecheck === true);
+  if (recovered.length > 0) {
+    lines.push(`复核确认到账（原判 CHECKIN_UNCONFIRMED，已补记账本、不再重签）：${recovered.map((item) => item.alias).join("、")}`);
   }
   if (anyrouter && anyrouter.failed > 0) {
     const failedNames = anyrouter.accounts.filter((item) => !item.ok).map((item) => `${item.alias}（${item.code ?? "UNKNOWN"}）`);
@@ -258,6 +349,14 @@ export type CheckinBatchOptions = {
   stateFile?: string;
   dbFile?: string;
   onProgress?: (line: string) => void;
+  /**
+   * CHECKIN_UNCONFIRMED 的只读复核（测试替身）。默认调用 recheckAccount：
+   * 用账本基线 + 站点状态给出第二意见，确认到账时补记账本。
+   * 复核失败不改变签到结论，也不会被当成一次重试。
+   */
+  reviewUnconfirmed?: (alias: string) => Promise<UnconfirmedReview>;
+  /** 单账号签到实现（测试替身）；缺省为生产 checkinAccount。 */
+  runCheckin?: typeof checkinAccount;
 };
 
 function stateFileFor(home: string, explicit?: string): string {
@@ -386,6 +485,7 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
   const closeAfter = options.closeAfter === true;
   const windowSize = options.windowSize ?? DEFAULT_WINDOW_SIZE;
   const onProgress = options.onProgress ?? (() => undefined);
+  const review = options.reviewUnconfirmed ?? ((alias: string) => defaultReviewUnconfirmed(home, run, alias, options.dbFile));
   const file = stateFileFor(home, options.stateFile);
   const outcomes = new Map<string, AccountOutcome>();
   const state = await readState(file);
@@ -577,7 +677,28 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
         const account = pending[index];
         const attempt = (outcomes.get(account.alias)?.attempts ?? 0) + 1;
         onProgress(`[轮 ${round}] ${account.alias}: 第 ${attempt} 次签到`);
-        const outcome = await runOne(home, run, account, { ...options, attempt, closeAfter, onProgress, now, sleep, ours });
+        let outcome = await runOne(home, run, account, { ...options, attempt, closeAfter, onProgress, now, sleep, ours });
+        // CHECKIN_UNCONFIRMED 只是"本次运行内没法证明到账"，不等于没到账：当天早些时候
+        // 登录已经把额度发掉时，重登不会二次发放，余额必然纹丝不动。先拿一次只读的
+        // 第二意见，确认到账就当场纠偏——否则它会被丢进补签队列反复退出重登，
+        // 白耗站点共享登录配额，最后撞上 LOGIN_RATE_LIMITED。
+        if (!outcome.ok && outcome.code === "CHECKIN_UNCONFIRMED") {
+          let verdict: UnconfirmedReview | undefined;
+          try { verdict = await review(account.alias); }
+          catch { /* 复核失败（实例离线/读页超时）不改变签到结论 */ }
+          if (verdict) {
+            const corrected = applyUnconfirmedReview(outcome, verdict);
+            if (corrected.recoveredByRecheck === true) {
+              outcome = corrected;
+              onProgress(`${account.alias}: 只读复核确认今日已到账（原判 CHECKIN_UNCONFIRMED），已补记账本、不再重签`);
+            } else {
+              onProgress(
+                `${account.alias}: 复核未确认到账（${verdict.verdict}，相对基线增量 ${verdict.balanceDelta ?? "—"}）；` +
+                  `保留原判，可用 zenx accounts recheck ${account.alias} 人工复核`,
+              );
+            }
+          }
+        }
         await remember(account.alias, outcome);
         if (outcome.ok) {
           // 已经成了，就不必再补签（它可能之前失败过、队列里还留着记录）。
@@ -758,6 +879,16 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
         `到账判定依赖配对快照，缺的账号明天会退化为裸余额差——可用 zenx accounts snapshot <别名> 单独补采（只读，不耗登录配额）。`,
     );
   }
+  const stale = staleBaselineAliases(accounts.map((item) => item.alias), wallNow(), options.dbFile);
+  if (stale.length > 0) {
+    const shown = stale.slice(0, PRE_CREDITED_NAME_LIMIT);
+    const rest = stale.length - shown.length;
+    onProgress(
+      `余额基线已停更超过 48 小时：${stale.length}/${accounts.length} 个账号（${shown.join(", ")}${rest > 0 ? ` 等（另有 ${rest} 个）` : ""}）。` +
+        `「今日已发放」短路对这些账号失效，已到账也可能被判成 CHECKIN_UNCONFIRMED；` +
+        `用 zenx accounts snapshot --all 补采配对快照即可恢复基线（只读，不耗登录配额）。`,
+    );
+  }
   // AnyRouter 也是"今天该签的号"，它的失败同样不能让整轮以 0 收尾——否则脚本
   // 会把"AnyRouter 没签上"当成"全部签完了"。
   const anyrouterFailed = anyrouterReport?.failed ?? 0;
@@ -809,10 +940,27 @@ async function runOne(
     ours: Set<string>;
     /** 墙钟（测试替身）：快照观测时间与"今天"的日界都用它，不能用 now（那是计时器）。 */
     wallNow?: () => Date;
+    /** 单账号签到实现（测试替身）；缺省为生产 checkinAccount。 */
+    runCheckin?: typeof checkinAccount;
   },
 ): Promise<AccountOutcome> {
   const retryCodes = new Set(context.retryCodes ?? DEFAULT_RETRY_CODES);
   const maxRetries = context.maxRetries ?? 1;
+  const invoke = context.runCheckin ?? checkinAccount;
+  /**
+   * 拉起事实要在 ensureOnline **返回之前**登记。连接超时（PROFILE_CONNECT_TIMEOUT）
+   * 时它只会抛错，成功路径里的 ours.add / recordLaunchedInstance 根本走不到；
+   * 那个刚拉起的 Edge 于是被当成"用户自己的"，--close-after 不关、追踪文件也没记录，
+   * 每失败一轮就多留一个进程。见 launch.ts 的 onLaunched。
+   */
+  const launchDependencies: LaunchDependencies = {
+    ...context.launchDependencies,
+    onLaunched: async (instanceId) => {
+      await context.launchDependencies?.onLaunched?.(instanceId);
+      context.ours.add(account.alias);
+      await recordLaunchedInstance(home, account.alias, instanceId);
+    },
+  };
   const base = () => ({
     alias: account.alias,
     attempts: context.attempt,
@@ -824,7 +972,7 @@ async function runOne(
     launched: context.ours.has(account.alias),
   });
   try {
-    const online = await ensureOnline(home, run, account.alias, context.ensureTimeoutMs ?? 60_000, context.launchDependencies);
+    const online = await ensureOnline(home, run, account.alias, context.ensureTimeoutMs ?? 60_000, launchDependencies);
     if (online.launched === true) {
       context.ours.add(account.alias);
       // zenx 拉起的实例立刻落盘：这一步之后无论签到成败、关闭成败，
@@ -844,7 +992,7 @@ async function runOne(
   try {
     let result: CheckinResult;
     try {
-      result = await checkinAccount(home, run, account.alias, context.checkinTimeoutMs ?? 180_000, {
+      result = await invoke(home, run, account.alias, context.checkinTimeoutMs ?? 180_000, {
         force: context.force === true,
         dbFile: context.dbFile,
         now: context.now,
@@ -855,6 +1003,8 @@ async function runOne(
         // 共用同一个 Profile —— 关掉会连标签页与未保存内容一起带走。
         // 用跨轮的 launched：上一轮拉起、这一轮才签到成功的实例同样要回收。
         closeAfter: context.closeAfter && launched,
+        // 批量层要在 CHECKIN_UNCONFIRMED 上做只读复核，复核得连同一个实例。
+        deferCloseOnUnconfirmed: true,
       });
     } catch (firstError) {
       // BSK_TIMEOUT 即时重试一次：首次 bsk 调用常因扩展/守护进程冷启动而超时
@@ -863,7 +1013,7 @@ async function runOne(
       if (!(firstError instanceof ZenxError) || firstError.code !== "BSK_TIMEOUT") throw firstError;
       context.onProgress(`${account.alias}: BSK_TIMEOUT，${BSK_TIMEOUT_RETRY_DELAY_MS / 1000}s 后自动重试一次`);
       await context.sleep(BSK_TIMEOUT_RETRY_DELAY_MS);
-      result = await checkinAccount(home, run, account.alias, context.checkinTimeoutMs ?? 180_000, {
+      result = await invoke(home, run, account.alias, context.checkinTimeoutMs ?? 180_000, {
         force: context.force === true,
         dbFile: context.dbFile,
         now: context.now,
@@ -871,6 +1021,8 @@ async function runOne(
         sleep: context.sleep,
         onSnapshot: context.onProgress,
         closeAfter: context.closeAfter && launched,
+        // 批量层要在 CHECKIN_UNCONFIRMED 上做只读复核，复核得连同一个实例。
+        deferCloseOnUnconfirmed: true,
       });
     }
     if (result.closed === true) context.ours.delete(account.alias);
