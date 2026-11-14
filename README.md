@@ -75,11 +75,12 @@ node src/cli.ts --help    # 查看全部用法；也可 npm start -- --help
 | `zenx accounts bind-anyrouter <别名> --identity <站点用户名> --confirm` | 给已绑定账号补记 AnyRouter（anyrouter.top）的站点身份 |
 | `zenx accounts anyrouter-checkin <别名>` | AnyRouter 签到：刷新页面即打卡（详见下文） |
 | `zenx accounts anyrouter-checkin-all` | AnyRouter 批量签到：依次处理所有绑定了 AnyRouter 身份的账号（离线按需拉起、已到账的连 Edge 都不拉起、单个失败不中断） |
-| `zenx accounts recheck <别名>` | 只读复查该账号今日签到额度是否已到账（不退出、不重登）；`--site` 指定站点 |
-| `zenx accounts snapshot <别名>` / `--all` | 采集余额与站点累计消耗，写入账本（周/月对比的观测点）；**按站点各采一次**，`--site` 只采一个 |
+| `zenx accounts recheck <别名>` | 只读复查该账号今日签到额度是否已到账（不退出、不重登）；**离线自动拉起已配置的 Edge、读完只关自己拉起的实例**；`--site` 指定站点 |
+| `zenx accounts snapshot <别名>` / `--all` | 采集余额与站点累计消耗，写入账本（周/月对比的观测点）；**离线自动拉起已配置的 Edge、采完只关自己拉起的实例**；按站点各采一次，`--site` 只采一个 |
+| `zenx accounts snapshot --missing --capture` | 一键补采：只处理今天还缺配对快照的账号，已有快照的连浏览器都不碰（日常推荐） |
 | `zenx report [--port 8787] [--open]` | 启动本地网页报表，查看签到统计与余额趋势 |
 
-账号数据保存在 `.zenx/accounts.json`；可用 `--home <目录>` 或环境变量 `ZENX_HOME` 指定数据目录。全局加 `--json` 输出 JSON。除 `checkin` 外其余命令均保持只读，不保存密码、Cookie 或令牌。
+账号数据保存在 `.zenx/accounts.json`；可用 `--home <目录>` 或环境变量 `ZENX_HOME` 指定数据目录。全局加 `--json` 输出 JSON。站点侧除 `checkin` 的退出重登外均只读；`snapshot` / `recheck` / `ensure-online` / 批量命令在实例离线时会按需拉起已配置的 Edge Profile。不保存密码、Cookie 或令牌。
 
 ### 关闭浏览器：`zenx accounts close`
 
@@ -293,11 +294,12 @@ AgentRouter：共 20 个账号，到账 19，今天已到账而跳过 18，失�
 
 ### 复查：当日额度到底到账没有（`zenx accounts recheck`）
 
-签到报失败或 `CHECKIN_UNCONFIRMED` 之后，用这条命令只读核对"今天到底到账没有"：
+签到报失败或 `CHECKIN_UNCONFIRMED` 之后，用这条命令只读核对"今天到底到账没有"。**不用手工先开浏览器**：实例离线时自动拉起已配置的 Edge Profile，读完只关这次自己拉起的实例。
 
 ```powershell
-node src/cli.ts accounts ensure-online edge-1    # 离线时先拉起（recheck 自身不启动 Edge）
 node src/cli.ts accounts recheck edge-1 --json
+node src/cli.ts accounts recheck edge-1 --json --ensure-online no   # 退回完全纯只读
+node src/cli.ts accounts recheck edge-1 --json --keep-open           # 保留自动拉起的窗口
 ```
 
 ```json
@@ -312,7 +314,7 @@ node src/cli.ts accounts recheck edge-1 --json
 
 - **不退出、不重新登录、不消耗站点登录配额**，可以反复跑；隔离窗口同样必定回收。
 - **退出码**：`0` = 已确认到账，`1` = 未到账或异常，便于脚本里直接判断。
-- **离线只报告、不启动 Edge**：先用 `ensure-online` 拉起。
+- **离线自动拉起**：与 `snapshot` 共用同一套规则（只拉起已配置 `configure-launch` 的 Profile、只关自己拉起的实例、失败给出具体错误码与下一步）。没配启动路径时提示里直接给 `configure-launch` 命令。
 - `baselineBalance` 取账本里"今天开始前"的最后一次余额。**新账号首次签到没有基准**（`null`），此时只剩账本和站点两个信号，结论会退化成 `not_credited` —— 那是"无法证明"，不等于"确认没发"。
 
 ### 排障：实例 ID 变化导致账号“离线”
@@ -390,15 +392,19 @@ AgentRouter 与 AnyRouter 的数据**在同一个报表里**，但按站点分�
 签到记录只反映"签到那一刻"的余额，而**每个账号都可能被单独使用** —— 两次签到之间花掉的钱，凭签到记录完全看不见。所以除了签到，还要**每天落一个观测点**：
 
 ```powershell
-node src/cli.ts accounts snapshot --all --json     # 依次采集全部已绑定账号
-node src/cli.ts accounts snapshot edge-1 --json    # 只采集一个
+node src/cli.ts accounts snapshot --missing --capture --json   # 日常推荐：只补采今天还缺配对快照的账号
+node src/cli.ts accounts snapshot --all --json                 # 强制全量重采
+node src/cli.ts accounts snapshot edge-1 --json                # 只采集一个
+node src/cli.ts accounts snapshot --missing --json             # 只读列出今天还缺谁，不碰浏览器
 ```
 
 每次往 `balance_snapshots` 表写一条：时间、账号、身份、**当前余额**、**站点累计消耗**、是否成功、失败错误码。
 
-- 只读：不退出、不重新登录、不消耗站点登录配额；隔离窗口同样必定回收。
+- **不用手工提前开浏览器**：实例离线时自动拉起该账号已用 `configure-launch` 配置的 Edge Profile，采完只关这次自己拉起的实例；用户本来开着的 Edge 一律保留。批量串行执行（采完即关），内存峰值始终只有一个 Profile。
+- 没配启动路径时不再只说"实例离线"，会直接给出 `configure-launch` 命令；内存不足、连接超时等也带具体错误码与下一步建议。
+- 站点侧只读：不退出、不重新登录、不消耗站点登录配额；隔离窗口同样必定回收。`--ensure-online no` 可退回完全纯只读，`--keep-open` 保留自动拉起的窗口（随后可用 `close-leftover --confirm` 兜底）。
 - **失败也留一条**（`ok=false` + 错误码，如 `OFFLINE`、`LOGGED_OUT`、`IDENTITY_MISMATCH`），保证"今天试过"这件事在账本里有痕。
-- `--all` 依次采集全部账号，单个失败不中断。
+- `--missing --capture` 只补采缺快照的账号、退出码 1 表示仍有缺口；`--all` 依次采集全部账号，单个失败不中断。
 
 报表（`node src/cli.ts report`）新增两块：
 

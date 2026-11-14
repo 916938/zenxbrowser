@@ -13,7 +13,7 @@ import { checkinAll, pendingCheckins, summarizeBatchReport } from "./checkin-bat
 import { recheckAccount } from "./recheck.ts";
 import { anyrouterCheckin } from "./anyrouter-checkin.ts";
 import { anyrouterCheckinAll } from "./anyrouter-batch.ts";
-import { snapshotAccount, snapshotAll, dailySnapshotSummary } from "./snapshot.ts";
+import { snapshotAccount, snapshotAll, snapshotMissing, dailySnapshotSummary } from "./snapshot.ts";
 import { startReportServer } from "./report.ts";
 import { isTabId } from "./site.ts";
 import { DEFAULT_BATCH_INHIBIT_TIMEOUT_MS, withSleepInhibit } from "./power-save.ts";
@@ -49,10 +49,10 @@ const help = `ZenX Browser — Windows Edge 多账号连接台
   zenx accounts anyrouter-checkin-all [--timeout 60s] [--force]
   zenx accounts checkin <别名> [--timeout 3m] [--force] [--close-after] [--inhibit-sleep yes|no] [--inhibit-timeout 4m]
   zenx accounts checkin-all [--timeout 3m] [--wait 16m] [--retries 1] [--window 8] [--close-after] [--close-leftover] [--retry-codes CODES] [--anyrouter yes|no] [--force] [--inhibit-sleep yes|no] [--inhibit-timeout 4h]
-  zenx accounts recheck <别名> [--timeout 45s] [--record yes|no] [--site agentrouter|anyrouter]
-  zenx accounts snapshot <别名> [--timeout 45s] [--site agentrouter|anyrouter]
-  zenx accounts snapshot --all [--timeout 45s] [--site agentrouter|anyrouter]
-  zenx accounts snapshot --missing
+  zenx accounts recheck <别名> [--timeout 45s] [--record yes|no] [--site agentrouter|anyrouter] [--ensure-online yes|no] [--keep-open]
+  zenx accounts snapshot <别名> [--timeout 45s] [--site agentrouter|anyrouter] [--ensure-online yes|no] [--keep-open]
+  zenx accounts snapshot --all [--timeout 45s] [--site agentrouter|anyrouter] [--ensure-online yes|no] [--keep-open]
+  zenx accounts snapshot --missing [--capture] [--timeout 45s] [--ensure-online yes|no] [--keep-open]
   zenx report [--port 8787] [--open]
 
 全局选项：
@@ -89,11 +89,17 @@ open-site 本期仅支持 https://agentrouter.org/；先查找并切换用户已
 inspect-site 只读采集既有 AgentRouter 标签当前视口可见正文，核对登录身份与签到信号；
   不启动 Edge、不切换/新建/刷新标签、不执行签到；离线直接报告，不等待。
   页面在扩展更新前已加载时没有只读接收器，需人工刷新该标签后重试。
-snapshot 采集一次"当前余额 + 站点累计消耗"写入账本（只读：不退出、不重登录、不消耗登录配额）；
+snapshot 采集一次"当前余额 + 站点累计消耗"写入账本（站点侧只读：不退出、不重登录、不消耗登录配额）；
   **通常不必手动跑**：checkin / checkin-all / anyrouter-checkin 会在签到时就地落一笔快照
   （用的是判定到账那一次页面读取，余额与消耗天然配对，且在关窗之前完成）。
   这个命令留给补漏：签到前就失败、或当天已到账被跳过的账号不会有自动快照。
-  --missing 只读账本列出"今天还缺配对快照"的账号（不碰 bsk、不拉起 Edge），供日常脚本按需补采；
+  **离线不用手工开浏览器**：实例离线时自动拉起该账号已配置（configure-launch）的 Edge Profile，
+  采完只关这次自己拉起的实例，用户本来开着的 Edge 一律保留；--ensure-online no 退回纯只读，
+  --keep-open 保留自动拉起的窗口。没配启动路径会直接告诉你该跑哪条命令，不再只说"实例离线"。
+  批量是串行的（采完即关），内存峰值始终只有一个 Profile。
+  --missing 只读账本列出"今天还缺配对快照"的账号（不碰 bsk、不拉起 Edge）；加 --capture 一键补采
+  这些账号（日常推荐）：已有配对快照的账号连浏览器都不碰，比 --all 省时省内存。
+  --capture 需覆盖账号的全部绑定站点才能补上配对快照，因此不接受 --site。
   --all 依次采集全部已绑定账号，单个失败不中断；失败也留一条（ok=false + 错误码）。
   **按站点各采一次**：账号在哪些站点绑了身份就采哪些（AgentRouter 用 expected-identity、
   AnyRouter 用 bind-anyrouter 的身份），各写一条独立记录；--site 只采指定站点。
@@ -102,7 +108,9 @@ recheck 只读复查某账号"今日签到额度是否已到账"：开隔离窗�
   确认到账但账本今天没有记录时，默认补记一条到账记录（--record no 可关闭）：
   额度未必由 checkin 发放（zenx accounts login 恢复登录态也会发放），钱领到了就不该
   因为记录路径不同而从账本与报表里消失。
-  退出码 0=已确认到账，1=未到账或异常；离线/非 Edge/协议不兼容只报告，不启动 Edge（先 ensure-online）；
+  退出码 0=已确认到账，1=未到账或异常；离线时自动拉起该账号已配置的 Edge Profile、
+  读完只关这次自己拉起的实例（与 snapshot 同一套规则），--ensure-online no 退回纯只读、
+  --keep-open 保留窗口。未配置启动路径会直接给出 configure-launch 命令。
   遇 GitHub 授权/验证页或登录身份不符时停止判断，不给出额度结论。
   --site 指定复查哪个站点（默认 agentrouter）；该站点未绑定身份时报 SITE_NOT_BOUND。
 --tab-id 仅供 open-site / inspect-site 使用，限 1–2147483647 的十进制整数。
@@ -353,6 +361,9 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
         window: { type: "string" },
         all: { type: "boolean" },
         missing: { type: "boolean" },
+        capture: { type: "boolean" },
+        "ensure-online": { type: "string" },
+        "keep-open": { type: "boolean" },
         "tab-id": { type: "string" },
         port: { type: "string" },
         open: { type: "boolean" },
@@ -394,8 +405,8 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     if (binding) for (const key of ["instance-id", "expected-identity", "confirm"]) allowed.add(key);
     if (configuring) for (const key of ["edge-path", "user-data-dir", "profile-directory", "confirm"]) allowed.add(key);
     if (ensuring || opening || inspecting || relinking || closing || rechecking || snapshotting) allowed.add("timeout");
-    if (rechecking) for (const key of ["record", "site"]) allowed.add(key);
-    if (snapshotting) for (const key of ["all", "missing", "site"]) allowed.add(key);
+    if (rechecking) for (const key of ["record", "site", "ensure-online", "keep-open"]) allowed.add(key);
+    if (snapshotting) for (const key of ["all", "missing", "site", "capture", "ensure-online", "keep-open"]) allowed.add(key);
     if (loggingIn) allowed.add("timeout");
     if (bindingAnyRouter) for (const key of ["identity", "confirm"]) allowed.add(key);
     if (checkingInAnyRouter || checkingInAnyRouterAll) for (const key of ["timeout", "force"]) allowed.add(key);
@@ -412,8 +423,22 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
     if (snapshotting && values.all === true && alias !== undefined) throw new ZenxError("INVALID_ARGUMENT", "--all 会采集全部账号，不能再指定别名。");
     if (snapshotting && values.missing === true && alias !== undefined) throw new ZenxError("INVALID_ARGUMENT", "--missing 只读账本列出缺快照的账号，不接受别名。");
     if (snapshotting && values.missing === true && values.all === true) throw new ZenxError("INVALID_ARGUMENT", "--missing 与 --all 不能同时使用。");
+    if (snapshotting && values.capture === true && values.missing !== true) throw new ZenxError("INVALID_ARGUMENT", "--capture 只能和 --missing 一起用：先列出今天缺配对快照的账号，再按需自动拉起补采。");
+    if (snapshotting && values.capture === true && values.site !== undefined) throw new ZenxError("INVALID_ARGUMENT", "一键补采要覆盖账号的全部绑定站点才补得上配对快照，--capture 不接受 --site；只采单站点请用 snapshot <别名> --site <站点>。");
+    if (snapshotting && values.missing === true && values.capture !== true &&
+        (values["ensure-online"] !== undefined || values["keep-open"] !== undefined)) {
+      throw new ZenxError("INVALID_ARGUMENT", "只读的 --missing 不接受启动参数；加 --capture 才会自动拉起并补采。");
+    }
     const home = resolveHome(values.home, dependencies.home);
     const run = dependencies.run ?? createRunner(process.env.ZENX_BSK_PATH);
+    // snapshot / recheck 共用的按需启动开关：默认自动拉起离线实例、采完即关；
+    // 进度行只在非 JSON 模式打印。
+    const browserOptions = {
+      ensureOnline: parseYesNo(values["ensure-online"] as string | undefined, "--ensure-online") ?? true,
+      keepOpen: values["keep-open"] === true,
+      launchDependencies: dependencies.launchDependencies,
+      onProgress: (line: string) => { if (!asJson) output(line); },
+    };
     // 防休眠配置：返回 null 表示整段不启用。日志走与进度相同的出口，JSON 模式下不打印。
     const inhibitOptions = (
       defaultTimeoutMs: number,
@@ -531,29 +556,37 @@ export async function main(args: string[], dependencies: Dependencies = {}): Pro
       );
     } else if (rechecking && alias && positionals.length === 3) {
       report = await recheckAccount(home, run, alias, parseTimeout(values.timeout), {
+        ...browserOptions,
         dbFile: dependencies.recheckDbFile,
         record: parseRecordFlag(values.record),
         siteId: parseSiteId(values.site),
       });
     } else if (snapshotting && values.missing === true && positionals.length === 2) {
-      // 只读账本：列出今天还缺**配对**观测点（余额 + 累计消耗）的账号。
-      // 自动快照已在签到时就地采集，这里只回答"还差谁"，不碰 bsk、不拉起 Edge。
-      const store = await readStore(home);
-      report = {
-        ...dailySnapshotSummary(
-          store.accounts.map((item) => item.alias),
-          (dependencies.now ?? (() => new Date()))(),
-          dependencies.snapshotDbFile,
-        ),
-      };
+      const at = (dependencies.now ?? (() => new Date()))();
+      if (values.capture === true) {
+        // 一键补采：只处理今天还缺配对快照的账号，离线自动拉起、采完即关。
+        report = await snapshotMissing(home, run, parseTimeout(values.timeout), {
+          ...browserOptions,
+          dbFile: dependencies.snapshotDbFile,
+          siteId: parseSiteId(values.site),
+          at,
+        });
+      } else {
+        // 只读账本：列出今天还缺**配对**观测点（余额 + 累计消耗）的账号。
+        // 自动快照已在签到时就地采集，这里只回答"还差谁"，不碰 bsk、不拉起 Edge。
+        const store = await readStore(home);
+        report = { ...dailySnapshotSummary(store.accounts.map((item) => item.alias), at, dependencies.snapshotDbFile) };
+      }
     } else if (snapshotting && values.all === true && positionals.length === 2) {
       report = await snapshotAll(home, run, parseTimeout(values.timeout), {
+        ...browserOptions,
         dbFile: dependencies.snapshotDbFile,
         siteId: parseSiteId(values.site),
       });
     } else if (snapshotting && alias && positionals.length === 3) {
       // 一个账号可能在多个站点各有身份，每个站点一条结果。
       const results = await snapshotAccount(home, run, alias, parseTimeout(values.timeout), {
+        ...browserOptions,
         dbFile: dependencies.snapshotDbFile,
         siteId: parseSiteId(values.site),
       });

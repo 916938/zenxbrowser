@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import { DEFAULT_RETRY_CODES, applyUnconfirmedReview, checkinAll, pendingCheckins, readState, summarizeBatchReport, writeState } from "../src/checkin-batch.ts";
 import type { AccountOutcome, UnconfirmedReview } from "../src/checkin-batch.ts";
 import type { CheckinDependencies } from "../src/checkin.ts";
-import { openDatabase } from "../src/db.ts";
+import { insertSnapshot, openDatabase } from "../src/db.ts";
 import { readLeftovers, recordLaunchedInstance } from "../src/leftover.ts";
 import type { Account, Browser, Result, Runner } from "../src/core.ts";
 import { ZenxError } from "../src/core.ts";
@@ -1178,7 +1178,33 @@ test("checkin-all: 余额基线停更超过 48 小时时收尾点名并给出恢
   const line = progress.find((item) => item.includes("余额基线已停更"));
   assert.ok(line, "基线断档必须显式报出来");
   assert.match(line, /alpha/);
-  assert.match(line, /snapshot --all/);
+  assert.match(line, /snapshot --missing --capture/);
+});
+
+// 实况（2026-11-14）：20 个账号今天都已有配对快照，但历史基准仍停在 48 小时前。
+// 基准只取今天 00:00 UTC 之前的观测点，当天补采无法消除告警 —— 这时不能再让用户
+// 白跑一次全量重采（现在会为二十个账号各拉起一遍 Edge）。
+test("checkin-all: 今天配对快照已齐但历史基线断档时不再建议补采", async (t) => {
+  const home = await fixture(t, [accounts[0]]);
+  const dbFile = tempDb(t);
+  seedCredited(dbFile, "alpha", "aaaa1111", new Date("2026-10-30T16:00:00Z"));
+  insertSnapshot({
+    time: "2026-11-05T09:00:00Z", alias: "alpha", instanceId: "aaaa1111",
+    identity: "github_1", balance: 1100, totalSpent: 100, ok: true, errorCode: null,
+  }, dbFile);
+  const time = clock(Date.parse("2026-11-05T10:00:00Z"));
+  const progress: string[] = [];
+  await checkinAll(home, runner, {
+    ...time, dbFile, anyrouter: false, windowSize: 0, maxRetries: 0, checkinTimeoutMs: 600,
+    onProgress: (line) => progress.push(line),
+  });
+  const line = progress.find((item) => item.includes("余额基线已停更"));
+  assert.ok(line, "历史断档仍要显式报出来");
+  assert.match(line, /alpha/);
+  assert.match(line, /无需补采/);
+  assert.match(line, /明天/);
+  assert.doesNotMatch(line, /--missing --capture/);
+  assert.ok(!progress.some((item) => item.includes("当日快照缺")), "今天并不缺配对快照");
 });
 
 test("checkin-all: 余额基线新鲜时不误报断档", async (t) => {

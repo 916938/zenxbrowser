@@ -1,11 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main } from "../src/cli.ts";
 import { insertCheckin, insertSnapshot, listCheckins } from "../src/db.ts";
 import { recheckAccount } from "../src/recheck.ts";
+import { readLeftovers } from "../src/leftover.ts";
+import type { LaunchDependencies } from "../src/launch.ts";
 import type { Browser, Runner } from "../src/core.ts";
 
 const edge: Browser = {
@@ -404,4 +406,132 @@ test("CLI：缺少别名时报错", async (t) => {
   const lines: string[] = [];
   assert.equal(await main(["accounts", "recheck", "--json"], { home, run: runner(), recheckDbFile: dbFile, output: (line) => lines.push(line) }), 1);
   assert.match(lines[0], /INVALID_ARGUMENT/);
+});
+
+// ---- 离线自动拉起：与 snapshot 共用 auto-online.ts ----
+
+type AutoState = { online: Browser[]; launched: number; closed: number; calls: string[][] };
+
+/** 造出能通过 validatePaths 的启动配置；Edge 启动本身由替身接管。 */
+async function launchFixture(t: { after: (fn: () => Promise<void>) => void }) {
+  const { home, dbFile } = await temporary(t);
+  const edgePath = join(home, "msedge.exe");
+  const userDataDir = join(home, "User Data");
+  await writeFile(edgePath, "fake executable");
+  await mkdir(join(userDataDir, "Profile 1"), { recursive: true });
+  await writeFile(join(userDataDir, "Profile 1", "Preferences"), "{}");
+  const store = JSON.parse(await readFile(join(home, "accounts.json"), "utf8"));
+  store.accounts[0].launch = { edgePath, userDataDir, profileDirectory: "Profile 1" };
+  await writeFile(join(home, "accounts.json"), JSON.stringify(store));
+  return { home, dbFile };
+}
+
+function autoRunner(state: AutoState, text = LOGGED_IN): Runner {
+  return async (args) => {
+    state.calls.push(args);
+    if (args[0] === "browsers" && args[1] === "--json") return { stdout: JSON.stringify(state.online), exitCode: 0 };
+    if (args[0] === "browsers" && args[1] === "close") {
+      state.closed += 1;
+      state.online = [];
+      return { stdout: JSON.stringify({ browser_id: args[3], closed: true, windows_closed: 1, sessions_stopped: 0, disconnected: false }), exitCode: 0 };
+    }
+    if (args[0] === "session" && args[1] === "start") return { stdout: JSON.stringify({ session_id: "abcd" }), exitCode: 0 };
+    if (args[0] === "session" && args[1] === "stop") return { stdout: "", exitCode: 0 };
+    if (args[0] === "navigate") return { stdout: "", exitCode: 0 };
+    if (args[0] === "evaluate") return { stdout: JSON.stringify({ ok: true, tab_id: 7, value: text }), exitCode: 0 };
+    throw new Error(`unexpected args: ${args.join(" ")}`);
+  };
+}
+
+function launchDeps(state: AutoState, overrides: Partial<LaunchDependencies> = {}): LaunchDependencies {
+  return {
+    platform: "win32",
+    freeMemory: () => 2 * 1024 ** 3,
+    sleep: async () => {},
+    launch: async () => { state.launched += 1; state.online = [edge]; },
+    ...overrides,
+  };
+}
+
+test("离线时自动拉起 Edge 完成复查，读完只关自己拉起的实例", async (t) => {
+  const { home, dbFile } = await launchFixture(t);
+  record(dbFile, { balanceBefore: 100, balanceAfter: 125, credited: true });
+  const state: AutoState = { online: [], launched: 0, closed: 0, calls: [] };
+  const result = await recheckAccount(home, autoRunner(state), account.alias, 45_000, {
+    dbFile, ...fast, launchDependencies: launchDeps(state),
+  });
+  assert.equal(result.connection, "online");
+  assert.equal(result.verdict, "credited");
+  assert.equal(result.launched, true);
+  assert.equal(result.closed, true);
+  assert.equal(state.launched, 1, "只拉起一次");
+  assert.equal(state.closed, 1);
+  assert.deepEqual((await readLeftovers(home)).instances, [], "确认关闭后不留遗留追踪");
+});
+
+test("用户自己开着的 Edge 不会被复查关闭", async (t) => {
+  const { home, dbFile } = await launchFixture(t);
+  const state: AutoState = { online: [edge], launched: 0, closed: 0, calls: [] };
+  const result = await recheckAccount(home, autoRunner(state), account.alias, 45_000, {
+    dbFile, ...fast, launchDependencies: launchDeps(state),
+  });
+  assert.equal(result.launched, false);
+  assert.equal(result.closed, undefined);
+  assert.equal(state.launched, 0);
+  assert.equal(state.closed, 0);
+});
+
+test("--ensure-online no 保持纯只读：不拉起、不关闭", async (t) => {
+  const { home, dbFile } = await launchFixture(t);
+  const state: AutoState = { online: [], launched: 0, closed: 0, calls: [] };
+  const result = await recheckAccount(home, autoRunner(state), account.alias, 45_000, {
+    dbFile, ...fast, ensureOnline: false, launchDependencies: launchDeps(state),
+  });
+  assert.equal(result.connection, "offline");
+  assert.equal(result.errorCode, "OFFLINE");
+  assert.equal(state.launched, 0);
+  assert.ok(!state.calls.some((args) => args[0] === "session"));
+  assert.match(result.note ?? "", /--ensure-online no/);
+});
+
+test("未配置启动路径时给出可执行的下一步，不再只说先执行 ensure-online", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  const result = await recheckAccount(home, runner({ browsers: [] }), account.alias, 45_000, { dbFile, ...fast });
+  assert.equal(result.connection, "offline");
+  assert.equal(result.errorCode, "OFFLINE");
+  assert.match(result.note ?? "", /configure-launch/);
+  assert.match(result.hint ?? "", /configure-launch/);
+  assert.doesNotMatch(result.note ?? "", /先执行 ensure-online/);
+});
+
+test("自动拉起失败（内存不足）如实报告原因并给出建议", async (t) => {
+  const { home, dbFile } = await launchFixture(t);
+  const state: AutoState = { online: [], launched: 0, closed: 0, calls: [] };
+  const result = await recheckAccount(home, autoRunner(state), account.alias, 45_000, {
+    dbFile, ...fast, launchDependencies: launchDeps(state, { freeMemory: () => 100 }),
+  });
+  assert.equal(result.errorCode, "LOW_MEMORY");
+  assert.equal(state.launched, 0);
+  assert.match(result.note ?? "", /LOW_MEMORY/);
+  assert.match(result.hint ?? "", /close-all/);
+});
+
+test("CLI：recheck 接受 --ensure-online no 与 --keep-open 并透传", async (t) => {
+  const { home, dbFile } = await launchFixture(t);
+  const state: AutoState = { online: [], launched: 0, closed: 0, calls: [] };
+  const readOnly: string[] = [];
+  assert.equal(await main(["accounts", "recheck", account.alias, "--ensure-online", "no", "--json"], {
+    home, run: autoRunner(state), recheckDbFile: dbFile,
+    launchDependencies: launchDeps(state), output: (line) => readOnly.push(line),
+  }), 1);
+  assert.equal(state.launched, 0);
+  assert.match(JSON.parse(readOnly[0]).note, /--ensure-online no/);
+
+  const kept: string[] = [];
+  await main(["accounts", "recheck", account.alias, "--keep-open", "--json"], {
+    home, run: autoRunner(state), recheckDbFile: dbFile,
+    launchDependencies: launchDeps(state), output: (line) => kept.push(line),
+  });
+  assert.equal(JSON.parse(kept[0]).launched, true);
+  assert.equal(state.closed, 0, "--keep-open 保留窗口");
 });

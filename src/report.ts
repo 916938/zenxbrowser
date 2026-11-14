@@ -274,7 +274,7 @@ async function load() {
 }
 
 function drawDaily(rows) {
-  if (!rows.length) return '<div class="empty">还没有每日快照，先跑一次 <code>zenx accounts snapshot --all</code>。</div>';
+  if (!rows.length) return '<div class="empty">还没有每日快照，先跑一次 <code>zenx accounts snapshot --missing --capture</code>。</div>';
   const body = [];
   // 一天按站点分成多行：两站的余额不能互转，合成一个数会误导。
   for (const r of rows.slice().reverse()) {
@@ -347,7 +347,7 @@ function bindSpentDetail(daily) {
 function drawRanges(ranges) {
   const note = '<div class="sub">到账 = 签到带来的余额增长；消耗优先取站点「历史消耗」的区间增量，' +
                '快照缺失时由签到记录反推（上次余额 + 25 − 本次余额）。' +
-               '每天跑一次 <code>zenx accounts snapshot --all</code> 可让消耗更精确。</div>';
+               '每天跑一次 <code>zenx accounts snapshot --missing --capture</code> 可让消耗更精确。</div>';
   return note + [["本周 vs 上周", ranges.week], ["本月 vs 上月", ranges.month]]
     .map(([title, cmp]) => rangeSection(title, cmp)).join("");
 }

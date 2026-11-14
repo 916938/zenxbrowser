@@ -157,7 +157,12 @@ const BASELINE_MAX_AGE_MS = 48 * 60 * 60_000;
  * 连续几天没跑时账本没有新观测点，⑤d 的新鲜度门槛会对**全部**账号失效：
  * 当天早些时候登录已发过额度的账号不会被短路放过，而是照常退出重登、余额不涨、
  * 报 CHECKIN_UNCONFIRMED。只报"当日快照缺 N 个"看不出这层因果（缺快照是结果，
- * 基线断档才是开关），所以单独点名，并给出恢复办法。从没有基线的是新绑账号，不算断档。
+ * 基线断档才是开关），所以单独点名。从没有基线的是新绑账号，不算断档。
+ *
+ * **时序要注意**：`start` 是今天 00:00 UTC，今天落下的观测点一律不参与基准计算，
+ * 因此这条告警在当天无法靠补采消除——补采的快照要到明天才成为"今天开始前"的基准。
+ * 收尾提示必须据此区分「今天还缺快照」（值得补采）与「今天已齐」（无需动作），
+ * 否则会让用户白跑一次 snapshot --all，为二十个账号各拉起一遍 Edge。
  */
 function staleBaselineAliases(aliases: string[], at: Date, dbFile?: string): string[] {
   const { start } = todayUtcRange(at);
@@ -178,7 +183,10 @@ async function defaultReviewUnconfirmed(
   dbFile?: string,
 ): Promise<UnconfirmedReview> {
   // record=true：确认到账但账本今天没记录时补记一条，否则明天它还会被当成待签到。
-  const result = await recheckAccount(home, run, alias, REVIEW_TIMEOUT_MS, { dbFile, record: true });
+  // 批量内部的复核必须是纯只读：它要连的是刚才签到用的那个 Edge（见
+  // deferCloseOnUnconfirmed），绝不能在这里另外拉起/关闭实例，否则会和本轮
+  // 的 ours 追踪与窗口回收打架。用户手工跑 recheck 才默认自动拉起。
+  const result = await recheckAccount(home, run, alias, REVIEW_TIMEOUT_MS, { dbFile, record: true, ensureOnline: false });
   return {
     verdict: result.verdict === "credited" ? "credited" : result.verdict === "not_credited" ? "not_credited" : "unknown",
     balanceDelta: result.balanceDelta,
@@ -876,17 +884,22 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
   if (!snapshots.ok) {
     onProgress(
       `当日快照缺 ${snapshots.missing.length}/${snapshots.total} 个账号：${snapshots.missing.join(", ")}。` +
-        `到账判定依赖配对快照，缺的账号明天会退化为裸余额差——可用 zenx accounts snapshot <别名> 单独补采（只读，不耗登录配额）。`,
+        `到账判定依赖配对快照，缺的账号明天会退化为裸余额差——跑 zenx accounts snapshot --missing --capture 一键补采（自动拉起离线实例，站点侧只读、不耗登录配额）。`,
     );
   }
   const stale = staleBaselineAliases(accounts.map((item) => item.alias), wallNow(), options.dbFile);
   if (stale.length > 0) {
     const shown = stale.slice(0, PRE_CREDITED_NAME_LIMIT);
     const rest = stale.length - shown.length;
+    // 基准只认今天 00:00 UTC 之前的观测点：今天补采的快照要到明天才生效。
+    // 今天快照已齐时没有任何能当天修复这个告警的动作，别让用户白跑一次全量重采。
+    const recovery = snapshots.ok
+      ? "今天每个账号都已有配对快照，它们从明天起就是新鲜基准，无需补采；今天这几个账号会照常执行完整签到（不会误跳过），若报 CHECKIN_UNCONFIRMED 可用 zenx accounts recheck <别名> 只读核实到账。"
+      : "今天还有账号缺配对快照：跑 zenx accounts snapshot --missing --capture 补采（自动拉起离线实例、站点侧只读），补上的观测点从明天起恢复基准；今天之内这条告警不会消失。";
     onProgress(
       `余额基线已停更超过 48 小时：${stale.length}/${accounts.length} 个账号（${shown.join(", ")}${rest > 0 ? ` 等（另有 ${rest} 个）` : ""}）。` +
-        `「今日已发放」短路对这些账号失效，已到账也可能被判成 CHECKIN_UNCONFIRMED；` +
-        `用 zenx accounts snapshot --all 补采配对快照即可恢复基线（只读，不耗登录配额）。`,
+        `基准只取今天 00:00 UTC 之前的观测点，因此「今日已发放」短路对这些账号今天失效，已到账也可能被判成 CHECKIN_UNCONFIRMED；` +
+        recovery,
     );
   }
   // AnyRouter 也是"今天该签的号"，它的失败同样不能让整轮以 0 收尾——否则脚本

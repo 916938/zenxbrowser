@@ -1,9 +1,12 @@
 import { setTimeout as delay } from "node:timers/promises";
-import { isEdge, listBrowsers, protocolSupported, readStore, withStoreLock, ZenxError } from "./core.ts";
+import { readStore, withStoreLock, ZenxError } from "./core.ts";
 import type { Account, Runner } from "./core.ts";
 import { DEFAULT_DB_FILE, hasCreditedBetween, insertCheckin, lastBalancePointBefore, lastPairedSnapshotBefore, ledgerAliasOf } from "./db.ts";
 import { readConsoleState } from "./console.ts";
 import { findAccount } from "./launch.ts";
+import type { LaunchDependencies } from "./launch.ts";
+import { prepareOnline } from "./auto-online.ts";
+import type { Connection } from "./auto-online.ts";
 import { agentRouter } from "./sites/agentrouter.ts";
 import { anyRouter } from "./sites/anyrouter.ts";
 import type { ReadableSite } from "./sites/readable.ts";
@@ -45,6 +48,13 @@ export type RecheckDependencies = {
   record?: boolean;
   /** 复查哪个站点（默认 AgentRouter）。 */
   siteId?: string;
+  /** 实例离线时自动拉起已配置的 Edge Profile（默认 true）；false 保持纯只读。 */
+  ensureOnline?: boolean;
+  /** 保留自动拉起的窗口（默认 false：读完只关自己拉起的实例）。 */
+  keepOpen?: boolean;
+  /** 拉起/回收的依赖注入（测试替身）。 */
+  launchDependencies?: LaunchDependencies;
+  onProgress?: (line: string) => void;
 };
 
 export type RecheckResult = {
@@ -53,7 +63,7 @@ export type RecheckResult = {
   alias: string;
   instanceId: string;
   identity: string;
-  connection: "online" | "offline" | "wrong_browser" | "unsupported_protocol";
+  connection: Connection;
   login: "logged_in" | "logged_out" | "manual_intervention" | "unknown";
   identityMatch: boolean;
   /** 站点 id；账本记录在 ledgerAliasOf(alias, site) 下。 */
@@ -75,8 +85,17 @@ export type RecheckResult = {
   verdict: "credited" | "not_credited" | "logged_out" | "manual_intervention" | "identity_mismatch" | "unknown";
   pageFeature?: string;
   note?: string;
+  /** 连接不可用时的具体错误码（自动拉起失败原因优先于笼统的 OFFLINE）。 */
+  errorCode?: string;
+  /** 可执行下一步建议（自动拉起失败、未配置启动路径时）。 */
+  hint?: string;
   /** 本次是否为到账补记了一条签到记录（钱到了但账本原本没记录时才会发生）。 */
   recorded?: boolean;
+  /** 该账号的 Edge 是否由本次复查自动拉起。 */
+  launched?: boolean;
+  /** 自动拉起的实例是否已复核确认关闭。 */
+  closed?: boolean;
+  closureError?: string;
 };
 
 /** 本地"今天"对应的 UTC 区间 [start, end)；按本地日界切，避免 UTC 日界把早上算到前一天。 */
@@ -86,10 +105,14 @@ export function todayUtcRange(now: Date): { start: string; end: string } {
   return { start: start.toISOString(), end: end.toISOString() };
 }
 
-function deadlineBudget(timeoutMs: number, now: () => number): () => number {
+function validateTimeout(timeoutMs: number): void {
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000) {
     throw new ZenxError("INVALID_TIMEOUT", "复查预算必须是 1–300000 毫秒的整数。");
   }
+}
+
+function deadlineBudget(timeoutMs: number, now: () => number): () => number {
+  validateTimeout(timeoutMs);
   const deadline = now() + timeoutMs;
   return () => {
     const budget = Math.floor(deadline - now());
@@ -139,6 +162,10 @@ function recordMissingCredit(
  * 与 checkin 的区别：不退出、不重新登录、不消耗站点登录配额，只是在隔离窗口里
  * 读一次控制台，再结合账本给出结论。用于签到失败或"未确认"后的核对。
  *
+ * **站点侧只读**；进程侧不是：实例离线时按需拉起该账号已配置的 Edge Profile，
+ * 读完只关这次自己拉起的实例（与 snapshot 共用 auto-online.ts）。ensureOnline=false
+ * 可退回完全纯只读，keepOpen=true 则保留窗口。
+ *
  * 判定顺序（先红线后证据）：
  * 1. 未登录 / 需人工授权 → 无法核对，需人工登录后再看；
  * 2. 登录身份与绑定身份不符 → identity_mismatch（不允许据此判断任何额度）；
@@ -155,13 +182,34 @@ export async function recheckAccount(
 ): Promise<RecheckResult> {
   const now = dependencies.now ?? (() => Date.now());
   const sleep = dependencies.sleep ?? delay;
-  const remaining = deadlineBudget(timeoutMs, now);
+  validateTimeout(timeoutMs);
   const target = siteById(dependencies.siteId ?? agentRouter.id);
   if (target === undefined) {
     throw new ZenxError("UNKNOWN_SITE", `未知站点 ${dependencies.siteId}；可用：${SITES.map((s) => s.site.id).join(", ")}。`);
   }
   const { site, identityOf } = target;
-  return withStoreLock(home, async () => {
+
+  // 只读预检：站点没绑身份时不该为此拉起浏览器（锁内会再核一次最新配置）。
+  const preStore = await readStore(home);
+  const preAccount = findAccount(preStore, alias);
+  if (!identityOf(preAccount)) {
+    throw new ZenxError("SITE_NOT_BOUND", `账号 ${alias} 未绑定 ${site.name} 身份；无法复查该站点。`);
+  }
+
+  // 连接判定 + 离线按需拉起。必须在 withStoreLock **之外**：ensureOnline 自己也持
+  // 同一把账号锁。与 snapshot 共用同一份拉起/回收/提示实现。
+  const session = await prepareOnline(home, run, preAccount, {
+    ensureOnline: dependencies.ensureOnline,
+    keepOpen: dependencies.keepOpen,
+    launchDependencies: dependencies.launchDependencies,
+    onProgress: dependencies.onProgress,
+    timeoutMs,
+  });
+  const connection = session.connection;
+  // 拉起 Edge 可能耗时，复查预算从采集开始时算，别让它吃掉站点读取的时间。
+  const remaining = deadlineBudget(timeoutMs, now);
+
+  async function recheckLocked(): Promise<RecheckResult> {
     const store = await readStore(home);
     const account = findAccount(store, alias);
     const identity = identityOf(account);
@@ -172,19 +220,13 @@ export async function recheckAccount(
     const ledgerAlias = ledgerAliasOf(account.alias, site.id);
     const base = { alias: account.alias, instanceId: account.instanceId, identity, site: site.id };
 
-    const browsers = await listBrowsers(run, {
-      timeoutMs: Math.min(60_000, remaining()),
-      env: { BSK_BROWSER_WAIT_MS: "0" },
-    });
-    remaining();
-    const browser = browsers.find((item) => item.instance_id === account.instanceId);
-    const connection: RecheckResult["connection"] = !browser ? "offline" : !isEdge(browser) ? "wrong_browser" : !protocolSupported(browser) ? "unsupported_protocol" : "online";
     if (connection !== "online") {
       return {
         ...base, ok: false, connection, login: "unknown", identityMatch: false, balance: null,
         siteCheckedIn: false, creditedToday: false, baselineBalance: null, balanceDelta: null,
         baselineTotalSpent: null, spentDelta: null, creditDelta: null,
-        verdict: "unknown", note: "实例离线或不兼容；未启动 Edge，未读取站点。先执行 ensure-online。",
+        verdict: "unknown", errorCode: session.errorCode, note: session.note,
+        ...(session.hint ? { hint: session.hint } : {}),
       };
     }
 
@@ -301,5 +343,15 @@ export async function recheckAccount(
         ? "未发现到账证据（缺少发放前余额基准，无法比较增量）；可重试签到，或次日再看余额趋势。"
         : "未发现到账证据：账本今日无到账记录、站点未显示已签到，余额相对今天开始前也没有净增（只有消耗没有发放）。可重试签到。",
     };
-  });
+  }
+
+  let result: RecheckResult;
+  let release: { closed?: boolean; closureError?: string } = {};
+  try {
+    result = await withStoreLock(home, recheckLocked);
+  } finally {
+    // 无论复查成功、失败还是抛错，都只回收本次自己拉起的实例。
+    release = await session.finish();
+  }
+  return { ...result, launched: session.launched, ...release };
 }

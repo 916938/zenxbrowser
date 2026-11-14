@@ -1,11 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main } from "../src/cli.ts";
 import { dailyTotals, insertCheckin, listSnapshots, rangeSummary } from "../src/db.ts";
-import { snapshotAccount, snapshotAll } from "../src/snapshot.ts";
+import { snapshotAccount, snapshotAll, snapshotMissing } from "../src/snapshot.ts";
+import { readLeftovers } from "../src/leftover.ts";
+import type { LaunchDependencies } from "../src/launch.ts";
 import type { Browser, Runner } from "../src/core.ts";
 
 const edge: Browser = {
@@ -102,6 +104,10 @@ test("离线时不开窗口，只留失败快照", async (t) => {
   assert.equal(result.errorCode, "OFFLINE");
   assert.ok(!calls.some((args) => args[0] === "session"));
   assert.equal(listSnapshots({ alias: account.alias }, dbFile)[0].errorCode, "OFFLINE");
+  // 没配启动路径时不再只丢一句"实例离线"，要直接给出可执行的下一步。
+  assert.match(result.note ?? "", /configure-launch/);
+  assert.match(result.hint ?? "", /configure-launch/);
+  assert.equal(result.launched, false);
 });
 
 test("页面读到 $0 时视为未渲染，快照记 null 而不是 0", async (t) => {
@@ -392,4 +398,177 @@ test("CLI：snapshot --missing 不接受别名，也不与 --all 同用", async 
   const withAll: string[] = [];
   assert.equal(await main(["accounts", "snapshot", "--missing", "--all", "--json"], { home, run: runner(), snapshotDbFile: dbFile, output: (line) => withAll.push(line) }), 1);
   assert.match(withAll[0], /不能同时使用/);
+});
+
+// ---- 离线自动拉起：不用再手工提前打开浏览器 ----
+
+type AutoState = { online: Browser[]; launched: number; closed: number; calls: string[][] };
+
+/** 造出能通过 validatePaths 的启动配置；Edge 启动本身由替身接管，不会真的开进程。 */
+async function launchFixture(t: { after: (fn: () => Promise<void>) => void }, accounts = [account]) {
+  const { home, dbFile } = await temporary(t, accounts);
+  const edgePath = join(home, "msedge.exe");
+  const userDataDir = join(home, "User Data");
+  await writeFile(edgePath, "fake executable");
+  const store = JSON.parse(await readFile(join(home, "accounts.json"), "utf8"));
+  for (const [index, item] of store.accounts.entries()) {
+    // 每个账号独立 Profile：共享同一个会被 rejectSharedProfile 拒绝。
+    const profileDirectory = `Profile ${index + 1}`;
+    await mkdir(join(userDataDir, profileDirectory), { recursive: true });
+    await writeFile(join(userDataDir, profileDirectory, "Preferences"), "{}");
+    item.launch = { edgePath, userDataDir, profileDirectory };
+  }
+  await writeFile(join(home, "accounts.json"), JSON.stringify(store));
+  return { home, dbFile };
+}
+
+function autoRunner(state: AutoState, text = LOGGED_IN): Runner {
+  return async (args) => {
+    state.calls.push(args);
+    if (args[0] === "browsers" && args[1] === "--json") return { stdout: JSON.stringify(state.online), exitCode: 0 };
+    if (args[0] === "browsers" && args[1] === "close") {
+      state.closed += 1;
+      state.online = [];
+      return { stdout: JSON.stringify({ browser_id: args[3], closed: true, windows_closed: 1, sessions_stopped: 0, disconnected: false }), exitCode: 0 };
+    }
+    if (args[0] === "session" && args[1] === "start") return { stdout: JSON.stringify({ session_id: "abcd" }), exitCode: 0 };
+    if (args[0] === "session" && args[1] === "stop") return { stdout: "", exitCode: 0 };
+    if (args[0] === "navigate") return { stdout: "", exitCode: 0 };
+    if (args[0] === "evaluate") return { stdout: JSON.stringify({ ok: true, tab_id: 7, value: text }), exitCode: 0 };
+    throw new Error(`unexpected args: ${args.join(" ")}`);
+  };
+}
+
+function launchDeps(state: AutoState, browser: Browser = edge, overrides: Partial<LaunchDependencies> = {}): LaunchDependencies {
+  return {
+    platform: "win32",
+    freeMemory: () => 2 * 1024 ** 3,
+    sleep: async () => {},
+    launch: async () => { state.launched += 1; state.online = [browser]; },
+    ...overrides,
+  };
+}
+
+test("离线时自动拉起 Edge 并采到快照，采完只关自己拉起的实例", async (t) => {
+  const { home, dbFile } = await launchFixture(t);
+  const state: AutoState = { online: [], launched: 0, closed: 0, calls: [] };
+  const result = await snapshotOne(home, autoRunner(state), account.alias, 45_000, { dbFile, ...fast, launchDependencies: launchDeps(state) });
+  assert.equal(result.ok, true);
+  assert.equal(result.connection, "online");
+  assert.equal(result.balance, 1100);
+  assert.equal(result.launched, true);
+  assert.equal(result.closed, true);
+  assert.equal(state.launched, 1, "只拉起一次");
+  assert.equal(state.closed, 1, "采完立刻关掉，压住内存峰值");
+  assert.deepEqual((await readLeftovers(home)).instances, [], "确认关闭后不留遗留追踪");
+  assert.equal(listSnapshots({ alias: account.alias }, dbFile)[0].ok, true);
+});
+
+test("用户自己开着的 Edge 不会被自动关闭", async (t) => {
+  const { home, dbFile } = await launchFixture(t);
+  const state: AutoState = { online: [edge], launched: 0, closed: 0, calls: [] };
+  const result = await snapshotOne(home, autoRunner(state), account.alias, 45_000, { dbFile, ...fast, launchDependencies: launchDeps(state) });
+  assert.equal(result.ok, true);
+  assert.equal(result.launched, false);
+  assert.equal(result.closed, undefined);
+  assert.equal(state.launched, 0);
+  assert.equal(state.closed, 0);
+  assert.ok(!state.calls.some((args) => args[0] === "browsers" && args[1] === "close"));
+});
+
+test("--ensure-online no 保持纯只读：不拉起、不关闭，只报离线", async (t) => {
+  const { home, dbFile } = await launchFixture(t);
+  const state: AutoState = { online: [], launched: 0, closed: 0, calls: [] };
+  const result = await snapshotOne(home, autoRunner(state), account.alias, 45_000, {
+    dbFile, ...fast, ensureOnline: false, launchDependencies: launchDeps(state),
+  });
+  assert.equal(result.errorCode, "OFFLINE");
+  assert.equal(state.launched, 0);
+  assert.equal(state.closed, 0);
+  assert.ok(!state.calls.some((args) => args[0] === "session"));
+  assert.match(result.note ?? "", /--ensure-online no/);
+});
+
+test("--keep-open 保留自动拉起的窗口，并留下遗留追踪供 close-leftover 兜底", async (t) => {
+  const { home, dbFile } = await launchFixture(t);
+  const state: AutoState = { online: [], launched: 0, closed: 0, calls: [] };
+  const result = await snapshotOne(home, autoRunner(state), account.alias, 45_000, {
+    dbFile, ...fast, keepOpen: true, launchDependencies: launchDeps(state),
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.launched, true);
+  assert.equal(state.closed, 0);
+  assert.equal(result.closed, undefined);
+  assert.equal((await readLeftovers(home)).instances.length, 1);
+});
+
+test("自动拉起失败（内存不足）如实留痕，并给出可执行建议", async (t) => {
+  const { home, dbFile } = await launchFixture(t);
+  const state: AutoState = { online: [], launched: 0, closed: 0, calls: [] };
+  const result = await snapshotOne(home, autoRunner(state), account.alias, 45_000, {
+    dbFile, ...fast, launchDependencies: launchDeps(state, edge, { freeMemory: () => 100 }),
+  });
+  assert.equal(result.errorCode, "LOW_MEMORY");
+  assert.equal(state.launched, 0, "内存不够时绝不拉起 Edge");
+  assert.equal(state.closed, 0);
+  assert.match(result.note ?? "", /LOW_MEMORY/);
+  assert.match(result.hint ?? "", /close-all/);
+  assert.equal(listSnapshots({ alias: account.alias }, dbFile)[0].errorCode, "LOW_MEMORY");
+});
+
+test("CLI：--ensure-online no 透传到 snapshot --all", async (t) => {
+  const { home, dbFile } = await launchFixture(t);
+  const state: AutoState = { online: [], launched: 0, closed: 0, calls: [] };
+  const lines: string[] = [];
+  const code = await main(["accounts", "snapshot", "--all", "--ensure-online", "no", "--json"], {
+    home, run: autoRunner(state), snapshotDbFile: dbFile,
+    launchDependencies: launchDeps(state), output: (line) => lines.push(line),
+  });
+  assert.equal(code, 1);
+  assert.equal(state.launched, 0);
+  assert.equal(JSON.parse(lines[0]).results[0].errorCode, "OFFLINE");
+});
+
+test("CLI：snapshot --missing --capture 只补采今天缺配对快照的账号", async (t) => {
+  const second = { ...account, alias: "broken", instanceId: "eeee9999", expectedIdentity: "github_16350" };
+  const { home, dbFile } = await launchFixture(t, [account, second]);
+  const { insertSnapshot } = await import("../src/db.ts");
+  const now = new Date();
+  insertSnapshot({
+    time: now.toISOString(), alias: account.alias, instanceId: account.instanceId,
+    identity: account.expectedIdentity, balance: 1100, totalSpent: 125, ok: true, errorCode: null,
+  }, dbFile);
+  const state: AutoState = { online: [], launched: 0, closed: 0, calls: [] };
+  const lines: string[] = [];
+  const code = await main(["accounts", "snapshot", "--missing", "--capture", "--json"], {
+    home, run: autoRunner(state), snapshotDbFile: dbFile,
+    launchDependencies: launchDeps(state, { ...edge, instance_id: second.instanceId }),
+    output: (line) => lines.push(line), now: () => now,
+  });
+  const report = JSON.parse(lines[0]);
+  assert.equal(code, 0);
+  assert.equal(report.ok, true);
+  assert.deepEqual(report.missing, [second.alias]);
+  assert.deepEqual(report.failed, []);
+  assert.equal(report.saved, 1);
+  assert.equal(state.launched, 1, "已有配对快照的账号连浏览器都不碰");
+  assert.equal(state.closed, 1);
+  assert.equal(listSnapshots({ alias: account.alias }, dbFile).length, 1, "不重复采集已有快照的账号");
+  assert.equal(listSnapshots({ alias: second.alias }, dbFile)[0].ok, true);
+});
+
+test("CLI：--capture 只能搭配 --missing；只读的 --missing 不接受启动参数", async (t) => {
+  const { home, dbFile } = await temporary(t);
+  const alone: string[] = [];
+  assert.equal(await main(["accounts", "snapshot", "--capture", "--json"], { home, run: runner(), snapshotDbFile: dbFile, output: (line) => alone.push(line) }), 1);
+  assert.match(alone[0], /--capture 只能和 --missing/);
+  const readOnly: string[] = [];
+  assert.equal(await main(["accounts", "snapshot", "--missing", "--ensure-online", "no", "--json"], { home, run: runner(), snapshotDbFile: dbFile, output: (line) => readOnly.push(line) }), 1);
+  assert.match(readOnly[0], /只读的 --missing/);
+  const bad: string[] = [];
+  assert.equal(await main(["accounts", "snapshot", account.alias, "--ensure-online", "maybe", "--json"], { home, run: runner(), snapshotDbFile: dbFile, output: (line) => bad.push(line) }), 1);
+  assert.match(bad[0], /只接受 yes \/ no/);
+  const withSite: string[] = [];
+  assert.equal(await main(["accounts", "snapshot", "--missing", "--capture", "--site", "agentrouter", "--json"], { home, run: runner(), snapshotDbFile: dbFile, output: (line) => withSite.push(line) }), 1);
+  assert.match(withSite[0], /不接受 --site/);
 });

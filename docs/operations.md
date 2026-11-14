@@ -25,7 +25,7 @@ node src/cli.ts doctor
 powershell -ExecutionPolicy Bypass -File scripts\daily-checkin.ps1
 ```
 
-它会依次完成：`ensure-online`（离线才拉起 Edge）→ 每个账号 `checkin` → 每满 10 次登录冷却 16 分钟 → `snapshot --all` 采集当日余额与消耗 → 清理残留 session。
+它会依次完成：`pending` 只读预检（跳过今天已到账的账号）→ `ensure-online`（离线才拉起 Edge）→ 每个账号 `checkin`（签到时就地落下配对快照）→ 每满 10 次登录冷却 16 分钟 → `anyrouter-checkin-all` → `snapshot --missing --capture` 一键补采当天还缺配对快照的账号（自动拉起并只关自己拉起的实例）→ 清理残留 session。
 另外：签到期间开启防休眠（覆盖 11 分钟冷却这段没人跑命令的空档，`-NoSleepGuard` 可关闭）。
 
 | 退出码 | 含义 |
@@ -61,11 +61,12 @@ node src/cli.ts accounts ensure-online edge-1     # 离线时拉起对应 Edge P
 node src/cli.ts accounts checkin edge-1           # 签到（退出 → 重登 → 确认到账）
 node src/cli.ts accounts checkin edge-1 --close-after   # 签到成功后连 Edge 实例一起关掉（释放内存）
 node src/cli.ts accounts login edge-1             # 只补登录：把停在登出态的账号拉回登录态
-node src/cli.ts accounts recheck edge-1           # 只读复查：今天到底到账没有
+node src/cli.ts accounts recheck edge-1           # 只读复查：今天到底到账没有（离线自动拉起 Edge）
 node src/cli.ts accounts recheck edge-6 --site anyrouter   # 复查 AnyRouter（默认 agentrouter）
 node src/cli.ts accounts snapshot edge-1          # 采集该账号的余额/消耗快照（按站点各采一条）
 node src/cli.ts accounts snapshot edge-6 --site anyrouter   # 只采指定站点
-node src/cli.ts accounts snapshot --all           # 采集全部账号
+node src/cli.ts accounts snapshot --missing --capture   # 日常推荐：只补采今天还缺配对快照的账号，离线自动拉起
+node src/cli.ts accounts snapshot --all           # 强制全量重采（会为每个账号各拉起一次 Edge）
 node src/cli.ts accounts close edge-1 --confirm   # 关闭该实例的所有 Edge 窗口
 ```
 
@@ -168,7 +169,7 @@ AgentRouter：共 20 个账号，到账 19，今天已到账而跳过 18，失�
   `[2026-09-20T14:12:03.115Z] 冷却开始：16.4 分钟（2026-09-20T14:28:27.115Z 结束），随后重试 6 个账号：edge-p14, ...`
 - **窗口上限**（默认 8）：一次只让这么多账号在线，一组签完立刻关掉它们的 Edge 实例再拉下一组——十几个 Edge Profile 同时常驻是本机最大的内存开销，把峰值压在窗口大小内比"全部拉起再逐个关"稳得多。`--window 0` 关闭分组。
 - **未确认到账先复核，别急着重签**：`CHECKIN_UNCONFIRMED` 只说明"本次运行内余额没涨"，而站点是登录即发放、一天一次——当天早些时候登录过就已经把额度发掉了，再退出重登不会二次发放。`checkin-all` 会对这类结果自动跑一次只读 `recheck`（不登录、不耗登录配额）：确认到账就补记账本、纠偏为成功并在汇总里单列，不再进补签队列；复核未确认才按原逻辑重试。复核要连同一个 Edge，所以这类账号不会在签到内部被 `--close-after` 提前关掉，改由组结束时回收。
-- **余额基线断档要显式报**：`⑤d「今日已发放」` 的短路要求"今天开始前的最后余额观测点"在 48 小时内。连续几天没跑时账本没有新观测点，这个门槛会对**所有**账号失效，已到账也可能被判 `CHECKIN_UNCONFIRMED`（2026-11-05 实测：断档 6 天，20 个号的基准全停在 10-30）。收尾会点名这些账号，并提示用 `zenx accounts snapshot --all` 补采配对快照恢复基线（只读，不耗登录配额）。
+- **余额基线断档要显式报**：`⑤d「今日已发放」` 的短路要求"今天开始前的最后余额观测点"在 48 小时内。连续几天没跑时账本没有新观测点，这个门槛会对**所有**账号失效，已到账也可能被判 `CHECKIN_UNCONFIRMED`（2026-11-05 实测：断档 6 天，20 个号的基准全停在 10-30）。收尾会点名这些账号。**注意时序**：基准只取今天 00:00 UTC 之前的观测点，今天补采的快照要到明天才生效，当天无法消除这条告警；今天配对快照已齐时无需任何动作（这些账号会照常走完整签到，不会误跳过），仍缺快照才用 `zenx accounts snapshot --missing --capture` 补采，让明天的基准接上。当天若报 `CHECKIN_UNCONFIRMED`，用 `zenx accounts recheck <别名>` 只读核实到账。
 - **失败的账号一定再试一次**：限流冷却是干等的十几分钟，之前失败的账号（BSK_TIMEOUT、PROFILE_CONNECT_TIMEOUT 之类）会一起塞进重试队列；整轮都没撞上限流时，收尾还会补签一轮——开头卡住的账号不会就这么被丢下。
 - **每次尝试都记状态**：`.zenx\checkin-state.json` 记录每个账号的最后尝试时间、结果、错误码与重试次数，中断后可接着看。
 - **默认重试一次**（`--retries`），冷却默认 15–18 分钟随机（`--wait`，显式指定则不抖动）。重试后仍失败就以失败收尾，不再无限循环。
@@ -178,7 +179,7 @@ AgentRouter：共 20 个账号，到账 19，今天已到账而跳过 18，失�
 
 - **`--close-after`（单账号也有）只在签到成功时生效**：先回收 session，再关掉整个 Edge 实例（含无关窗口，未保存内容会丢）。失败时不关——账号可能停在登出态，留着窗口方便人工处理。批量层例外：`CHECKIN_UNCONFIRMED` 要留着实例给自动复核，由组结束时的释放兜底。配合修好的扩展（见 5.5），这才是真正把进程退出，而不是只关掉一个页面。
 - **只关 zenx 自己拉起的实例**：本来就在线的 Edge 是用户自己的（共用同一 Profile），一律保留。判定跨轮记忆——上一轮拉起、这一轮才签到成功的实例（限流冷却后重试成功的那种）同样会被回收。**拉起事实在等实例连接之前就落盘**：连接超时（`PROFILE_CONNECT_TIMEOUT`）时 `ensure-online` 只抛错，若等成功返回后才登记，这个刚拉起的 Edge 会被误报成"用户自己的"、每失败一轮就多留一个进程。
-- **`recheck` 是"签到后核对"工具，不是第二次签到**：不退出、不重登、不消耗站点登录配额，可以反复跑。退出码 `0` = 已确认到账，`1` = 未到账或异常。
+- **`recheck` 是"签到后核对"工具，不是第二次签到**：不退出、不重登、不消耗站点登录配额，可以反复跑。退出码 `0` = 已确认到账，`1` = 未到账或异常。实例离线时会自动拉起已配置的 Edge Profile、读完只关自己拉起的实例（与 `snapshot` 同一套规则），不必先跑 `ensure-online`；`--ensure-online no` 退回完全纯只读，`--keep-open` 保留窗口。
 - **`close` 会关掉该实例的所有窗口**（包括与本项目无关的窗口），未保存内容会丢；只用账号里绑定的精确实例 ID，失败不重试。
 - 签到成功后想立即收尾，就 `close` —— 与 `ensure-online` 成对。
 
@@ -228,7 +229,7 @@ node -e "const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync('
 - **错误码不等于没到账**。例：`edge-4` 报 `MANUAL_INTERVENTION_REQUIRED`，但复查发现余额已 501.1 → 526.1（+25），实际已到账。判断"到没到账"一律用 `recheck`，别用错误码。
 - **`recheck` 会记账，不改站点状态**：确认到账但账本当天没有记录时，它会补一条到账记录（`--record no` 可关闭）。额度不一定由 `checkin` 发放，`login` 恢复登录态也会发放——钱领到了就不该在报表里显示为"没签到"。
 - **消耗需要相邻两个观测点**。建立基线的第一天，消耗显示 `—` 是正常的，第二天才有真实曲线。区间内没有快照时同样是 `—`，不臆造数字。
-- **「每日总额」不能逐日相加去对累计消耗**。快照稀疏时，两次观测之间的消耗会整笔记在**较晚那个观测点所在的日子**（实测 edge-1：9/22 → 10/03 的 674.59 全落在 10-03 那格）。想让逐日数字精确，只能保证每天跑一次 `zenx accounts snapshot --all`。
+- **「每日总额」不能逐日相加去对累计消耗**。快照稀疏时，两次观测之间的消耗会整笔记在**较晚那个观测点所在的日子**（实测 edge-1：9/22 → 10/03 的 674.59 全落在 10-03 那格）。想让逐日数字精确，只能保证每天跑一次 `zenx accounts snapshot --missing --capture`。
 
 ---
 
@@ -349,7 +350,7 @@ node -e "console.log(require('fs').readFileSync('D:/916938/browserskill-new/apps
 
 - **身份校验是红线**：控制台身份与绑定身份不符时立即停止，绝不执行退出 —— 防止在错误账号上操作。
 - 只操作**已绑定的精确实例 ID**，不按标签/前缀匹配，不改选实例。
-- 不保存密码、Cookie 或令牌；`close` 之外的命令保持只读（除 `checkin` 的退出重登外）。
+- 不保存密码、Cookie 或令牌；站点侧除 `checkin` 的退出重登外保持只读。进程侧 `snapshot` / `recheck` / `ensure-online` / 批量命令在实例离线时会拉起已配置的 Edge Profile，`snapshot`、`recheck` 与 `checkin --close-after` 只关自己拉起的实例；`--ensure-online no` 可让 `snapshot` / `recheck` 完全不碰浏览器进程。
 - 账本 `zenxbrowser/checkin.db` 含账号身份与余额，**已被 `.gitignore` 排除**，不要提交。
 - 隔离窗口必定回收：签到/复查/快照结束后都会 `session stop`；异常时日志里会报 `CLEANUP_INCOMPLETE`，需手动关掉那个 Edge 窗口。
 

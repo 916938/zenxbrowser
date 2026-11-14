@@ -269,29 +269,14 @@ if (0 -ne $anyrouter) {
 # with no spend baseline for weeks).
 # What remains here is a sweep for whatever the automatic pass could not record -
 # accounts that failed before reaching the console, or were skipped as already
-# credited today. ensure-online brings them back up only if needed; the sweep is
-# read-only and never costs a login.
+# credited today. One command does the whole sweep now: snapshot --missing --capture
+# only touches accounts still missing a paired snapshot, auto-launches their Edge
+# profile when offline, and closes ONLY the instances it launched itself (so the
+# user's own Edge windows survive). No login, no site-side writes. Exit code 1
+# means some accounts are still missing a paired observation.
 Add-Content -Path $log -Encoding UTF8 -Value "`n===== $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') daily snapshot sweep ====="
-$missing = @()
-try {
-  $snapOut = & node $cli accounts snapshot --missing --json 2>&1 | Out-String
-  Add-Content -Path $log -Encoding UTF8 -Value $snapOut
-  $snapReport = $snapOut | ConvertFrom-Json
-  if ($null -ne $snapReport.missing) { $missing = @($snapReport.missing) }
-  if ($missing.Count -eq 0) {
-    Add-Content -Path $log -Encoding UTF8 -Value "--- every account already has a paired snapshot today (taken during checkin)"
-  }
-} catch {
-  Add-Content -Path $log -Encoding UTF8 -Value "--- snapshot sweep unavailable: $($_.Exception.Message)"
-}
-foreach ($alias in $missing) {
-  if (0 -ne (Invoke-Zenx @("accounts", "ensure-online", $alias))) {
-    Add-Content -Path $log -Encoding UTF8 -Value "--- ${alias}: offline, cannot sweep snapshot"
-    continue
-  }
-  if (0 -ne (Invoke-Zenx @("accounts", "snapshot", $alias))) {
-    Add-Content -Path $log -Encoding UTF8 -Value "--- ${alias}: snapshot sweep incomplete (ok=false row still stored)"
-  }
+if (0 -ne (Invoke-Zenx @("accounts", "snapshot", "--missing", "--capture"))) {
+  Add-Content -Path $log -Encoding UTF8 -Value "--- snapshot sweep incomplete (see JSON above; ok=false rows are still stored)"
 }
 
 # Always leave a clean desktop, even when a checkin failed part-way through.
