@@ -27,7 +27,8 @@ import type { AnyRouterBatchReport } from "./anyrouter-batch.ts";
  *
  * 关键是：限流不是账号级的，而是**站点侧的共享配额**——同一出口 IP 连续登录若干次后，
  * 站点对所有账号都只提示"登录次数过多请稍后再试"，此时继续跑只会把更多账号退出成登出态。
- * 正因为是共享配额、恢复只看墙钟，冷却就从**第一次撞上限流**起算：中途再撞只补足差额。
+ * 每次撞上限流都重新等待完整冷却：冷却后的探测仍被拒，说明上一个截止时间判断错了，
+ * 不能再以"距首次限流已经够久"为由立即重试，否则会把剩余账号连续撞成登出态。
  */
 export const DEFAULT_RETRY_WAIT_MIN_MS = 15 * 60_000;
 export const DEFAULT_RETRY_WAIT_MAX_MS = 18 * 60_000;
@@ -69,7 +70,7 @@ export type AccountOutcome = {
   credited: boolean;
   skipped?: string;
   attempts: number;
-  /** 命中限流（已排入冷却重试队列）。 */
+  /** 命中站点共享限流，或因前序账号限流而未能尝试。与是否还有重试额度无关。 */
   rateLimited: boolean;
   balanceBefore: number | null;
   balanceAfter: number | null;
@@ -320,8 +321,8 @@ export type CheckinBatchOptions = {
   checkinTimeoutMs?: number;
   ensureTimeoutMs?: number;
   /**
-   * 限流冷却时长；默认在 15–18 分钟之间随机取值。显式指定时不抖动。
-   * 它是"距首次限流"要等到的总时长，中途再撞限流只补足差额（见 checkinAll 里的 limitedSince）。
+   * 每次限流后的完整冷却时长；默认在 15–18 分钟之间随机取值，显式指定时不抖动。
+   * 冷却后仍限流会重新等待，不做零时长的立即重试。
    * 无论冷却与否，失败的账号都会再补签一次（见 checkinAll 的收尾补签）。
    */
   waitMs?: number;
@@ -476,8 +477,8 @@ function chunkAccounts(accounts: Account[], size: number): Account[][] {
  *    再拉起下一组——内存占用的峰值因此被压在窗口大小的实例数上；
  * 3. 冷却等待期间已完成账号保持关闭状态，不会白占十几分钟内存；
  * 4. 失败的账号不会就此丢下：撞上限流时顺冷却一起重试，全程没限流也会在收尾补签一轮；
- * 5. 冷却时长是"距**首次**限流"要等到的总时长（默认 15–18 分钟）：共享配额的恢复只认墙钟，
- *    冷却后重试又撞上限流时只补足差额，不重新计满。
+ * 5. 每次限流都等待完整冷却（默认 15–18 分钟）；重试预算按账号自己的 attempts 计算，
+ *    不按组内轮数计算，排在后面的未尝试账号不会因前序账号反复失败而被丢弃。
  */
 export async function checkinAll(home: string, run: Runner, options: CheckinBatchOptions = {}): Promise<CheckinBatchReport> {
   const now = options.now ?? (() => Date.now());
@@ -598,29 +599,35 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
    * 收尾还会再给它们一轮（开头的账号卡在 BSK_TIMEOUT、后面一切顺利时尤其有用）。
    */
   const retryPool = new Map<string, Account>();
-  /**
-   * 本次限流窗口的起点：第一次撞到站点限流的时刻（null = 本次运行还没撞过）。
-   *
-   * 必须跨轮、跨组记忆：限流是站点侧的**共享配额**，恢复只认墙钟时间。
-   * 冷却重试之后又撞上限流时，不能再从头等一整轮——从第一次撞上算起已经过去十几分钟了，
-   * 只补足剩下的几分钟即可（原来每次都重新计满，一轮签到能白等两遍）。
-   * 反过来，有账号真的签到成功就说明配额已经恢复：此时把起点清零，
-   * 之后再来一次限流算新的一轮，重新等满——否则"上轮等到解除、这轮又立刻撞上"
-   * 会被算成已经等够了，一次都不等就再撞一次墙。
-   */
-  let limitedSince: number | null = null;
+  /** 因前序账号触发共享限流而推迟、尚未真正尝试的账号。 */
+  const rateLimitDeferred = new Set<string>();
   /**
    * 整轮兜底名单：**一次都没真正尝试过**的账号。
-   *
-   * 为什么不能只靠 retryPool：限流会把同组剩下的账号整批推迟，若之后又赶上重试
-   * 上限（`round > maxRetries` 直接 break），它们连一条失败记录都没有就被整轮丢下——
-   * 汇总里只是"未尝试"，既不像失败那样点名，也没有任何尝试痕迹，只能靠人手工再跑。
-   * 反复失败且已用尽重试次数的账号**不**在这里补：maxRetries 是调用方设的上限，
-   * 收尾再悄悄加一轮等于把它架空。
+   * 反复失败且已用尽重试次数的账号不在这里补，避免架空 maxRetries。
    */
   const unresolved = new Map<string, Account>();
   /** 兜底只做一次：补签组自己再失败时不能无限追加新组。 */
   let sweepDone = false;
+  /** 未启用重试时撞上限流，后续组也不能继续消耗站点登录配额。 */
+  let stopRemainingGroups = false;
+
+  const notAttemptedOutcome = (account: Account): AccountOutcome => {
+    const deferred = rateLimitDeferred.has(account.alias);
+    return {
+      alias: account.alias,
+      ok: false,
+      code: deferred ? "RATE_LIMIT_DEFERRED" : "NOT_ATTEMPTED",
+      message: deferred
+        ? "因站点共享登录限流而推迟，本次未获得尝试机会；稍后重跑 checkin-all。"
+        : "本轮未尝试。",
+      credited: false,
+      attempts: 0,
+      rateLimited: deferred,
+      balanceBefore: null,
+      balanceAfter: null,
+      closed: false,
+    };
+  };
 
   /** 从补签队列取出最多 limit 个账号；exclude 里已有的（本组剩余账号）跳过。 */
   const takeFromPool = (limit: number, exclude: Account[]): Account[] => {
@@ -662,9 +669,6 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
 
   for (let groupIndex = 0; groupIndex < plan.length; groupIndex++) {
     const group = plan[groupIndex];
-    // 兜底组是"最后再试一次"，不再为它等一轮限流冷却——本轮已经为这些账号等过一次，
-    // 再等十几分钟换来的通常还是同一个结果，而整轮时长会翻倍。
-    const isSweepGroup = sweepDone;
     if (plan.length > 1) {
       onProgress(`[组 ${groupIndex + 1}/${plan.length}] ${group.length} 个账号（同时在线上限 ${windowSize}）`);
     }
@@ -683,6 +687,7 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
       const deferred: Account[] = [];
       for (let index = 0; index < pending.length; index++) {
         const account = pending[index];
+        rateLimitDeferred.delete(account.alias);
         const attempt = (outcomes.get(account.alias)?.attempts ?? 0) + 1;
         onProgress(`[轮 ${round}] ${account.alias}: 第 ${attempt} 次签到`);
         let outcome = await runOne(home, run, account, { ...options, attempt, closeAfter, onProgress, now, sleep, ours });
@@ -711,9 +716,6 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
         if (outcome.ok) {
           // 已经成了，就不必再补签（它可能之前失败过、队列里还留着记录）。
           retryPool.delete(account.alias);
-          // 真拿到当日额度= 站点的共享配额确实已经恢复：限流窗口就此结束，
-          // 之后再来一次限流就从那一刻重新计冷却。
-          if (outcome.credited) limitedSince = null;
           // 疑似到账必须和确认到账分开说：两者在汇总里都是"到账"，但前者没有凭证，
           // 屏幕上都写成"已到账"的话，真正要人工核对的那几个会被淹没。
           onProgress(
@@ -737,8 +739,14 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
           retryPool.delete(account.alias);
         }
         if (outcome.rateLimited) {
-          // 本轮剩下的账号同样会命中共享配额，一并推迟到冷却之后再试。
-          deferred.push(...pending.slice(index));
+          // 限流状态与重试额度无关：即使当前账号已经用完重试，也必须熔断后续账号。
+          // 但已用完额度的账号本身不再入队；其余账号按各自的 attempts 判断，不能按组内轮数截断。
+          const affected = pending.slice(index);
+          for (const item of affected) {
+            if ((outcomes.get(item.alias)?.attempts ?? 0) === 0) rateLimitDeferred.add(item.alias);
+          }
+          deferred.push(...affected.filter((item) => (outcomes.get(item.alias)?.attempts ?? 0) <= maxRetries));
+          if (maxRetries === 0) stopRemainingGroups = true;
           const deferredByLimit = deferred.length;
           // 冷却是干等的十几分钟，顺手把之前失败的账号也拉进来重试：多等一轮不再花时间，
           // 却给了开头卡在 BSK_TIMEOUT / PROFILE_CONNECT_TIMEOUT 的账号第二次机会。
@@ -758,38 +766,19 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
           break;
         }
       }
-      if (isSweepGroup && deferred.length > 0) {
-        onProgress(`收尾补签再撞站点限流，不再等待冷却：${deferred.map((item) => item.alias).join(", ")}`);
-        break;
-      }
-      if (deferred.length === 0 || round > maxRetries) break;
+      if (deferred.length === 0 || maxRetries === 0) break;
       const coolStart = now();
-      if (limitedSince === null) limitedSince = coolStart;
-      // 冷却按墙钟计：从第一次撞限流算起，已经等过的部分不重复计入，只补足差额。
-      const targetMs = pickWaitMs();
-      const elapsedMs = coolStart - limitedSince;
-      const cooldownMs = Math.max(0, targetMs - elapsedMs);
+      // 上次冷却后的探测仍然限流，证明旧截止时间不够；必须重新等完整冷却。
+      // 绝不能按"距首次限流"补足成 0 分钟后立即重试，那正是连续撞限流的根源。
+      const cooldownMs = pickWaitMs();
       const retryNames = deferred.map((item) => item.alias).join(", ");
-      if (cooldownMs <= 0) {
-        onProgress(
-          `[${stamp(coolStart)}] 冷却已等够：自首次限流起已过 ${formatMinutes(elapsedMs)} 分钟（目标 ${formatMinutes(targetMs)} 分钟），` +
-            `直接重试 ${deferred.length} 个账号：${retryNames}`,
-        );
-      } else {
-        if (elapsedMs > 0) {
-          onProgress(
-            `[${stamp(coolStart)}] 距首次限流已过 ${formatMinutes(elapsedMs)} 分钟（目标 ${formatMinutes(targetMs)} 分钟），` +
-              `本次只补足剩余部分`,
-          );
-        }
-        onProgress(
-          `[${stamp(coolStart)}] 冷却开始：${formatMinutes(cooldownMs)} 分钟（${stamp(coolStart + cooldownMs)} 结束），` +
-            `随后重试 ${deferred.length} 个账号：${retryNames}`,
-        );
-        await sleepWithProgress(cooldownMs, sleep, onProgress);
-        waited += cooldownMs;
-        onProgress(`[${stamp(now())}] 冷却结束，开始重试 ${deferred.length} 个账号`);
-      }
+      onProgress(
+        `[${stamp(coolStart)}] 冷却开始：${formatMinutes(cooldownMs)} 分钟（${stamp(coolStart + cooldownMs)} 结束），` +
+          `随后重试 ${deferred.length} 个账号：${retryNames}`,
+      );
+      await sleepWithProgress(cooldownMs, sleep, onProgress);
+      waited += cooldownMs;
+      onProgress(`[${stamp(now())}] 冷却结束，开始重试 ${deferred.length} 个账号`);
       pending = deferred;
     }
 
@@ -812,18 +801,7 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
           ours.delete(account.alias);
         }
         await remember(account.alias, {
-          ...(current ?? {
-            alias: account.alias,
-            ok: false,
-            code: "NOT_ATTEMPTED",
-            message: "本轮未尝试。",
-            credited: false,
-            attempts: 0,
-            rateLimited: false,
-            balanceBefore: null,
-            balanceAfter: null,
-            closed: false,
-          }),
+          ...(current ?? notAttemptedOutcome(account)),
           closed: release.closed,
           closureError: release.error,
         });
@@ -834,21 +812,26 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
       }
     }
 
-    // 这组结束时把**一次都没真正尝试过**的账号收进兜底名单：前序账号撞上限流会把
-    // 同组剩下的账号整批推迟，若之后又赶上重试上限（`round > maxRetries`），它们连
-    // 一条失败记录都没有就被整轮丢下——既不在失败名单里，也没有任何尝试痕迹。
-    // 反复失败但已用尽重试次数的账号不在这里补：maxRetries 是调用方设的上限，
-    // 收尾再悄悄加一轮等于把它架空。
+    // 一次都没真正尝试过的账号进入兜底名单；反复失败且已用尽重试次数的不在这里补。
     for (const account of handled) {
-      if (!outcomes.has(account.alias)) unresolved.set(account.alias, account);
-      else if (outcomes.get(account.alias)?.ok === true) unresolved.delete(account.alias);
+      const current = outcomes.get(account.alias);
+      if (current?.ok === true) unresolved.delete(account.alias);
+      else if (!current || current.attempts === 0) unresolved.set(account.alias, account);
+    }
+
+    if (stopRemainingGroups) {
+      for (const rest of plan.slice(groupIndex + 1).flat()) {
+        if ((outcomes.get(rest.alias)?.attempts ?? 0) === 0) rateLimitDeferred.add(rest.alias);
+      }
+      onProgress("未启用限流重试（--retries 0）：停止后续分组，避免继续消耗站点登录配额。");
+      break;
     }
 
     // 收尾补签：所有账号都跑完了，还有没签上的账号就再给它们一轮。
     // 撞上限流的在冷却时已经顺带重试过（那时已从队列取走）；这里兜住的是"整轮都没限流"
     // 的情形——例如开头几个账号卡在 BSK_TIMEOUT，后面一路顺利，它们本该再试一次。
     // 名单 = 补签队列里剩下的，加上那些一次都没轮到的账号。
-    if (groupIndex === plan.length - 1 && !sweepDone) {
+    if (groupIndex === plan.length - 1 && !sweepDone && maxRetries > 0) {
       const extra = new Map<string, Account>();
       for (const [alias, account] of retryPool) extra.set(alias, account);
       for (const [alias, account] of unresolved) extra.set(alias, account);
@@ -864,18 +847,7 @@ export async function checkinAll(home: string, run: Runner, options: CheckinBatc
     }
   }
 
-  const accounts = wanted.map((account) => outcomes.get(account.alias) ?? {
-    alias: account.alias,
-    ok: false,
-    code: "NOT_ATTEMPTED",
-    message: "本轮未尝试（前序账号限流推迟后超出重试上限）。",
-    credited: false,
-    attempts: 0,
-    rateLimited: false,
-    balanceBefore: null,
-    balanceAfter: null,
-    closed: false,
-  });
+  const accounts = wanted.map((account) => outcomes.get(account.alias) ?? notAttemptedOutcome(account));
   const failed = accounts.filter((item) => !item.ok).length;
   // 快照覆盖率在**关窗之后**才汇总：这里只读账本，不再碰浏览器。
   // 采集本身已经在每个账号签到时就地完成（见 checkin.ts 的 finish），
@@ -958,7 +930,6 @@ async function runOne(
   },
 ): Promise<AccountOutcome> {
   const retryCodes = new Set(context.retryCodes ?? DEFAULT_RETRY_CODES);
-  const maxRetries = context.maxRetries ?? 1;
   const invoke = context.runCheckin ?? checkinAccount;
   /**
    * 拉起事实要在 ensureOnline **返回之前**登记。连接超时（PROFILE_CONNECT_TIMEOUT）
@@ -1046,6 +1017,7 @@ async function runOne(
       launched,
       ok: result.ok,
       credited: result.checkinCredited === true && result.skipped === undefined,
+      rateLimited: !result.ok && retryCodes.has(result.code ?? ""),
       skipped: result.skipped,
       balanceBefore: result.balanceBefore,
       balanceAfter: result.balanceAfter,
@@ -1066,7 +1038,8 @@ async function runOne(
     const enriched = await enrichBskTimeout(error, run, { instanceId: account.instanceId });
     const code = enriched instanceof ZenxError ? enriched.code : "COMMAND_FAILED";
     const message = enriched instanceof Error ? enriched.message : "签到失败。";
-    const rateLimited = retryCodes.has(code) && context.attempt <= maxRetries;
+    // 最后一次失败也仍然是站点限流：批量层必须熔断后续账号，只是不再重试当前账号。
+    const rateLimited = retryCodes.has(code);
     return { ...base(), launched, ok: false, code, message, rateLimited };
   }
 }

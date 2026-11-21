@@ -36,8 +36,7 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }, store: A
 /**
  * 预算极小的假时钟：每次读表前进 100ms，于是 600ms 预算内 checkin 必然抛
  * CHECKIN_TIMEOUT——用它稳定地模拟"任何需要冷却重试的失败"，不必搭完整页面流程。
- * sleep 也会推进时钟（真睡过去时间就变了）：冷却时长是按墙钟算的，
- * 不推进就等于假装等待不耗时，"只补足剩余冷却"根本测不出来。
+ * sleep 也会推进时钟（真睡过去时间就变了），冷却日志的起止时间与实际等待保持同一条时间线。
  */
 function clock(start = 0) {
   let now = start;
@@ -73,9 +72,9 @@ test("checkin-all: 命中限流后冷却并重跑一轮", async (t) => {
     ...time,
   });
   assert.equal(report.total, 2);
-  assert.equal(report.rounds, 2, "限流后应进入第二轮");
-  assert.equal(report.waitedMs, 60_000, "应完整冷却一次");
-  assert.deepEqual(time.sleeps, [60_000]);
+  assert.equal(report.rounds, 4, "两个账号各自最多尝试两次");
+  assert.equal(report.waitedMs, 3 * 60_000, "每次恢复探测前都完整冷却，最后一次失败后不再等待");
+  assert.deepEqual(time.sleeps, [60_000, 60_000, 60_000]);
   const byAlias = new Map(report.accounts.map((item) => [item.alias, item]));
   assert.equal(byAlias.get("alpha")?.code, "CHECKIN_TIMEOUT");
   assert.ok((byAlias.get("alpha")?.attempts ?? 0) >= 1);
@@ -100,6 +99,57 @@ test("checkin-all: retries=0 时不冷却、不重跑", async (t) => {
   assert.equal(report.rounds, 1);
   assert.equal(report.waitedMs, 0);
   assert.deepEqual(time.sleeps, []);
+  assert.equal(report.accounts[0]?.attempts, 1);
+  assert.equal(report.accounts[1]?.attempts, 0, "未启用重试时不能立即拿下一个账号探测");
+  assert.equal(report.accounts[1]?.code, "RATE_LIMIT_DEFERRED", "未尝试原因必须明确是共享限流");
+  assert.equal(report.accounts[1]?.rateLimited, true);
+});
+
+// 回归（2026-11-21 实况）：edge-10 第二次限流后旧代码不再识别 rateLimited，
+// 立即撞 p3；随后 round > maxRetries 又把没尝试过的队尾账号整批丢下。
+test("checkin-all: 持续限流时按账号预算重试，不立即撞下一个也不丢下队尾", async (t) => {
+  const three: Account[] = [
+    ...accounts,
+    { alias: "gamma", instanceId: "cccc3333", expectedIdentity: "github_3", boundAt: "2026-09-13T00:00:00Z" },
+  ];
+  const home = await fixture(t, three);
+  const time = clock();
+  const progress: string[] = [];
+  const online: Runner = (args, options) => {
+    if (args[0] === "browsers") return Promise.resolve({ stdout: JSON.stringify(three.map((item) => browser(item.instanceId))), exitCode: 0 });
+    return runner(args, options);
+  };
+  const report = await checkinAll(home, online, {
+    ...time,
+    dbFile: tempDb(t),
+    anyrouter: false,
+    windowSize: 0,
+    waitMs: 60_000,
+    maxRetries: 1,
+    runCheckin: async (_home, _run, alias) => {
+      // alpha 走失败返回值，beta/gamma 走异常：两条通道都必须触发共享限流熔断。
+      if (alias === "alpha") {
+        return {
+          ok: false, alias, instanceId: "aaaa1111", identity: "github_1",
+          balanceBefore: null, balanceAfter: null, checkinCredited: false, code: "LOGIN_RATE_LIMITED",
+        };
+      }
+      throw new ZenxError("LOGIN_RATE_LIMITED", "站点登录限流");
+    },
+    onProgress: (line) => progress.push(line),
+  });
+  assert.deepEqual(
+    progress.filter((line) => /: 第 \d+ 次签到$/.test(line)).map((line) => /^.*] ([^:]+):/.exec(line)?.[1]),
+    ["alpha", "alpha", "beta", "beta", "gamma", "gamma"],
+    "每次恢复探测之间都必须冷却，队尾也要获得自己的两次机会",
+  );
+  assert.deepEqual(time.sleeps, [60_000, 60_000, 60_000, 60_000, 60_000]);
+  for (const item of report.accounts) {
+    assert.equal(item.attempts, 2, `${item.alias} 应独立用尽自己的重试预算`);
+    assert.equal(item.code, "LOGIN_RATE_LIMITED");
+    assert.equal(item.rateLimited, true, "最后一次失败也必须保持限流身份");
+  }
+  assert.equal(report.accounts.some((item) => item.code === "NOT_ATTEMPTED"), false);
 });
 
 // 非限流错误码不进**冷却**队列（不等待、不消耗限流预算），但失败不该就此丢下：
@@ -213,7 +263,11 @@ test("checkin-all: 冷却日志带具体起止时间，长冷却中途报剩余"
   assert.equal(stamps.length, 2, "冷却开始这行要同时给出开始与预计结束时间");
   assert.ok(lines.some((line) => line.includes("冷却结束")), "冷却结束也要记一笔");
   assert.ok(lines.some((line) => line.includes("剩余") && line.includes("分钟")), "长冷却要报剩余时长");
-  assert.deepEqual(time.sleeps, [5 * 60_000, 5 * 60_000, 2 * 60_000], "12 分钟按 5 分钟分段等待");
+  assert.deepEqual(
+    time.sleeps,
+    [5 * 60_000, 5 * 60_000, 2 * 60_000, 5 * 60_000, 5 * 60_000, 2 * 60_000, 5 * 60_000, 5 * 60_000, 2 * 60_000],
+    "三次恢复探测各自按 5 分钟分段等待",
+  );
 });
 
 test("checkin-all: 短冷却不分段，行为与原来一致", async (t) => {
@@ -228,7 +282,7 @@ test("checkin-all: 短冷却不分段，行为与原来一致", async (t) => {
     onProgress: (line) => lines.push(line),
     ...time,
   });
-  assert.deepEqual(time.sleeps, [60_000], "不足一整段就是单次等待");
+  assert.deepEqual(time.sleeps, [60_000, 60_000, 60_000], "每次短冷却都不分段");
   assert.equal(lines.filter((line) => line.includes("冷却中")).length, 0);
 });
 
@@ -415,7 +469,8 @@ test("checkin-all: --close-after 不关闭本来就在跑的 Edge（用户自己
     return runner(args, options);
   };
   const report = await checkinAll(home, spy, {
-    retryCodes: ["CHECKIN_TIMEOUT"],
+    // 本用例验证关闭守卫，不验证限流：让 CHECKIN_TIMEOUT 走普通失败路径。
+    retryCodes: ["LOGIN_RATE_LIMITED"],
     checkinTimeoutMs: 600,
     maxRetries: 0,
     closeAfter: true,
@@ -448,7 +503,8 @@ test("checkin-all: launched 如实记录哪些实例是本轮拉起的", async (
   };
   const time = clock();
   const report = await checkinAll(home, spy, {
-    retryCodes: ["CHECKIN_TIMEOUT"],
+    // 本用例验证 launched 记录，不验证限流：让 CHECKIN_TIMEOUT 走普通失败路径。
+    retryCodes: ["LOGIN_RATE_LIMITED"],
     checkinTimeoutMs: 600,
     // 关掉重试：重试那一轮的 ensure-online 会看到 alpha 已在线（launched=false），
     // 把第一次的真实结果覆盖掉。
@@ -847,7 +903,7 @@ test("checkin-all: 冷却期间顺带重试之前失败的账号", async (t) => 
   assert.equal(byAlias.get("off1")?.attempts, 2, "之前失败的账号应被顺带重试");
   assert.equal(byAlias.get("on2")?.attempts, 2);
   assert.equal(byAlias.get("on3")?.attempts, 2, "本组剩余账号照旧推迟到冷却后");
-  assert.equal(report.waitedMs, 60_000, "只冷却一次");
+  assert.equal(report.waitedMs, 2 * 60_000, "第二次恢复探测仍限流时必须再完整冷却一次");
   assert.match(lines.find((line) => line.includes("顺带重试")) ?? "", /off1/, "要说清顺带重试了谁");
   assert.match(lines.find((line) => line.includes("随后重试")) ?? "", /on2, on3, off1/, "重试名单含补签账号");
 });
@@ -898,7 +954,7 @@ test("checkin-all: 冷却期间跨组补签拉起的实例，组末照样回收"
 
 // 冷却时长：默认 15–18 分钟随机（站点约 10–15 分钟恢复），显式 --wait 不抖动。
 test("checkin-all: 默认冷却在 15–18 分钟之间取值", async (t) => {
-  const home = await fixture(t);
+  const home = await fixture(t, [accounts[0]]);
   const short = await checkinAll(home, runner, {
     retryCodes: ["CHECKIN_TIMEOUT"],
     checkinTimeoutMs: 600,
@@ -919,13 +975,11 @@ test("checkin-all: 默认冷却在 15–18 分钟之间取值", async (t) => {
   assert.equal(long.waitedMs, 18 * 60_000, "随机取上限：18 分钟");
 });
 
-// 冷却是墙钟账：共享配额从第一次撞限流起恢复，中途再撞只补差额，不重新计满。
-// 站点侧配额不会因为我们换了组、重新登录了几个账号就额外多等一段时间。
-test("checkin-all: 再次撞限流只补足剩余冷却，不重新计满", async (t) => {
+// 冷却后再次限流说明上一次等得不够，不能按距首次限流的时长直接重试。
+test("checkin-all: 再次撞限流重新等待完整冷却", async (t) => {
   const home = await fixture(t);
   const time = clock();
   const lines: string[] = [];
-  // 第一次冷却取下限 15 分钟，第二次取上限 18 分钟：第二次只该补 3 分钟出头。
   const picks = [0, 1];
   const report = await checkinAll(home, runner, {
     retryCodes: ["CHECKIN_TIMEOUT"],
@@ -937,31 +991,30 @@ test("checkin-all: 再次撞限流只补足剩余冷却，不重新计满", asyn
     ...time,
     dbFile: tempDb(t),
   });
-  assert.equal(time.sleeps.length, 4, "15 分钟按 5 分钟分段3 次，第二次冷却 1 次");
-  assert.deepEqual(time.sleeps.slice(0, 3), [5 * 60_000, 5 * 60_000, 5 * 60_000]);
-  const second = time.sleeps[3];
-  assert.ok(second > 0 && second <= 3 * 60_000, `第二次冷却应只剩 3 分钟以内，实际 ${second}ms`);
-  assert.ok(report.waitedMs < 18 * 60_000, `总共不该等满两轮，实际 ${report.waitedMs}ms`);
-  assert.match(lines.find((line) => line.includes("距首次限流已过")) ?? "", /已过 1[56](\.\d)? 分钟/, "要说清是补足剩余冷却");
+  assert.deepEqual(
+    time.sleeps,
+    [5 * 60_000, 5 * 60_000, 5 * 60_000, 5 * 60_000, 5 * 60_000, 5 * 60_000, 3 * 60_000],
+    "两组分别完整等待 15 和 18 分钟",
+  );
+  assert.equal(report.waitedMs, 33 * 60_000);
+  assert.equal(lines.filter((line) => line.includes("冷却开始")).length, 2);
+  assert.equal(lines.some((line) => line.includes("冷却已等够") || line.includes("距首次限流")), false);
 });
 
-test("checkin-all: 已经等够冷却时直接重试，不再多睡一轮", async (t) => {
+test("checkin-all: 固定冷却时再次限流也重新等待，不做零时长重试", async (t) => {
   const home = await fixture(t);
   const time = clock();
-  const lines: string[] = [];
   const report = await checkinAll(home, runner, {
     retryCodes: ["CHECKIN_TIMEOUT"],
     checkinTimeoutMs: 600,
     waitMs: 60_000,
     maxRetries: 1,
     windowSize: 1,
-    onProgress: (line) => lines.push(line),
     ...time,
     dbFile: tempDb(t),
   });
-  assert.deepEqual(time.sleeps, [60_000], "第二次限流时已经等够 1 分钟，不该再睡一次");
-  assert.equal(report.waitedMs, 60_000);
-  assert.match(lines.find((line) => line.includes("冷却已等够")) ?? "", /直接重试 1 个账号：beta/, "要说清是直接重试");
+  assert.deepEqual(time.sleeps, [60_000, 60_000]);
+  assert.equal(report.waitedMs, 2 * 60_000);
 });
 
 // 只关自己拉起的实例，但"自己拉起"要跨轮记忆：重试那轮实例已在线，
@@ -991,7 +1044,7 @@ test("checkin-all: 上一轮拉起、这一轮仍在线的实例照常回收", a
     ...time,
     dbFile: tempDb(t),
   });
-  assert.equal(report.rounds, 2, "限流冷却后重试过一轮");
+  assert.equal(report.rounds, 4, "两个账号各自重试一轮");
   assert.equal(report.accounts.find((item) => item.alias === "alpha")?.launched, true, "alpha 的 Edge 是本轮拉起的");
   assert.deepEqual(closeCalls, ["aaaa1111"], "alpha 是 zenx 拉起的，重试轮结束照样关掉");
   assert.equal(report.released, 1);

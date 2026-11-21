@@ -46,7 +46,7 @@ const HINTS: Record<string, HintTemplate> = {
 
   // --- 站点与签到 ---
   LOGIN_RATE_LIMITED: {
-    text: "这是站点侧共享配额（同一出口 IP 连续登录触发），不是账号问题，立刻重试只会更糟。等待 15 分钟后再跑；批量场景用 zenx accounts checkin-all 自动冷却重试（默认 15–18 分钟，且只补足距首次限流还没等够的那截）。",
+    text: "这是站点侧共享配额（同一出口 IP 连续登录触发），不是账号问题，立刻重试只会更糟。等待 15 分钟后再跑；批量场景用 zenx accounts checkin-all 自动冷却重试（默认每次完整等待 15–18 分钟，冷却后仍限流会重新等待，不会立即撞下一个账号）。",
   },
   LOGIN_TIMEOUT: {
     text: "三种常见原因：① 窗口被隐藏/最小化（先激活该 Profile 的 Edge 窗口）② 站点限流（等 15 分钟以上，见 LOGIN_RATE_LIMITED）③ GitHub 会话过期（人工登录一次）。可先跑 zenx accounts login {alias} 只补登录。",

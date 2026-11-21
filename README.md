@@ -71,7 +71,7 @@ node src/cli.ts --help    # 查看全部用法；也可 npm start -- --help
 | `zenx accounts inspect-site <别名>` | 只读核对登录身份与签到信号 |
 | `zenx accounts checkin <别名>` | 执行完整退出重登签到流程（支持无人值守/计划任务）；`--close-after` 在签到成功后连浏览器实例一起释放 |
 | `zenx accounts login <别名>` | 只补“登录”这一步：把重登失败后停在登出态的账号拉回登录态（不退出、不签到） |
-| `zenx accounts checkin-all` | 批量签到：**先跑 AnyRouter 阶段**（默认开，`--anyrouter no` 关闭）再跑 AgentRouter 那二十个号；自动处理站点登录限流（冷却 `--wait`，默认 15–18 分钟随机、且从首次限流起算只补足剩余时间，后重试 `--retries` 次），失败账号顺冷却或收尾再补签一次，`--window`（默认 8）限制同时在线账号数，`--close-after` 逐个释放实例内存（两个阶段都生效）；全程开启防休眠（`--inhibit-sleep no` 关闭，`--inhibit-timeout` 设上限） |
+| `zenx accounts checkin-all` | 批量签到：**先跑 AnyRouter 阶段**（默认开，`--anyrouter no` 关闭）再跑 AgentRouter 那二十个号；自动处理站点登录限流（每次完整冷却 `--wait`，默认 15–18 分钟随机，仍限流则重新等待，再按各账号预算重试 `--retries` 次），失败账号顺冷却或收尾再补签一次，`--window`（默认 8）限制同时在线账号数，`--close-after` 逐个释放实例内存（两个阶段都生效）；全程开启防休眠（`--inhibit-sleep no` 关闭，`--inhibit-timeout` 设上限） |
 | `zenx accounts bind-anyrouter <别名> --identity <站点用户名> --confirm` | 给已绑定账号补记 AnyRouter（anyrouter.top）的站点身份 |
 | `zenx accounts anyrouter-checkin <别名>` | AnyRouter 签到：刷新页面即打卡（详见下文） |
 | `zenx accounts anyrouter-checkin-all` | AnyRouter 批量签到：依次处理所有绑定了 AnyRouter 身份的账号（离线按需拉起、已到账的连 Edge 都不拉起、单个失败不中断） |
